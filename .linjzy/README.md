@@ -1,8 +1,8 @@
 # Custom release image pipeline
 
-This public fork builds a small, auditable customization on top of published
-new-api releases. Production hosts pull prebuilt images from GHCR and do not
-clone source code or run Docker builds.
+This public fork builds a small, auditable customization bundle on top of
+published new-api releases. Production hosts pull prebuilt images from GHCR
+and do not clone source code or run Docker builds.
 
 ## Release mapping
 
@@ -29,11 +29,11 @@ started manually. It:
 1. Selects the newest published, non-draft upstream release unless an explicit
    release is requested.
 2. Checks out the exact upstream tag commit.
-3. Applies `.linjzy/patches/usage-logs-auto-refresh.patch` without a fallback
-   merge.
-4. Builds the upstream Dockerfile for `linux/amd64`.
-5. Runs an isolated container smoke test.
-6. Pushes the public source branch and immutable GHCR image.
-7. Updates `candidate` only after all checks pass.
+3. Applies every reviewed patch in `.linjzy/patches/` without a fallback merge.
+4. Runs the DTO and relay Go regression tests.
+5. Builds the upstream Dockerfile for `linux/amd64`.
+6. Runs an isolated container smoke test.
+7. Pushes the public source branch and immutable GHCR image.
+8. Updates `candidate` only after all checks pass.
 
 The workflow does not contain or use production-server credentials.
