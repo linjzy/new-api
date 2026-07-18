@@ -7,6 +7,7 @@ UPSTREAM_COMMIT="${3:?upstream commit is required}"
 SOURCE_REF="${4:?source ref is required}"
 USAGE_PATCH_FILE="${5:-$SOURCE_DIR/.linjzy/patches/usage-logs-auto-refresh.patch}"
 ANTHROPIC_PATCH_FILE="${6:-$SOURCE_DIR/.linjzy/patches/anthropic-buffered-nonstream.patch}"
+CHANNEL_TEST_PATCH_FILE="${7:-$SOURCE_DIR/.linjzy/patches/channel-test-responses-policy.patch}"
 
 log() {
   printf '[prepare-release] %s\n' "$*"
@@ -38,6 +39,14 @@ anthropic_customization_present() {
       "$SOURCE_DIR/dto/claude.go"
 }
 
+channel_test_customization_present() {
+  grep -q 'ShouldChatCompletionsUseResponsesGlobal' \
+    "$SOURCE_DIR/controller/channel-test.go" &&
+    [[ -f "$SOURCE_DIR/controller/channel_test_endpoint_test.go" ]] &&
+    grep -q 'TestNormalizeChannelTestEndpointUsesResponsesCompatibilityPolicy' \
+      "$SOURCE_DIR/controller/channel_test_endpoint_test.go"
+}
+
 apply_customization() {
   local name="$1"
   local patch_file="$2"
@@ -59,6 +68,7 @@ git -C "$SOURCE_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
   die "source directory is not a Git checkout"
 [[ -f "$USAGE_PATCH_FILE" ]] || die "customization patch not found: $USAGE_PATCH_FILE"
 [[ -f "$ANTHROPIC_PATCH_FILE" ]] || die "customization patch not found: $ANTHROPIC_PATCH_FILE"
+[[ -f "$CHANNEL_TEST_PATCH_FILE" ]] || die "customization patch not found: $CHANNEL_TEST_PATCH_FILE"
 [[ "$RELEASE_TAG" != *[[:space:]]* ]] || die "invalid release tag"
 [[ "$SOURCE_REF" != *[[:space:]]* ]] || die "invalid source ref"
 
@@ -76,10 +86,14 @@ apply_customization \
   'Anthropic buffered non-stream' \
   "$ANTHROPIC_PATCH_FILE" \
   anthropic_customization_present
+apply_customization \
+  'channel-test Responses policy' \
+  "$CHANNEL_TEST_PATCH_FILE" \
+  channel_test_customization_present
 git -C "$SOURCE_DIR" diff --check
 
 PATCH_SHA256="$(
-  sha256sum "$USAGE_PATCH_FILE" "$ANTHROPIC_PATCH_FILE" |
+  sha256sum "$USAGE_PATCH_FILE" "$ANTHROPIC_PATCH_FILE" "$CHANNEL_TEST_PATCH_FILE" |
     awk '{print $1}' |
     sha256sum |
     awk '{print $1}'

@@ -80,7 +80,8 @@ jobs:
           patch_sha="$(
             sha256sum \
               .linjzy/patches/usage-logs-auto-refresh.patch \
-              .linjzy/patches/anthropic-buffered-nonstream.patch |
+              .linjzy/patches/anthropic-buffered-nonstream.patch \
+              .linjzy/patches/channel-test-responses-policy.patch |
               awk '{print $1}' |
               sha256sum |
               awk '{print $1}'
@@ -160,8 +161,8 @@ jobs:
         with:
           go-version: '>=1.25.1'
 
-      - name: Test relay customizations
-        run: go test ./dto ./relay/...
+      - name: Test Go customizations
+        run: go test ./controller ./dto ./relay/...
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0

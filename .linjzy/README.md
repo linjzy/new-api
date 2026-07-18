@@ -30,7 +30,7 @@ started manually. It:
    release is requested.
 2. Checks out the exact upstream tag commit.
 3. Applies every reviewed patch in `.linjzy/patches/` without a fallback merge.
-4. Runs the DTO and relay Go regression tests.
+4. Runs the controller, DTO, and relay Go regression tests.
 5. Builds the upstream Dockerfile for `linux/amd64`.
 6. Runs an isolated container smoke test.
 7. Pushes the public source branch and immutable GHCR image.
