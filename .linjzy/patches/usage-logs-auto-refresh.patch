@@ -1,20 +1,20 @@
 diff --git a/Dockerfile b/Dockerfile
-index e2788f5..919b9fc 100644
+index 10345a5..ca0e404 100644
 --- a/Dockerfile
 +++ b/Dockerfile
-@@ -7,7 +7,7 @@ COPY web/classic/package.json ./classic/package.json
+@@ -5,7 +5,7 @@ COPY web/package.json web/bun.lock ./
  RUN bun install --frozen-lockfile
- COPY ./web/default ./default
+ COPY ./web ./
  COPY ./VERSION /build/VERSION
--RUN cd default && DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$(cat /build/VERSION) bun run build
-+RUN cd default && DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$(cat /build/VERSION) bun run build:check
+-RUN DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$(cat /build/VERSION) bun run build
++RUN DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$(cat /build/VERSION) bun run build:check
  
- FROM oven/bun:1@sha256:0733e50325078969732ebe3b15ce4c4be5082f18c4ac1a0f0ca4839c2e4e42a7 AS builder-classic
- 
-diff --git a/web/default/src/features/usage-logs/components/common-logs-stats.tsx b/web/default/src/features/usage-logs/components/common-logs-stats.tsx
+ FROM golang:1.26.1-alpine@sha256:2389ebfa5b7f43eeafbd6be0c3700cc46690ef842ad962f6c5bd6be49ed82039 AS builder2
+ ENV GO111MODULE=on CGO_ENABLED=0
+diff --git a/web/src/features/usage-logs/components/common-logs-stats.tsx b/web/src/features/usage-logs/components/common-logs-stats.tsx
 index dd754e2..fb449d3 100644
---- a/web/default/src/features/usage-logs/components/common-logs-stats.tsx
-+++ b/web/default/src/features/usage-logs/components/common-logs-stats.tsx
+--- a/web/src/features/usage-logs/components/common-logs-stats.tsx
++++ b/web/src/features/usage-logs/components/common-logs-stats.tsx
 @@ -25,7 +25,10 @@ import { formatLogQuota } from '@/lib/format'
  import { cn } from '@/lib/utils'
  
@@ -48,10 +48,10 @@ index dd754e2..fb449d3 100644
    })
  
    if (isLoading) {
-diff --git a/web/default/src/features/usage-logs/components/usage-logs-provider.tsx b/web/default/src/features/usage-logs/components/usage-logs-provider.tsx
+diff --git a/web/src/features/usage-logs/components/usage-logs-provider.tsx b/web/src/features/usage-logs/components/usage-logs-provider.tsx
 index 50fa0ed..460a3a4 100644
---- a/web/default/src/features/usage-logs/components/usage-logs-provider.tsx
-+++ b/web/default/src/features/usage-logs/components/usage-logs-provider.tsx
+--- a/web/src/features/usage-logs/components/usage-logs-provider.tsx
++++ b/web/src/features/usage-logs/components/usage-logs-provider.tsx
 @@ -36,6 +36,8 @@ interface UsageLogsContextValue {
    setAffinityDialogOpen: (open: boolean) => void
    sensitiveVisible: boolean
@@ -78,10 +78,10 @@ index 50fa0ed..460a3a4 100644
          viewScope,
          setViewScope,
        }}
-diff --git a/web/default/src/features/usage-logs/components/usage-logs-table.tsx b/web/default/src/features/usage-logs/components/usage-logs-table.tsx
+diff --git a/web/src/features/usage-logs/components/usage-logs-table.tsx b/web/src/features/usage-logs/components/usage-logs-table.tsx
 index bb96123..fad8e3b 100644
---- a/web/default/src/features/usage-logs/components/usage-logs-table.tsx
-+++ b/web/default/src/features/usage-logs/components/usage-logs-table.tsx
+--- a/web/src/features/usage-logs/components/usage-logs-table.tsx
++++ b/web/src/features/usage-logs/components/usage-logs-table.tsx
 @@ -18,7 +18,12 @@ For commercial licensing, please contact support@quantumnous.com
  */
  import { useQuery } from '@tanstack/react-query'
@@ -171,10 +171,10 @@ index bb96123..fad8e3b 100644
      onColumnFiltersChange,
      manualPagination: true,
      manualFiltering: true,
-diff --git a/web/default/src/features/usage-logs/constants.ts b/web/default/src/features/usage-logs/constants.ts
-index a2dff48..cd327dc 100644
---- a/web/default/src/features/usage-logs/constants.ts
-+++ b/web/default/src/features/usage-logs/constants.ts
+diff --git a/web/src/features/usage-logs/constants.ts b/web/src/features/usage-logs/constants.ts
+index a2dff48..e8ae974 100644
+--- a/web/src/features/usage-logs/constants.ts
++++ b/web/src/features/usage-logs/constants.ts
 @@ -44,6 +44,9 @@ export const DEFAULT_LOGS_DATA = {
    total: 0,
  }
@@ -185,10 +185,10 @@ index a2dff48..cd327dc 100644
  // ============================================================================
  // Log Type Enum
  // ============================================================================
-diff --git a/web/default/src/features/usage-logs/index.tsx b/web/default/src/features/usage-logs/index.tsx
+diff --git a/web/src/features/usage-logs/index.tsx b/web/src/features/usage-logs/index.tsx
 index 20467b7..10a4f81 100644
---- a/web/default/src/features/usage-logs/index.tsx
-+++ b/web/default/src/features/usage-logs/index.tsx
+--- a/web/src/features/usage-logs/index.tsx
++++ b/web/src/features/usage-logs/index.tsx
 @@ -16,12 +16,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
  
  For commercial licensing, please contact support@quantumnous.com

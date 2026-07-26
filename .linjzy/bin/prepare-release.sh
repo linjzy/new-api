@@ -20,13 +20,13 @@ die() {
 
 usage_customization_present() {
   grep -q 'USAGE_LOGS_AUTO_REFRESH_INTERVAL_MS' \
-    "$SOURCE_DIR/web/default/src/features/usage-logs/constants.ts" &&
+    "$SOURCE_DIR/web/src/features/usage-logs/constants.ts" &&
     grep -q 'onCheckedChange={handleAutoRefreshChange}' \
-      "$SOURCE_DIR/web/default/src/features/usage-logs/index.tsx" &&
+      "$SOURCE_DIR/web/src/features/usage-logs/index.tsx" &&
     grep -q 'refetchIntervalInBackground: false' \
-      "$SOURCE_DIR/web/default/src/features/usage-logs/components/usage-logs-table.tsx" &&
+      "$SOURCE_DIR/web/src/features/usage-logs/components/usage-logs-table.tsx" &&
     grep -q 'USAGE_LOGS_AUTO_REFRESH_INTERVAL_MS' \
-      "$SOURCE_DIR/web/default/src/features/usage-logs/components/common-logs-stats.tsx"
+      "$SOURCE_DIR/web/src/features/usage-logs/components/common-logs-stats.tsx"
 }
 
 anthropic_customization_present() {
