@@ -1,12 +1,12 @@
 diff --git a/relay/channel/claude/adaptor.go b/relay/channel/claude/adaptor.go
-index bbd711f..9b1ca56 100644
+index bbd711f..4301df7 100644
 --- a/relay/channel/claude/adaptor.go
 +++ b/relay/channel/claude/adaptor.go
 @@ -124,6 +124,11 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
  func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (usage any, err *types.NewAPIError) {
  	info.FinalRequestRelayFormat = types.RelayFormatClaude
  	if info.IsStream {
-+		clientStream := info.Request != nil && info.Request.IsStream(c)
++		clientStream := info.Request != nil && info.Request.IsStream(c.Request)
 +		if !clientStream {
 +			info.IsStream = false
 +			return ClaudeBufferedStreamHandler(c, resp, info)
@@ -16,7 +16,7 @@ index bbd711f..9b1ca56 100644
  		return ClaudeHandler(c, resp, info)
 diff --git a/relay/channel/claude/buffered_stream.go b/relay/channel/claude/buffered_stream.go
 new file mode 100644
-index 0000000..9542edc
+index 0000000..47f87c6
 --- /dev/null
 +++ b/relay/channel/claude/buffered_stream.go
 @@ -0,0 +1,316 @@
@@ -34,7 +34,7 @@ index 0000000..9542edc
 +	relaycommon "github.com/QuantumNous/new-api/relay/common"
 +	"github.com/QuantumNous/new-api/relay/helper"
 +	"github.com/QuantumNous/new-api/service"
-+	"github.com/QuantumNous/new-api/types"
++	"github.com/QuantumNous/new-api/relaykit/types"
 +
 +	"github.com/gin-gonic/gin"
 +)
@@ -338,7 +338,7 @@ index 0000000..9542edc
 +}
 diff --git a/relay/channel/claude/buffered_stream_test.go b/relay/channel/claude/buffered_stream_test.go
 new file mode 100644
-index 0000000..b032728
+index 0000000..5ec76ff
 --- /dev/null
 +++ b/relay/channel/claude/buffered_stream_test.go
 @@ -0,0 +1,170 @@
@@ -355,7 +355,7 @@ index 0000000..b032728
 +	"github.com/QuantumNous/new-api/constant"
 +	"github.com/QuantumNous/new-api/relaykit/dto"
 +	relaycommon "github.com/QuantumNous/new-api/relay/common"
-+	"github.com/QuantumNous/new-api/types"
++	"github.com/QuantumNous/new-api/relaykit/types"
 +	"github.com/stretchr/testify/assert"
 +	"github.com/stretchr/testify/require"
 +
