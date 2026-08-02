@@ -1,17 +1,5 @@
-diff --git a/dto/claude.go b/dto/claude.go
-index 0c552b4b..97c7bca2 100644
---- a/dto/claude.go
-+++ b/dto/claude.go
-@@ -22,6 +22,7 @@ type ClaudeMediaMessage struct {
- 	Source       *ClaudeMessageSource `json:"source,omitempty"`
- 	Usage        *ClaudeUsage         `json:"usage,omitempty"`
- 	StopReason   *string              `json:"stop_reason,omitempty"`
-+	StopSequence *string              `json:"stop_sequence,omitempty"`
- 	PartialJson  *string              `json:"partial_json,omitempty"`
- 	Role         string               `json:"role,omitempty"`
- 	Thinking     *string              `json:"thinking,omitempty"`
 diff --git a/relay/channel/claude/adaptor.go b/relay/channel/claude/adaptor.go
-index b8e4a036..033620cf 100644
+index bbd711f..9b1ca56 100644
 --- a/relay/channel/claude/adaptor.go
 +++ b/relay/channel/claude/adaptor.go
 @@ -124,6 +124,11 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
@@ -28,7 +16,7 @@ index b8e4a036..033620cf 100644
  		return ClaudeHandler(c, resp, info)
 diff --git a/relay/channel/claude/buffered_stream.go b/relay/channel/claude/buffered_stream.go
 new file mode 100644
-index 00000000..828e1a3e
+index 0000000..9542edc
 --- /dev/null
 +++ b/relay/channel/claude/buffered_stream.go
 @@ -0,0 +1,316 @@
@@ -42,7 +30,7 @@ index 00000000..828e1a3e
 +	"strings"
 +
 +	"github.com/QuantumNous/new-api/common"
-+	"github.com/QuantumNous/new-api/dto"
++	"github.com/QuantumNous/new-api/relaykit/dto"
 +	relaycommon "github.com/QuantumNous/new-api/relay/common"
 +	"github.com/QuantumNous/new-api/relay/helper"
 +	"github.com/QuantumNous/new-api/service"
@@ -350,7 +338,7 @@ index 00000000..828e1a3e
 +}
 diff --git a/relay/channel/claude/buffered_stream_test.go b/relay/channel/claude/buffered_stream_test.go
 new file mode 100644
-index 00000000..2074f245
+index 0000000..b032728
 --- /dev/null
 +++ b/relay/channel/claude/buffered_stream_test.go
 @@ -0,0 +1,170 @@
@@ -365,7 +353,7 @@ index 00000000..2074f245
 +
 +	"github.com/QuantumNous/new-api/common"
 +	"github.com/QuantumNous/new-api/constant"
-+	"github.com/QuantumNous/new-api/dto"
++	"github.com/QuantumNous/new-api/relaykit/dto"
 +	relaycommon "github.com/QuantumNous/new-api/relay/common"
 +	"github.com/QuantumNous/new-api/types"
 +	"github.com/stretchr/testify/assert"
@@ -524,3 +512,15 @@ index 00000000..2074f245
 +	assert.True(t, info.IsStream)
 +	assert.Contains(t, recorder.Body.String(), `"type":"message_start"`)
 +}
+diff --git a/relaykit/dto/claude.go b/relaykit/dto/claude.go
+index a3a41e7..69e3149 100644
+--- a/relaykit/dto/claude.go
++++ b/relaykit/dto/claude.go
+@@ -21,6 +21,7 @@ type ClaudeMediaMessage struct {
+ 	Source       *ClaudeMessageSource `json:"source,omitempty"`
+ 	Usage        *ClaudeUsage         `json:"usage,omitempty"`
+ 	StopReason   *string              `json:"stop_reason,omitempty"`
++	StopSequence *string              `json:"stop_sequence,omitempty"`
+ 	PartialJson  *string              `json:"partial_json,omitempty"`
+ 	Role         string               `json:"role,omitempty"`
+ 	Thinking     *string              `json:"thinking,omitempty"`

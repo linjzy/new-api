@@ -36,7 +36,7 @@ anthropic_customization_present() {
     grep -q 'return ClaudeBufferedStreamHandler' \
       "$SOURCE_DIR/relay/channel/claude/adaptor.go" &&
     grep -q 'StopSequence.*stop_sequence' \
-      "$SOURCE_DIR/dto/claude.go"
+      "$SOURCE_DIR/relaykit/dto/claude.go"
 }
 
 channel_test_customization_present() {
