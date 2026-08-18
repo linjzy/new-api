@@ -1,8 +1,17 @@
 diff --git a/controller/channel-test.go b/controller/channel-test.go
-index 4ba3698..21484e5 100644
+index b294979..45e402f 100644
 --- a/controller/channel-test.go
 +++ b/controller/channel-test.go
-@@ -52,6 +52,13 @@ func normalizeChannelTestEndpoint(channel *model.Channel, modelName, endpointTyp
+@@ -42,7 +42,7 @@ type testResult struct {
+ 	newAPIError *types.NewAPIError
+ }
+ 
+-func normalizeChannelTestEndpoint(channel *model.Channel, endpointType string) string {
++func normalizeChannelTestEndpoint(channel *model.Channel, modelName, endpointType string) string {
+ 	normalized := strings.TrimSpace(endpointType)
+ 	if normalized != "" {
+ 		return normalized
+@@ -50,6 +50,13 @@ func normalizeChannelTestEndpoint(channel *model.Channel, endpointType string) s
  	if channel != nil && channel.Type == constant.ChannelTypeCodex {
  		return string(constant.EndpointTypeOpenAIResponse)
  	}
@@ -15,6 +24,15 @@ index 4ba3698..21484e5 100644
 +	}
  	return normalized
  }
+ 
+@@ -108,7 +115,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+ 		}
+ 	}
+ 
+-	endpointType = normalizeChannelTestEndpoint(channel, endpointType)
++	endpointType = normalizeChannelTestEndpoint(channel, testModel, endpointType)
+ 
+ 	requestPath := "/v1/chat/completions"
  
 diff --git a/controller/channel_test_endpoint_test.go b/controller/channel_test_endpoint_test.go
 new file mode 100644
