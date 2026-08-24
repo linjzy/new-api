@@ -17,6 +17,10 @@ type RetryParam struct {
 	RequestPath  string
 	Retry        *int
 	resetNextTry bool
+	// sequentialChannelID is set only after a sequential multi-key failure
+	// retires the current key. The next attempt must stay on that channel so
+	// key priority is not accidentally replaced by channel priority/weight.
+	sequentialChannelID int
 }
 
 func (p *RetryParam) GetRetry() int {
@@ -43,6 +47,23 @@ func (p *RetryParam) IncreaseRetry() {
 
 func (p *RetryParam) ResetRetryNextTry() {
 	p.resetNextTry = true
+}
+
+func (p *RetryParam) SetSequentialChannel(channelID int) {
+	p.sequentialChannelID = channelID
+}
+
+// TakeSequentialChannel returns the channel pinned for one key fallback and
+// clears the pin before the request is sent. A subsequent failure must opt in
+// again, which keeps transient errors bounded by the normal retry policy.
+func (p *RetryParam) TakeSequentialChannel() int {
+	channelID := p.sequentialChannelID
+	p.sequentialChannelID = 0
+	return channelID
+}
+
+func (p *RetryParam) HasSequentialChannel() bool {
+	return p.sequentialChannelID > 0
 }
 
 // CacheGetRandomSatisfiedChannel tries to get a random channel that satisfies the requirements.
