@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -42,10 +43,7 @@ func EnableChannel(channelId int, usingKey string, channelName string) {
 	}
 }
 
-func ShouldDisableChannel(err *types.NewAPIError) bool {
-	if !common.AutomaticDisableChannelEnabled {
-		return false
-	}
+func shouldDisableChannelCore(err *types.NewAPIError) bool {
 	if err == nil {
 		return false
 	}
@@ -62,6 +60,32 @@ func ShouldDisableChannel(err *types.NewAPIError) bool {
 	lowerMessage := strings.ToLower(err.Error())
 	search, _ := AcSearch(lowerMessage, operation_setting.AutomaticDisableKeywords, true)
 	return search
+}
+
+func ShouldDisableChannel(err *types.NewAPIError) bool {
+	if !common.AutomaticDisableChannelEnabled {
+		return false
+	}
+	return shouldDisableChannelCore(err)
+}
+
+// SequentialKeyAutoSkip reports whether the channel is a multi-key channel in
+// sequential (priority) mode: a failing key is retired and the next enabled
+// key takes over on the following request/retry.
+func SequentialKeyAutoSkip(channel *model.Channel) bool {
+	return channel.ChannelInfo.IsMultiKey && channel.ChannelInfo.MultiKeyMode == constant.MultiKeyModeSequential
+}
+
+// ShouldDisableChannelForChannel decides whether a failed request should
+// disable the channel (or, in multi-key mode, the used key). Sequential
+// multi-key channels ignore the global AutomaticDisableChannelEnabled switch:
+// their "skip to the next key on failure" semantics require a failing key to
+// be retired immediately, regardless of the global setting.
+func ShouldDisableChannelForChannel(channel *model.Channel, err *types.NewAPIError) bool {
+	if SequentialKeyAutoSkip(channel) {
+		return shouldDisableChannelCore(err)
+	}
+	return ShouldDisableChannel(err)
 }
 
 func ShouldEnableChannel(newAPIError *types.NewAPIError, status int) bool {
