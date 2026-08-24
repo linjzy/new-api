@@ -1,0 +1,175 @@
+diff --git a/constant/multi_key_mode.go b/constant/multi_key_mode.go
+index cd0cdbff..315d1ab0 100644
+--- a/constant/multi_key_mode.go
++++ b/constant/multi_key_mode.go
+@@ -3,6 +3,7 @@ package constant
+ type MultiKeyMode string
+ 
+ const (
+-	MultiKeyModeRandom  MultiKeyMode = "random"  // 随机
+-	MultiKeyModePolling MultiKeyMode = "polling" // 轮询
++	MultiKeyModeRandom     MultiKeyMode = "random"     // 随机
++	MultiKeyModePolling    MultiKeyMode = "polling"    // 轮询
++	MultiKeyModeSequential MultiKeyMode = "sequential"  // 顺序(优先):始终使用第一个可用 key,失败后切换下一个
+ )
+diff --git a/model/channel.go b/model/channel.go
+index 0f8cdb10..1b31b74b 100644
+--- a/model/channel.go
++++ b/model/channel.go
+@@ -276,6 +276,10 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
+ 		}
+ 		// Fallback – should not happen, but return first enabled key
+ 		return keys[enabledIdx[0]], enabledIdx[0], nil
++	case constant.MultiKeyModeSequential:
++		// 顺序模式:始终使用第一个启用的 key;key 失败后由 UpdateChannelStatus 自动禁用,
++		// 下一次请求自然落到下一个启用的 key(不移动轮询指针)
++		return keys[enabledIdx[0]], enabledIdx[0], nil
+ 	default:
+ 		// Unknown mode, default to first enabled key (or original key string)
+ 		return keys[enabledIdx[0]], enabledIdx[0], nil
+diff --git a/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx b/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx
+index 56a4e950..fbfceec1 100644
+--- a/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx
++++ b/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx
+@@ -3203,6 +3203,10 @@ export function ChannelMutateDrawer({
+                                               value: 'polling',
+                                               label: t('Polling'),
+                                             },
++                                            {
++                                              value: 'sequential',
++                                              label: t('Sequential'),
++                                            },
+                                           ]}
+                                           onValueChange={field.onChange}
+                                           value={field.value}
+@@ -3222,6 +3226,9 @@ export function ChannelMutateDrawer({
+                                               <SelectItem value='polling'>
+                                                 {t('Polling')}
+                                               </SelectItem>
++                                              <SelectItem value='sequential'>
++                                                {t('Sequential')}
++                                              </SelectItem>
+                                             </SelectGroup>
+                                           </SelectContent>
+                                         </Select>
+@@ -3232,6 +3239,10 @@ export function ChannelMutateDrawer({
+                                                 'Polling mode requires Redis and memory cache, otherwise performance will be significantly degraded'
+                                               )}
+                                             </span>
++                                          ) : multiKeyType === 'sequential' ? (
++                                            t(
++                                              'Always use the first enabled key; once it fails, the next key is used automatically'
++                                            )
+                                           ) : (
+                                             t(
+                                               'Randomly select a key from the pool for each request'
+diff --git a/web/src/features/channels/lib/channel-form.ts b/web/src/features/channels/lib/channel-form.ts
+index 244014cb..cf347ae8 100644
+--- a/web/src/features/channels/lib/channel-form.ts
++++ b/web/src/features/channels/lib/channel-form.ts
+@@ -249,7 +249,7 @@ export const channelFormSchema = z
+     other: z.string().optional(),
+     // Multi-key options (not sent to backend directly)
+     multi_key_mode: z.enum(['single', 'batch', 'multi_to_single']).optional(),
+-    multi_key_type: z.enum(['random', 'polling']).optional(),
++    multi_key_type: z.enum(['random', 'polling', 'sequential']).optional(),
+     batch_add_set_key_prefix_2_name: z.boolean().optional(),
+     key_mode: z.enum(['append', 'replace']).optional(), // For editing multi-key channels
+     // Channel extra settings (stored in setting JSON, not sent directly)
+diff --git a/web/src/features/channels/types.ts b/web/src/features/channels/types.ts
+index 6b53c336..fe4dc8f1 100644
+--- a/web/src/features/channels/types.ts
++++ b/web/src/features/channels/types.ts
+@@ -364,7 +364,7 @@ export interface ChannelFormData {
+   other?: string
+   // Multi-key specific
+   multi_key_mode?: 'single' | 'batch' | 'multi_to_single'
+-  multi_key_type?: 'random' | 'polling'
++  multi_key_type?: 'random' | 'polling' | 'sequential'
+   batch_add_set_key_prefix_2_name?: boolean
+ }
+ 
+diff --git a/web/src/i18n/locales/en.json b/web/src/i18n/locales/en.json
+index 86095b29..24ee8c14 100644
+--- a/web/src/i18n/locales/en.json
++++ b/web/src/i18n/locales/en.json
+@@ -3673,6 +3673,7 @@
+     "Quota:": "Quota:",
+     "Radius": "Radius",
+     "Random": "Random",
++    "Sequential": "Sequential",
+     "Randomly select a key from the pool for each request": "Randomly select a key from the pool for each request",
+     "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.",
+     "Rankings": "Rankings",
+diff --git a/web/src/i18n/locales/fr.json b/web/src/i18n/locales/fr.json
+index 1d4dc4b9..674f7a08 100644
+--- a/web/src/i18n/locales/fr.json
++++ b/web/src/i18n/locales/fr.json
+@@ -3673,6 +3673,7 @@
+     "Quota:": "Quota :",
+     "Radius": "Rayon",
+     "Random": "Aléatoire",
++    "Sequential": "Séquentiel",
+     "Randomly select a key from the pool for each request": "Sélectionner aléatoirement une clé du pool pour chaque requête",
+     "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "Les données de classement sont actuellement simulées à des fins d'aperçu et seront remplacées par des analyses en direct une fois l'intégration backend livrée.",
+     "Rankings": "Classements",
+diff --git a/web/src/i18n/locales/ja.json b/web/src/i18n/locales/ja.json
+index 7eaed957..16d84236 100644
+--- a/web/src/i18n/locales/ja.json
++++ b/web/src/i18n/locales/ja.json
+@@ -3673,6 +3673,7 @@
+     "Quota:": "クォータ：",
+     "Radius": "角丸",
+     "Random": "ランダム",
++    "Sequential": "順次",
+     "Randomly select a key from the pool for each request": "各リクエストごとにプールからランダムにキーを選択",
+     "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "現在のランキングデータはプレビュー用のシミュレーションです。バックエンド連携が完了次第、リアルタイム分析データに置き換わります。",
+     "Rankings": "ランキング",
+diff --git a/web/src/i18n/locales/ru.json b/web/src/i18n/locales/ru.json
+index 9e087d1f..697a3289 100644
+--- a/web/src/i18n/locales/ru.json
++++ b/web/src/i18n/locales/ru.json
+@@ -3673,6 +3673,7 @@
+     "Quota:": "Квота:",
+     "Radius": "Радиус",
+     "Random": "Случайный",
++    "Sequential": "Последовательно",
+     "Randomly select a key from the pool for each request": "Случайно выбирать ключ из пула для каждого запроса",
+     "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "Сейчас данные рейтинга смоделированы для превью; после внедрения бэкенда они будут заменены реальной аналитикой.",
+     "Rankings": "Рейтинги",
+diff --git a/web/src/i18n/locales/vi.json b/web/src/i18n/locales/vi.json
+index 2ae59238..7a6908d0 100644
+--- a/web/src/i18n/locales/vi.json
++++ b/web/src/i18n/locales/vi.json
+@@ -3673,6 +3673,7 @@
+     "Quota:": "Hạn ngạch:",
+     "Radius": "Bo góc",
+     "Random": "Ngẫu nhiên",
++    "Sequential": "Tuần tự",
+     "Randomly select a key from the pool for each request": "Chọn ngẫu nhiên một khóa từ kho cho mỗi yêu cầu",
+     "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "Dữ liệu xếp hạng hiện đang được mô phỏng để xem trước và sẽ được thay bằng dữ liệu thực sau khi tích hợp backend.",
+     "Rankings": "Bảng xếp hạng",
+diff --git a/web/src/i18n/locales/zh-TW.json b/web/src/i18n/locales/zh-TW.json
+index 25250e24..f0168881 100644
+--- a/web/src/i18n/locales/zh-TW.json
++++ b/web/src/i18n/locales/zh-TW.json
+@@ -3673,6 +3673,7 @@
+     "Quota:": "Quota:",
+     "Radius": "圓角",
+     "Random": "隨機",
++    "Sequential": "順序",
+     "Randomly select a key from the pool for each request": "每次請求從池中隨機選擇一個金鑰",
+     "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "目前排行榜數據為預覽用模擬數據，後端整合完成後將替換為真實分析數據。",
+     "Rankings": "排行榜",
+diff --git a/web/src/i18n/locales/zh.json b/web/src/i18n/locales/zh.json
+index 457b1c53..59ffedf9 100644
+--- a/web/src/i18n/locales/zh.json
++++ b/web/src/i18n/locales/zh.json
+@@ -3673,6 +3673,7 @@
+     "Quota:": "Quota:",
+     "Radius": "圆角",
+     "Random": "随机",
++    "Sequential": "顺序",
+     "Randomly select a key from the pool for each request": "每次请求从池中随机选择一个密钥",
+     "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "当前排行榜数据为预览用模拟数据，后端集成完成后将替换为真实分析数据。",
+     "Rankings": "排行榜",
