@@ -400,6 +400,14 @@ index 8dccfe76..4b543743 100644
  		if !shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry()) {
  			break
  		}
+@@ -326,6 +326,7 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
+ 	if newAPIError != nil {
+ 		return nil, newAPIError
+ 	}
++	common.SysLog(fmt.Sprintf("SEQKEY-SETUP ch=%d ctxmulti=%v objmulti=%v mode=%q keylen=%d", channel.Id, common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey), channel.ChannelInfo.IsMultiKey, channel.ChannelInfo.MultiKeyMode, len(channel.Key)))
+ 	return channel, nil
+ }
+ 
 --- a/controller/channel-test.go
 +++ b/controller/channel-test.go
 @@ -931,10 +931,10 @@

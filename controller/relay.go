@@ -326,6 +326,7 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 	if newAPIError != nil {
 		return nil, newAPIError
 	}
+	common.SysLog(fmt.Sprintf("SEQKEY-SETUP ch=%d ctxmulti=%v objmulti=%v mode=%q keylen=%d", channel.Id, common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey), channel.ChannelInfo.IsMultiKey, channel.ChannelInfo.MultiKeyMode, len(channel.Key)))
 	return channel, nil
 }
 
