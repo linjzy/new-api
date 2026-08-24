@@ -253,7 +253,9 @@ export function MultiKeyManageDialog({
                 label={
                   currentRow.channel_info.multi_key_mode === 'random'
                     ? t('Random')
-                    : t('Polling')
+                    : currentRow.channel_info.multi_key_mode === 'sequential'
+                      ? t('Sequential')
+                      : t('Polling')
                 }
                 variant='neutral'
                 copyable={false}

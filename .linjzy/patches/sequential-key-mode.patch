@@ -1,0 +1,317 @@
+diff --git a/constant/multi_key_mode.go b/constant/multi_key_mode.go
+index cd0cdbff..315d1ab0 100644
+--- a/constant/multi_key_mode.go
++++ b/constant/multi_key_mode.go
+@@ -3,6 +3,7 @@ package constant
+ type MultiKeyMode string
+ 
+ const (
+-	MultiKeyModeRandom  MultiKeyMode = "random"  // 随机
+-	MultiKeyModePolling MultiKeyMode = "polling" // 轮询
++	MultiKeyModeRandom     MultiKeyMode = "random"     // 随机
++	MultiKeyModePolling    MultiKeyMode = "polling"    // 轮询
++	MultiKeyModeSequential MultiKeyMode = "sequential"  // 顺序(优先):始终使用第一个可用 key,失败后切换下一个
+ )
+diff --git a/model/channel.go b/model/channel.go
+index 0f8cdb10..1b31b74b 100644
+--- a/model/channel.go
++++ b/model/channel.go
+@@ -276,6 +276,10 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
+ 		}
+ 		// Fallback – should not happen, but return first enabled key
+ 		return keys[enabledIdx[0]], enabledIdx[0], nil
++	case constant.MultiKeyModeSequential:
++		// 顺序模式:始终使用第一个启用的 key;key 失败后由 UpdateChannelStatus 自动禁用,
++		// 下一次请求自然落到下一个启用的 key(不移动轮询指针)
++		return keys[enabledIdx[0]], enabledIdx[0], nil
+ 	default:
+ 		// Unknown mode, default to first enabled key (or original key string)
+ 		return keys[enabledIdx[0]], enabledIdx[0], nil
+diff --git a/web/src/features/channels/components/channels-columns.tsx b/web/src/features/channels/components/channels-columns.tsx
+index ad6fadcd..8c0f844a 100644
+--- a/web/src/features/channels/components/channels-columns.tsx
++++ b/web/src/features/channels/components/channels-columns.tsx
+@@ -21,6 +21,7 @@ import { useQueryClient } from '@tanstack/react-query'
+ import type { ColumnDef } from '@tanstack/react-table'
+ import {
+   AlertTriangle,
++  ArrowDownWideNarrow,
+   ChevronDown,
+   ChevronRight,
+   ListOrdered,
+@@ -788,11 +789,17 @@ export function useChannelsColumns(
+           const isMultiKey = isMultiKeyChannel(channel)
+           const multiKeyMode = channel.channel_info?.multi_key_mode ?? 'random'
+           const MultiKeyModeIcon =
+-            multiKeyMode === 'random' ? Shuffle : ListOrdered
++            multiKeyMode === 'random'
++              ? Shuffle
++              : multiKeyMode === 'sequential'
++                ? ArrowDownWideNarrow
++                : ListOrdered
+           const multiKeyTooltip =
+             multiKeyMode === 'random'
+               ? t('Multi-key: Random rotation')
+-              : t('Multi-key: Polling rotation')
++              : multiKeyMode === 'sequential'
++                ? t('Multi-key: Sequential priority')
++                : t('Multi-key: Polling rotation')
+ 
+           const ionetMeta = parseIonetMeta(channel.other_info)
+           const isIonet = ionetMeta?.source === 'ionet'
+diff --git a/web/src/features/channels/components/dialogs/multi-key-manage-dialog.tsx b/web/src/features/channels/components/dialogs/multi-key-manage-dialog.tsx
+index 22f75214..83599502 100644
+--- a/web/src/features/channels/components/dialogs/multi-key-manage-dialog.tsx
++++ b/web/src/features/channels/components/dialogs/multi-key-manage-dialog.tsx
+@@ -253,7 +253,9 @@ export function MultiKeyManageDialog({
+                 label={
+                   currentRow.channel_info.multi_key_mode === 'random'
+                     ? t('Random')
+-                    : t('Polling')
++                    : currentRow.channel_info.multi_key_mode === 'sequential'
++                      ? t('Sequential')
++                      : t('Polling')
+                 }
+                 variant='neutral'
+                 copyable={false}
+diff --git a/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx b/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx
+index 56a4e950..fbfceec1 100644
+--- a/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx
++++ b/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx
+@@ -3203,6 +3203,10 @@ export function ChannelMutateDrawer({
+                                               value: 'polling',
+                                               label: t('Polling'),
+                                             },
++                                            {
++                                              value: 'sequential',
++                                              label: t('Sequential'),
++                                            },
+                                           ]}
+                                           onValueChange={field.onChange}
+                                           value={field.value}
+@@ -3222,6 +3226,9 @@ export function ChannelMutateDrawer({
+                                               <SelectItem value='polling'>
+                                                 {t('Polling')}
+                                               </SelectItem>
++                                              <SelectItem value='sequential'>
++                                                {t('Sequential')}
++                                              </SelectItem>
+                                             </SelectGroup>
+                                           </SelectContent>
+                                         </Select>
+@@ -3232,6 +3239,10 @@ export function ChannelMutateDrawer({
+                                                 'Polling mode requires Redis and memory cache, otherwise performance will be significantly degraded'
+                                               )}
+                                             </span>
++                                          ) : multiKeyType === 'sequential' ? (
++                                            t(
++                                              'Always use the first enabled key; once it fails, the next key is used automatically'
++                                            )
+                                           ) : (
+                                             t(
+                                               'Randomly select a key from the pool for each request'
+diff --git a/web/src/features/channels/constants.ts b/web/src/features/channels/constants.ts
+index 861b30f2..933a2b49 100644
+--- a/web/src/features/channels/constants.ts
++++ b/web/src/features/channels/constants.ts
+@@ -189,6 +189,7 @@ export const MULTI_KEY_STATUS_CONFIG = {
+ export const MULTI_KEY_MODES = [
+   { value: 'random', label: 'Random' },
+   { value: 'polling', label: 'Polling' },
++  { value: 'sequential', label: 'Sequential' },
+ ] as const
+ 
+ export const ADD_MODE_OPTIONS = [
+diff --git a/web/src/features/channels/lib/channel-form.ts b/web/src/features/channels/lib/channel-form.ts
+index 244014cb..e58643ba 100644
+--- a/web/src/features/channels/lib/channel-form.ts
++++ b/web/src/features/channels/lib/channel-form.ts
+@@ -249,7 +249,7 @@ export const channelFormSchema = z
+     other: z.string().optional(),
+     // Multi-key options (not sent to backend directly)
+     multi_key_mode: z.enum(['single', 'batch', 'multi_to_single']).optional(),
+-    multi_key_type: z.enum(['random', 'polling']).optional(),
++    multi_key_type: z.enum(['random', 'polling', 'sequential']).optional(),
+     batch_add_set_key_prefix_2_name: z.boolean().optional(),
+     key_mode: z.enum(['append', 'replace']).optional(), // For editing multi-key channels
+     // Channel extra settings (stored in setting JSON, not sent directly)
+@@ -777,7 +777,7 @@ function normalizeBaseUrl(value: string | undefined): string {
+  */
+ export function transformFormDataToCreatePayload(formData: ChannelFormValues): {
+   mode: 'single' | 'batch' | 'multi_to_single'
+-  multi_key_mode?: 'random' | 'polling'
++  multi_key_mode?: 'random' | 'polling' | 'sequential'
+   batch_add_set_key_prefix_2_name?: boolean
+   channel: Partial<Channel>
+ } {
+diff --git a/web/src/features/channels/types.ts b/web/src/features/channels/types.ts
+index 6b53c336..216a63a9 100644
+--- a/web/src/features/channels/types.ts
++++ b/web/src/features/channels/types.ts
+@@ -29,7 +29,7 @@ export const channelInfoSchema = z.object({
+   multi_key_disabled_reason: z.record(z.string(), z.string()).optional(),
+   multi_key_disabled_time: z.record(z.string(), z.number()).optional(),
+   multi_key_polling_index: z.number().default(0),
+-  multi_key_mode: z.enum(['random', 'polling']).default('random'),
++  multi_key_mode: z.enum(['random', 'polling', 'sequential']).default('random'),
+ })
+ 
+ export type ChannelInfo = z.infer<typeof channelInfoSchema>
+@@ -364,7 +364,7 @@ export interface ChannelFormData {
+   other?: string
+   // Multi-key specific
+   multi_key_mode?: 'single' | 'batch' | 'multi_to_single'
+-  multi_key_type?: 'random' | 'polling'
++  multi_key_type?: 'random' | 'polling' | 'sequential'
+   batch_add_set_key_prefix_2_name?: boolean
+ }
+ 
+@@ -374,7 +374,7 @@ export interface ChannelFormData {
+ 
+ export interface AddChannelRequest {
+   mode: 'single' | 'batch' | 'multi_to_single'
+-  multi_key_mode?: 'random' | 'polling'
++  multi_key_mode?: 'random' | 'polling' | 'sequential'
+   batch_add_set_key_prefix_2_name?: boolean
+   channel: Partial<Channel>
+ }
+diff --git a/web/src/i18n/locales/en.json b/web/src/i18n/locales/en.json
+index 86095b29..1a768c1a 100644
+--- a/web/src/i18n/locales/en.json
++++ b/web/src/i18n/locales/en.json
+@@ -2824,6 +2824,7 @@
+     "Multi-Key Strategy": "Multi-Key Strategy",
+     "Multi-key: Polling rotation": "Multi-key: Polling rotation",
+     "Multi-key: Random rotation": "Multi-key: Random rotation",
++    "Multi-key: Sequential priority": "Multi-key: Sequential priority",
+     "Multi-protocol Compatible": "Multi-protocol Compatible",
+     "Multi-region deployment for stable global access": "Multi-region deployment for stable global access",
+     "Multi-step thinking before final answer": "Multi-step thinking before final answer",
+@@ -3673,6 +3674,7 @@
+     "Quota:": "Quota:",
+     "Radius": "Radius",
+     "Random": "Random",
++    "Sequential": "Sequential",
+     "Randomly select a key from the pool for each request": "Randomly select a key from the pool for each request",
+     "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.",
+     "Rankings": "Rankings",
+diff --git a/web/src/i18n/locales/fr.json b/web/src/i18n/locales/fr.json
+index 1d4dc4b9..fcd36dd7 100644
+--- a/web/src/i18n/locales/fr.json
++++ b/web/src/i18n/locales/fr.json
+@@ -2824,6 +2824,7 @@
+     "Multi-Key Strategy": "Stratégie multi-clés",
+     "Multi-key: Polling rotation": "Multi-clé : Rotation par sondage",
+     "Multi-key: Random rotation": "Multi-clé : Rotation aléatoire",
++    "Multi-key: Sequential priority": "Multi-clés : priorité séquentielle",
+     "Multi-protocol Compatible": "Compatible multi-protocole",
+     "Multi-region deployment for stable global access": "Déploiement multirégional pour un accès mondial stable",
+     "Multi-step thinking before final answer": "Raisonnement en plusieurs étapes avant la réponse finale",
+@@ -3673,6 +3674,7 @@
+     "Quota:": "Quota :",
+     "Radius": "Rayon",
+     "Random": "Aléatoire",
++    "Sequential": "Séquentiel",
+     "Randomly select a key from the pool for each request": "Sélectionner aléatoirement une clé du pool pour chaque requête",
+     "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "Les données de classement sont actuellement simulées à des fins d'aperçu et seront remplacées par des analyses en direct une fois l'intégration backend livrée.",
+     "Rankings": "Classements",
+diff --git a/web/src/i18n/locales/ja.json b/web/src/i18n/locales/ja.json
+index 7eaed957..8bdc07c2 100644
+--- a/web/src/i18n/locales/ja.json
++++ b/web/src/i18n/locales/ja.json
+@@ -2824,6 +2824,7 @@
+     "Multi-Key Strategy": "マルチキー戦略",
+     "Multi-key: Polling rotation": "マルチキー：ポーリングローテーション",
+     "Multi-key: Random rotation": "マルチキー：ランダムローテーション",
++    "Multi-key: Sequential priority": "マルチキー：順番優先",
+     "Multi-protocol Compatible": "マルチプロトコル互換",
+     "Multi-region deployment for stable global access": "安定したグローバルアクセスを実現するマルチリージョンデプロイメント",
+     "Multi-step thinking before final answer": "最終回答の前に複数ステップで思考",
+@@ -3673,6 +3674,7 @@
+     "Quota:": "クォータ：",
+     "Radius": "角丸",
+     "Random": "ランダム",
++    "Sequential": "順次",
+     "Randomly select a key from the pool for each request": "各リクエストごとにプールからランダムにキーを選択",
+     "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "現在のランキングデータはプレビュー用のシミュレーションです。バックエンド連携が完了次第、リアルタイム分析データに置き換わります。",
+     "Rankings": "ランキング",
+diff --git a/web/src/i18n/locales/ru.json b/web/src/i18n/locales/ru.json
+index 9e087d1f..0524f157 100644
+--- a/web/src/i18n/locales/ru.json
++++ b/web/src/i18n/locales/ru.json
+@@ -2824,6 +2824,7 @@
+     "Multi-Key Strategy": "Стратегия нескольких ключей",
+     "Multi-key: Polling rotation": "Мульти-ключ: Циклическая ротация",
+     "Multi-key: Random rotation": "Мульти-ключ: Случайная ротация",
++    "Multi-key: Sequential priority": "Мульти-ключ: последовательный приоритет",
+     "Multi-protocol Compatible": "Совместимо с несколькими протоколами",
+     "Multi-region deployment for stable global access": "Мультирегиональное развертывание для стабильного глобального доступа",
+     "Multi-step thinking before final answer": "Многошаговые рассуждения перед итоговым ответом",
+@@ -3673,6 +3674,7 @@
+     "Quota:": "Квота:",
+     "Radius": "Радиус",
+     "Random": "Случайный",
++    "Sequential": "Последовательно",
+     "Randomly select a key from the pool for each request": "Случайно выбирать ключ из пула для каждого запроса",
+     "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "Сейчас данные рейтинга смоделированы для превью; после внедрения бэкенда они будут заменены реальной аналитикой.",
+     "Rankings": "Рейтинги",
+diff --git a/web/src/i18n/locales/vi.json b/web/src/i18n/locales/vi.json
+index 2ae59238..4c1d1ff1 100644
+--- a/web/src/i18n/locales/vi.json
++++ b/web/src/i18n/locales/vi.json
+@@ -2824,6 +2824,7 @@
+     "Multi-Key Strategy": "Chiến lược đa khóa",
+     "Multi-key: Polling rotation": "Đa khóa: Xoay vòng tuần tự",
+     "Multi-key: Random rotation": "Đa khóa: Xoay vòng ngẫu nhiên",
++    "Multi-key: Sequential priority": "Đa khóa: ưu tiên tuần tự",
+     "Multi-protocol Compatible": "Tương thích đa giao thức",
+     "Multi-region deployment for stable global access": "Triển khai đa khu vực để truy cập toàn cầu ổn định",
+     "Multi-step thinking before final answer": "Suy luận nhiều bước trước khi đưa ra câu trả lời cuối",
+@@ -3673,6 +3674,7 @@
+     "Quota:": "Hạn ngạch:",
+     "Radius": "Bo góc",
+     "Random": "Ngẫu nhiên",
++    "Sequential": "Tuần tự",
+     "Randomly select a key from the pool for each request": "Chọn ngẫu nhiên một khóa từ kho cho mỗi yêu cầu",
+     "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "Dữ liệu xếp hạng hiện đang được mô phỏng để xem trước và sẽ được thay bằng dữ liệu thực sau khi tích hợp backend.",
+     "Rankings": "Bảng xếp hạng",
+diff --git a/web/src/i18n/locales/zh-TW.json b/web/src/i18n/locales/zh-TW.json
+index 25250e24..cefa15ec 100644
+--- a/web/src/i18n/locales/zh-TW.json
++++ b/web/src/i18n/locales/zh-TW.json
+@@ -2824,6 +2824,7 @@
+     "Multi-Key Strategy": "多金鑰策略",
+     "Multi-key: Polling rotation": "多金鑰：輪詢",
+     "Multi-key: Random rotation": "多金鑰：隨機",
++    "Multi-key: Sequential priority": "多密鑰：順序優先",
+     "Multi-protocol Compatible": "兼容多協定",
+     "Multi-region deployment for stable global access": "多區域部署，實現穩定的全球存取",
+     "Multi-step thinking before final answer": "在給出最終答案前進行多步推理",
+@@ -3673,6 +3674,7 @@
+     "Quota:": "Quota:",
+     "Radius": "圓角",
+     "Random": "隨機",
++    "Sequential": "順序",
+     "Randomly select a key from the pool for each request": "每次請求從池中隨機選擇一個金鑰",
+     "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "目前排行榜數據為預覽用模擬數據，後端整合完成後將替換為真實分析數據。",
+     "Rankings": "排行榜",
+diff --git a/web/src/i18n/locales/zh.json b/web/src/i18n/locales/zh.json
+index 457b1c53..0825e67a 100644
+--- a/web/src/i18n/locales/zh.json
++++ b/web/src/i18n/locales/zh.json
+@@ -2824,6 +2824,7 @@
+     "Multi-Key Strategy": "多密钥策略",
+     "Multi-key: Polling rotation": "多密钥：轮询",
+     "Multi-key: Random rotation": "多密钥：随机",
++    "Multi-key: Sequential priority": "多密钥：顺序优先",
+     "Multi-protocol Compatible": "兼容多协议",
+     "Multi-region deployment for stable global access": "多区域部署，实现稳定的全球访问",
+     "Multi-step thinking before final answer": "在给出最终答案前进行多步推理",
+@@ -3673,6 +3674,7 @@
+     "Quota:": "Quota:",
+     "Radius": "圆角",
+     "Random": "随机",
++    "Sequential": "顺序",
+     "Randomly select a key from the pool for each request": "每次请求从池中随机选择一个密钥",
+     "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "当前排行榜数据为预览用模拟数据，后端集成完成后将替换为真实分析数据。",
+     "Rankings": "排行榜",

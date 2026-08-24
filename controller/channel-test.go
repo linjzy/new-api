@@ -42,12 +42,19 @@ type testResult struct {
 	newAPIError *types.NewAPIError
 }
 
-func normalizeChannelTestEndpoint(channel *model.Channel, endpointType string) string {
+func normalizeChannelTestEndpoint(channel *model.Channel, modelName, endpointType string) string {
 	normalized := strings.TrimSpace(endpointType)
 	if normalized != "" {
 		return normalized
 	}
 	if channel != nil && channel.Type == constant.ChannelTypeCodex {
+		return string(constant.EndpointTypeOpenAIResponse)
+	}
+	if channel != nil && service.ShouldChatCompletionsUseResponsesGlobal(
+		channel.Id,
+		channel.Type,
+		modelName,
+	) {
 		return string(constant.EndpointTypeOpenAIResponse)
 	}
 	return normalized
@@ -108,7 +115,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		}
 	}
 
-	endpointType = normalizeChannelTestEndpoint(channel, endpointType)
+	endpointType = normalizeChannelTestEndpoint(channel, testModel, endpointType)
 
 	requestPath := "/v1/chat/completions"
 
