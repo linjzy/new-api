@@ -57,6 +57,8 @@ sequential_key_customization_present() {
       "$SOURCE_DIR/service/channel.go" &&
   grep -q 'ShouldDisableChannelForChannel(channel, err)' \
       "$SOURCE_DIR/controller/relay.go" &&
+  grep -q 'SequentialKeyAutoSkip(channel) && service.ShouldDisableChannelForChannel' \
+      "$SOURCE_DIR/controller/relay.go" &&
   grep -q 'SequentialKeyAutoSkip(channel)' \
       "$SOURCE_DIR/controller/channel-test.go"
 }

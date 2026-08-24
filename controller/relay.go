@@ -231,6 +231,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
 
+		// 顺序多 key 渠道：key 失败即禁用并直接返回错误，不发起渠道重试；
+		// 后续请求会自动使用下一个启用 key，避免同一次请求重复上游调用。
+		if service.SequentialKeyAutoSkip(channel) && service.ShouldDisableChannelForChannel(channel, newAPIError) {
+			break
+		}
+
 		if !shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry()) {
 			break
 		}
