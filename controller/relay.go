@@ -233,6 +233,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		// 顺序多 key 渠道：key 失败即禁用并直接返回错误，不发起渠道重试；
 		// 后续请求会自动使用下一个启用 key，避免同一次请求重复上游调用。
+		common.SysLog(fmt.Sprintf("SEQKEY-DEBUG ch=%d multi=%v mode=%q disable=%v retry=%d", channel.Id, channel.ChannelInfo.IsMultiKey, channel.ChannelInfo.MultiKeyMode, service.ShouldDisableChannelForChannel(channel, newAPIError), retryParam.GetRetry()))
 		if service.SequentialKeyAutoSkip(channel) && service.ShouldDisableChannelForChannel(channel, newAPIError) {
 			break
 		}
