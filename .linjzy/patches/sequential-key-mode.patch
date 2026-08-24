@@ -315,3 +315,89 @@ index 457b1c53..0825e67a 100644
      "Randomly select a key from the pool for each request": "每次请求从池中随机选择一个密钥",
      "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "当前排行榜数据为预览用模拟数据，后端集成完成后将替换为真实分析数据。",
      "Rankings": "排行榜",
+diff --git a/service/channel.go b/service/channel.go
+index f348e081..cc5b8191 100644
+--- a/service/channel.go
++++ b/service/channel.go
+@@ -5,6 +5,7 @@ import (
+ 	"strings"
+ 
+ 	"github.com/QuantumNous/new-api/common"
++	"github.com/QuantumNous/new-api/constant"
+ 	"github.com/QuantumNous/new-api/model"
+ 	"github.com/QuantumNous/new-api/relaykit/dto"
+ 	"github.com/QuantumNous/new-api/relaykit/types"
+@@ -42,10 +43,7 @@ func EnableChannel(channelId int, usingKey string, channelName string) {
+ 	}
+ }
+ 
+-func ShouldDisableChannel(err *types.NewAPIError) bool {
+-	if !common.AutomaticDisableChannelEnabled {
+-		return false
+-	}
++func shouldDisableChannelCore(err *types.NewAPIError) bool {
+ 	if err == nil {
+ 		return false
+ 	}
+@@ -64,6 +62,32 @@ func ShouldDisableChannel(err *types.NewAPIError) bool {
+ 	return search
+ }
+ 
++func ShouldDisableChannel(err *types.NewAPIError) bool {
++	if !common.AutomaticDisableChannelEnabled {
++		return false
++	}
++	return shouldDisableChannelCore(err)
++}
++
++// SequentialKeyAutoSkip reports whether the channel is a multi-key channel in
++// sequential (priority) mode: a failing key is retired and the next enabled
++// key takes over on the following request/retry.
++func SequentialKeyAutoSkip(channel *model.Channel) bool {
++	return channel.ChannelInfo.IsMultiKey && channel.ChannelInfo.MultiKeyMode == constant.MultiKeyModeSequential
++}
++
++// ShouldDisableChannelForChannel decides whether a failed request should
++// disable the channel (or, in multi-key mode, the used key). Sequential
++// multi-key channels ignore the global AutomaticDisableChannelEnabled switch:
++// their "skip to the next key on failure" semantics require a failing key to
++// be retired immediately, regardless of the global setting.
++func ShouldDisableChannelForChannel(channel *model.Channel, err *types.NewAPIError) bool {
++	if SequentialKeyAutoSkip(channel) {
++		return shouldDisableChannelCore(err)
++	}
++	return ShouldDisableChannel(err)
++}
++
+ func ShouldEnableChannel(newAPIError *types.NewAPIError, status int) bool {
+ 	if !common.AutomaticEnableChannelEnabled {
+ 		return false
+diff --git a/controller/relay.go b/controller/relay.go
+index 8dccfe76..4b543743 100644
+--- a/controller/relay.go
++++ b/controller/relay.go
+@@ -364,7 +364,8 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
+ 	logger.LogError(c, fmt.Sprintf("channel error (channel #%d, status code: %d): %s", channelError.ChannelId, err.StatusCode, common.LocalLogPreview(err.Error())))
+ 	// 不要使用context获取渠道信息，异步处理时可能会出现渠道信息不一致的情况
+ 	// do not use context to get channel info, there may be inconsistent channel info when processing asynchronously
+-	if service.ShouldDisableChannel(err) && channelError.AutoBan {
++	channel, _ := model.CacheGetChannel(channelError.ChannelId)
++	if service.ShouldDisableChannelForChannel(channel, err) && channelError.AutoBan {
+ 		gopool.Go(func() {
+ 			service.DisableChannel(channelError, err.ErrorWithStatusCode())
+ 		})
+--- a/controller/channel-test.go
++++ b/controller/channel-test.go
+@@ -931,10 +931,10 @@
+ 	shouldBanChannel := false
+ 	newAPIError := result.newAPIError
+ 	if newAPIError != nil {
+-		shouldBanChannel = service.ShouldDisableChannel(result.newAPIError)
++		shouldBanChannel = service.ShouldDisableChannelForChannel(channel, result.newAPIError)
+ 	}
+ 
+-	if common.AutomaticDisableChannelEnabled && !shouldBanChannel {
++	if (common.AutomaticDisableChannelEnabled || service.SequentialKeyAutoSkip(channel)) && !shouldBanChannel {
+ 		if milliseconds > disableThreshold {
+ 			err := fmt.Errorf("响应时间 %.2fs 超过阈值 %.2fs", float64(milliseconds)/1000.0, float64(disableThreshold)/1000.0)
+ 			newAPIError = types.NewOpenAIError(err, types.ErrorCodeChannelResponseTimeExceeded, http.StatusRequestTimeout)

@@ -51,8 +51,14 @@ channel_test_customization_present() {
 sequential_key_customization_present() {
   grep -q 'MultiKeyModeSequential' \
     "$SOURCE_DIR/constant/multi_key_mode.go" &&
-    grep -q 'case constant.MultiKeyModeSequential' \
-      "$SOURCE_DIR/model/channel.go"
+  grep -q 'case constant.MultiKeyModeSequential' \
+      "$SOURCE_DIR/model/channel.go" &&
+  grep -q 'func ShouldDisableChannelForChannel' \
+      "$SOURCE_DIR/service/channel.go" &&
+  grep -q 'ShouldDisableChannelForChannel(channel, err)' \
+      "$SOURCE_DIR/controller/relay.go" &&
+  grep -q 'SequentialKeyAutoSkip(channel)' \
+      "$SOURCE_DIR/controller/channel-test.go"
 }
 
 apply_customization() {
