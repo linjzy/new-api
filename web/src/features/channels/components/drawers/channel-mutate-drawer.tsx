@@ -3203,6 +3203,10 @@ export function ChannelMutateDrawer({
                                               value: 'polling',
                                               label: t('Polling'),
                                             },
+                                            {
+                                              value: 'sequential',
+                                              label: t('Sequential'),
+                                            },
                                           ]}
                                           onValueChange={field.onChange}
                                           value={field.value}
@@ -3222,6 +3226,9 @@ export function ChannelMutateDrawer({
                                               <SelectItem value='polling'>
                                                 {t('Polling')}
                                               </SelectItem>
+                                              <SelectItem value='sequential'>
+                                                {t('Sequential')}
+                                              </SelectItem>
                                             </SelectGroup>
                                           </SelectContent>
                                         </Select>
@@ -3232,6 +3239,10 @@ export function ChannelMutateDrawer({
                                                 'Polling mode requires Redis and memory cache, otherwise performance will be significantly degraded'
                                               )}
                                             </span>
+                                          ) : multiKeyType === 'sequential' ? (
+                                            t(
+                                              'Always use the first enabled key; once it fails, the next key is used automatically'
+                                            )
                                           ) : (
                                             t(
                                               'Randomly select a key from the pool for each request'
