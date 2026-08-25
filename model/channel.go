@@ -276,6 +276,10 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 		}
 		// Fallback – should not happen, but return first enabled key
 		return keys[enabledIdx[0]], enabledIdx[0], nil
+	case constant.MultiKeyModeSequential:
+		// Sequential mode always starts with the first enabled key. Relay retry
+		// logic retires a failed key before asking for the next one.
+		return keys[enabledIdx[0]], enabledIdx[0], nil
 	default:
 		// Unknown mode, default to first enabled key (or original key string)
 		return keys[enabledIdx[0]], enabledIdx[0], nil
@@ -654,29 +658,36 @@ func CleanupChannelPollingLocks() {
 	})
 }
 
-func handlerMultiKeyUpdate(channel *Channel, usingKey string, status int, reason string) {
+func handlerMultiKeyUpdate(channel *Channel, usingKey string, usingKeyIndex int, status int, reason string) bool {
 	keys := channel.GetKeys()
 	if len(keys) == 0 {
 		channel.Status = status
 	} else {
-		keyIndex := -1
-		for i, key := range keys {
-			if key == usingKey {
-				keyIndex = i
-				break
+		keyIndex := usingKeyIndex
+		if keyIndex >= 0 {
+			if keyIndex >= len(keys) || keys[keyIndex] != usingKey {
+				common.SysLog(fmt.Sprintf("failed to update multi-key status: channel_id=%d, using key index does not match", channel.Id))
+				return false
+			}
+		} else {
+			for i, key := range keys {
+				if key == usingKey {
+					keyIndex = i
+					break
+				}
 			}
 		}
 		if keyIndex < 0 {
 			if usingKey != "" {
 				common.SysLog(fmt.Sprintf("failed to update multi-key status: channel_id=%d, using key not found", channel.Id))
-				return
+				return false
 			}
 			channel.Status = status
 			info := channel.GetOtherInfo()
 			info["status_reason"] = reason
 			info["status_time"] = common.GetTimestamp()
 			channel.SetOtherInfo(info)
-			return
+			return true
 		}
 		if channel.ChannelInfo.MultiKeyStatusList == nil {
 			channel.ChannelInfo.MultiKeyStatusList = make(map[int]int)
@@ -704,6 +715,7 @@ func handlerMultiKeyUpdate(channel *Channel, usingKey string, status int, reason
 			channel.Status = common.ChannelStatusEnabled
 		}
 	}
+	return true
 }
 
 func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
@@ -720,6 +732,16 @@ func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
 }
 
 func UpdateChannelStatus(channelId int, usingKey string, status int, reason string) bool {
+	return updateChannelStatus(channelId, usingKey, -1, status, reason)
+}
+
+// UpdateChannelStatusByKeyIndex updates the exact credential selected for a
+// multi-key request. The index disambiguates duplicate key values.
+func UpdateChannelStatusByKeyIndex(channelId int, usingKey string, usingKeyIndex int, status int, reason string) bool {
+	return updateChannelStatus(channelId, usingKey, usingKeyIndex, status, reason)
+}
+
+func updateChannelStatus(channelId int, usingKey string, usingKeyIndex int, status int, reason string) bool {
 	if common.MemoryCacheEnabled {
 		channelStatusLock.Lock()
 		defer channelStatusLock.Unlock()
@@ -740,7 +762,9 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
 		if channelCache.ChannelInfo.IsMultiKey {
 			beforeStatus := channelCache.Status
 			// 如果是多Key模式，更新缓存中的状态
-			handlerMultiKeyUpdate(channelCache, usingKey, status, reason)
+			if !handlerMultiKeyUpdate(channelCache, usingKey, usingKeyIndex, status, reason) {
+				return false
+			}
 			if beforeStatus != channelCache.Status {
 				CacheUpdateChannelStatus(channelId, channelCache.Status)
 			}
@@ -774,7 +798,9 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
 
 		if channel.ChannelInfo.IsMultiKey {
 			beforeStatus := channel.Status
-			handlerMultiKeyUpdate(channel, usingKey, status, reason)
+			if !handlerMultiKeyUpdate(channel, usingKey, usingKeyIndex, status, reason) {
+				return false
+			}
 			if beforeStatus != channel.Status {
 				shouldUpdateAbilities = true
 			}
