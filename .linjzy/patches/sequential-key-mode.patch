@@ -49,9 +49,9 @@ index 8dccfe76..c520db34 100644
 +		sequentialKeyDisabled := processChannelErrorForChannel(c, *channelError, newAPIError, channelForError)
 +
 +		// A qualifying sequential-key failure retires only the used key and pins
-+		// the next attempt to the same channel. This fallback is independent of
-+		// the normal channel retry budget, so a channel with more keys than
-+		// RetryTimes still gets a chance to use every enabled key.
++		// the next attempt to the same channel. Pinning suppresses the loop's next
++		// retry increment, so every enabled key is tried without consuming the
++		// normal channel retry budget.
 +		if service.SequentialKeyAutoSkip(channelForError) &&
 +			service.ShouldDisableChannelForChannel(channelForError, newAPIError) &&
 +			sequentialKeyDisabled && sequentialKeyAvailable(channelForError.Id) {
@@ -160,9 +160,10 @@ index 8dccfe76..c520db34 100644
 +			// A locked task channel already provides the sequential fallback
 +			// target; consume the one-shot pin so the next failure must opt in
 +			// again.
-+			retryParam.TakeSequentialChannel()
++			sequentialKeyFallback := retryParam.TakeSequentialChannel() > 0
  			channel = lockedCh
- 			if retryParam.GetRetry() > 0 {
+-			if retryParam.GetRetry() > 0 {
++			if sequentialKeyFallback || retryParam.GetRetry() > 0 {
  				if setupErr := middleware.SetupContextForSelectedChannel(c, channel, relayInfo.OriginModelName); setupErr != nil {
 @@ -560,10 +639,16 @@ func RelayTask(c *gin.Context) {
  		}
@@ -351,17 +352,20 @@ index 0ab88dc8..33b871d1 100644
  }
  
  func (p *RetryParam) GetRetry() int {
-@@ -45,6 +49,23 @@ func (p *RetryParam) ResetRetryNextTry() {
+@@ -45,6 +49,26 @@ func (p *RetryParam) ResetRetryNextTry() {
  	p.resetNextTry = true
  }
  
++// SetSequentialChannel pins one same-channel key fallback and suppresses the
++// loop's next channel retry increment. Rotating keys must not consume RetryTimes.
 +func (p *RetryParam) SetSequentialChannel(channelID int) {
 +	p.sequentialChannelID = channelID
++	p.ResetRetryNextTry()
 +}
 +
 +// TakeSequentialChannel returns the channel pinned for one key fallback and
-+// clears the pin before the request is sent. A subsequent failure must opt in
-+// again, which keeps transient errors bounded by the normal retry policy.
++// clears the pin before the request is sent. A subsequent key failure must opt
++// in again; after the keys are exhausted, the normal channel retry advances.
 +func (p *RetryParam) TakeSequentialChannel() int {
 +	channelID := p.sequentialChannelID
 +	p.sequentialChannelID = 0
@@ -380,7 +384,7 @@ new file mode 100644
 index 00000000..27549c75
 --- /dev/null
 +++ b/service/channel_sequential_test.go
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,70 @@
 +package service
 +
 +import (
@@ -433,14 +437,22 @@ index 00000000..27549c75
 +	require.False(t, ShouldDisableChannelForChannel(sequential, notDisableStatus))
 +}
 +
-+func TestRetryParamSequentialChannelPinIsOneShot(t *testing.T) {
-+	param := &RetryParam{}
++func TestRetryParamSequentialChannelPinDoesNotConsumeChannelRetry(t *testing.T) {
++	retry := 2
++	param := &RetryParam{Retry: &retry}
 +	require.False(t, param.HasSequentialChannel())
 +
-+	param.SetSequentialChannel(17)
-+	require.True(t, param.HasSequentialChannel())
-+	require.Equal(t, 17, param.TakeSequentialChannel())
-+	require.False(t, param.HasSequentialChannel())
++	for i := 0; i < 3; i++ {
++		param.SetSequentialChannel(17)
++		param.IncreaseRetry()
++		require.Equal(t, 2, param.GetRetry())
++		require.True(t, param.HasSequentialChannel())
++		require.Equal(t, 17, param.TakeSequentialChannel())
++		require.False(t, param.HasSequentialChannel())
++	}
++
++	param.IncreaseRetry()
++	require.Equal(t, 3, param.GetRetry())
 +	require.Equal(t, 0, param.TakeSequentialChannel())
 +}
 diff --git a/web/src/features/channels/components/channels-columns.tsx b/web/src/features/channels/components/channels-columns.tsx

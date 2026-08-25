@@ -55,6 +55,11 @@ sequential_customization_present() {
       "$SOURCE_DIR/service/channel.go" &&
     grep -q 'HasSequentialChannel' \
       "$SOURCE_DIR/controller/relay.go" &&
+    grep -q 'p.ResetRetryNextTry()' \
+      "$SOURCE_DIR/service/channel_select.go" &&
+    [[ -f "$SOURCE_DIR/service/channel_sequential_test.go" ]] &&
+    grep -q 'TestRetryParamSequentialChannelPinDoesNotConsumeChannelRetry' \
+      "$SOURCE_DIR/service/channel_sequential_test.go" &&
     [[ -f "$SOURCE_DIR/model/channel_sequential_test.go" ]] &&
     grep -q 'TestGetNextEnabledKeySequentialUsesFirstEnabledKey' \
       "$SOURCE_DIR/model/channel_sequential_test.go" &&
