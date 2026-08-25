@@ -1,5 +1,5 @@
 diff --git a/relay/channel/claude/adaptor.go b/relay/channel/claude/adaptor.go
-index bbd711f..4301df7 100644
+index bbd711ff..4301df74 100644
 --- a/relay/channel/claude/adaptor.go
 +++ b/relay/channel/claude/adaptor.go
 @@ -124,6 +124,11 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
@@ -16,24 +16,26 @@ index bbd711f..4301df7 100644
  		return ClaudeHandler(c, resp, info)
 diff --git a/relay/channel/claude/buffered_stream.go b/relay/channel/claude/buffered_stream.go
 new file mode 100644
-index 0000000..47f87c6
+index 00000000..8bad2354
 --- /dev/null
 +++ b/relay/channel/claude/buffered_stream.go
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,413 @@
 +package claude
 +
 +import (
 +	"bufio"
++	"context"
 +	"fmt"
 +	"net/http"
 +	"sort"
 +	"strings"
++	"time"
 +
 +	"github.com/QuantumNous/new-api/common"
-+	"github.com/QuantumNous/new-api/relaykit/dto"
++	"github.com/QuantumNous/new-api/constant"
 +	relaycommon "github.com/QuantumNous/new-api/relay/common"
 +	"github.com/QuantumNous/new-api/relay/helper"
-+	"github.com/QuantumNous/new-api/service"
++	"github.com/QuantumNous/new-api/relaykit/dto"
 +	"github.com/QuantumNous/new-api/relaykit/types"
 +
 +	"github.com/gin-gonic/gin"
@@ -44,6 +46,8 @@ index 0000000..47f87c6
 +	stopSequence *string
 +	blocks       map[int]*dto.ClaudeMediaMessage
 +	toolInputs   map[int]*strings.Builder
++	textBuffers  map[int]*strings.Builder
++	thinkBuffers map[int]*strings.Builder
 +	started      bool
 +	stopped      bool
 +}
@@ -59,8 +63,10 @@ index 0000000..47f87c6
 +			Type: "message",
 +			Role: "assistant",
 +		},
-+		blocks:     make(map[int]*dto.ClaudeMediaMessage),
-+		toolInputs: make(map[int]*strings.Builder),
++		blocks:       make(map[int]*dto.ClaudeMediaMessage),
++		toolInputs:   make(map[int]*strings.Builder),
++		textBuffers:  make(map[int]*strings.Builder),
++		thinkBuffers: make(map[int]*strings.Builder),
 +	}
 +}
 +
@@ -199,21 +205,38 @@ index 0000000..47f87c6
 +		case "text_delta":
 +			block.Type = "text"
 +			if event.Delta.Text != nil {
-+				text := block.GetText() + *event.Delta.Text
++				builder, ok := a.textBuffers[index]
++				if !ok {
++					builder = &strings.Builder{}
++					builder.WriteString(block.GetText())
++					a.textBuffers[index] = builder
++				}
++				builder.WriteString(*event.Delta.Text)
++				text := builder.String()
 +				block.Text = &text
 +			}
 +		case "thinking_delta":
 +			block.Type = "thinking"
 +			if event.Delta.Thinking != nil {
-+				thinking := ""
-+				if block.Thinking != nil {
-+					thinking = *block.Thinking
++				builder, ok := a.thinkBuffers[index]
++				if !ok {
++					builder = &strings.Builder{}
++					if block.Thinking != nil {
++						builder.WriteString(*block.Thinking)
++					}
++					a.thinkBuffers[index] = builder
 +				}
-+				thinking += *event.Delta.Thinking
++				builder.WriteString(*event.Delta.Thinking)
++				thinking := builder.String()
 +				block.Thinking = &thinking
 +			}
 +		case "signature_delta":
 +			block.Signature += event.Delta.Signature
++		case "citations_delta":
++			if len(event.Delta.Citation) > 0 {
++				citation := append([]byte(nil), event.Delta.Citation...)
++				block.Citations = append(block.Citations, citation)
++			}
 +		case "input_json_delta":
 +			if event.Delta.PartialJson != nil {
 +				builder, ok := a.toolInputs[index]
@@ -271,9 +294,6 @@ index 0000000..47f87c6
 +	if a.response.Model == "" {
 +		a.response.Model = model
 +	}
-+	if a.response.Usage == nil {
-+		a.response.Usage = &dto.ClaudeUsage{}
-+	}
 +	return &claudeBufferedResponse{
 +		ClaudeResponse: &a.response,
 +		StopSequence:   a.stopSequence,
@@ -284,13 +304,80 @@ index 0000000..47f87c6
 +	if resp == nil || resp.Body == nil {
 +		return nil, types.NewError(fmt.Errorf("invalid response"), types.ErrorCodeBadResponse)
 +	}
-+	defer service.CloseResponseBodyGracefully(resp)
-+
 +	accumulator := newClaudeBufferedStreamAccumulator()
++	claudeInfo := &ClaudeResponseInfo{
++		ResponseId:   helper.GetResponseID(c),
++		Created:      common.GetTimestamp(),
++		Model:        info.UpstreamModelName,
++		ResponseText: strings.Builder{},
++		Usage:        &dto.Usage{},
++	}
 +	scanner := helper.NewStreamScanner(resp.Body)
 +	scanner.Split(bufio.ScanLines)
-+	for scanner.Scan() {
-+		line := scanner.Text()
++
++	type scanEvent struct {
++		line string
++		err  error
++		done bool
++	}
++	scanContext, cancelScan := context.WithCancel(c.Request.Context())
++	scanEvents := make(chan scanEvent, 1)
++	scanDone := make(chan struct{})
++	go func() {
++		defer close(scanDone)
++		for scanner.Scan() {
++			select {
++			case scanEvents <- scanEvent{line: scanner.Text()}:
++			case <-scanContext.Done():
++				return
++			}
++		}
++		select {
++		case scanEvents <- scanEvent{err: scanner.Err(), done: true}:
++		case <-scanContext.Done():
++		}
++	}()
++	defer func() {
++		cancelScan()
++		_ = resp.Body.Close()
++		<-scanDone
++	}()
++
++	streamingTimeout := time.Duration(constant.StreamingTimeout) * time.Second
++	if streamingTimeout <= 0 {
++		streamingTimeout = time.Nanosecond
++	}
++	timeout := time.NewTimer(streamingTimeout)
++	defer timeout.Stop()
++	streamStopped := false
++	for !streamStopped {
++		var scanned scanEvent
++		select {
++		case <-c.Request.Context().Done():
++			return nil, types.NewError(c.Request.Context().Err(), types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
++		case <-timeout.C:
++			return nil, types.NewError(
++				fmt.Errorf("Claude stream timed out after %s", streamingTimeout),
++				types.ErrorCodeBadResponse,
++			)
++		case scanned = <-scanEvents:
++		}
++
++		if scanned.done {
++			if scanned.err != nil {
++				return nil, types.NewError(scanned.err, types.ErrorCodeBadResponse)
++			}
++			break
++		}
++		if !timeout.Stop() {
++			select {
++			case <-timeout.C:
++			default:
++			}
++		}
++		timeout.Reset(streamingTimeout)
++
++		line := scanned.line
 +		if len(line) < 5 || line[:5] != "data:" {
 +			continue
 +		}
@@ -309,28 +396,38 @@ index 0000000..47f87c6
 +		if claudeError := event.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
 +			return nil, types.WithClaudeError(*claudeError, http.StatusInternalServerError)
 +		}
++		FormatClaudeResponseInfo(&event, nil, claudeInfo)
++		if event.Type == "message_start" && event.Message != nil && event.Message.Model != "" {
++			info.UpstreamModelName = event.Message.Model
++		}
 +		if err := accumulator.process(&event); err != nil {
 +			return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 +		}
 +		if event.Type == "message_stop" {
-+			break
++			streamStopped = true
 +		}
-+	}
-+	if err := scanner.Err(); err != nil {
-+		return nil, types.NewError(err, types.ErrorCodeBadResponse)
 +	}
 +
 +	response, err := accumulator.finalResponse(info.UpstreamModelName)
 +	if err != nil {
 +		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 +	}
++	finalizeClaudeUsage(c, info, claudeInfo)
++	finalUsage := buildMessageDeltaPatchUsage(response.ClaudeResponse, claudeInfo)
++	if finalUsage.OutputTokens == 0 {
++		finalUsage.OutputTokens = claudeInfo.Usage.CompletionTokens
++	}
++	if finalUsage.BillingUsage == nil {
++		finalUsage.BillingUsage = dto.CloneBillingUsage(claudeInfo.Usage.BillingUsage)
++	}
++	response.Usage = finalUsage
++
 +	responseBody, err := common.Marshal(response)
 +	if err != nil {
 +		return nil, types.NewError(err, types.ErrorCodeJsonMarshalFailed)
 +	}
 +
 +	resp.Header.Set("Content-Type", "application/json; charset=utf-8")
-+	claudeInfo := &ClaudeResponseInfo{Usage: &dto.Usage{}}
 +	if handleErr := HandleClaudeResponseData(c, info, claudeInfo, resp, responseBody); handleErr != nil {
 +		return nil, handleErr
 +	}
@@ -338,23 +435,25 @@ index 0000000..47f87c6
 +}
 diff --git a/relay/channel/claude/buffered_stream_test.go b/relay/channel/claude/buffered_stream_test.go
 new file mode 100644
-index 0000000..5ec76ff
+index 00000000..fc2487fd
 --- /dev/null
 +++ b/relay/channel/claude/buffered_stream_test.go
-@@ -0,0 +1,170 @@
+@@ -0,0 +1,325 @@
 +package claude
 +
 +import (
++	"context"
 +	"io"
 +	"net/http"
 +	"net/http/httptest"
 +	"strings"
++	"sync"
 +	"testing"
 +
 +	"github.com/QuantumNous/new-api/common"
 +	"github.com/QuantumNous/new-api/constant"
-+	"github.com/QuantumNous/new-api/relaykit/dto"
 +	relaycommon "github.com/QuantumNous/new-api/relay/common"
++	"github.com/QuantumNous/new-api/relaykit/dto"
 +	"github.com/QuantumNous/new-api/relaykit/types"
 +	"github.com/stretchr/testify/assert"
 +	"github.com/stretchr/testify/require"
@@ -362,8 +461,39 @@ index 0000000..5ec76ff
 +	"github.com/gin-gonic/gin"
 +)
 +
++type blockingReadCloser struct {
++	closed chan struct{}
++	once   sync.Once
++}
++
++func newBlockingReadCloser() *blockingReadCloser {
++	return &blockingReadCloser{closed: make(chan struct{})}
++}
++
++func setClaudeBufferedTestTimeout(t *testing.T, timeout int) {
++	t.Helper()
++	previousStreamingTimeout := constant.StreamingTimeout
++	constant.StreamingTimeout = timeout
++	t.Cleanup(func() {
++		constant.StreamingTimeout = previousStreamingTimeout
++	})
++}
++
++func (b *blockingReadCloser) Read([]byte) (int, error) {
++	<-b.closed
++	return 0, io.EOF
++}
++
++func (b *blockingReadCloser) Close() error {
++	b.once.Do(func() {
++		close(b.closed)
++	})
++	return nil
++}
++
 +func TestAdaptorDoResponseBuffersClaudeStreamForNonStreamClient(t *testing.T) {
 +	gin.SetMode(gin.TestMode)
++	setClaudeBufferedTestTimeout(t, 30)
 +	recorder := httptest.NewRecorder()
 +	c, _ := gin.CreateTestContext(recorder)
 +	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
@@ -512,11 +642,160 @@ index 0000000..5ec76ff
 +	assert.True(t, info.IsStream)
 +	assert.Contains(t, recorder.Body.String(), `"type":"message_start"`)
 +}
++
++func TestClaudeBufferedStreamPreservesRedactedThinkingAndCitations(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	setClaudeBufferedTestTimeout(t, 30)
++	recorder := httptest.NewRecorder()
++	c, _ := gin.CreateTestContext(recorder)
++	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
++	info := &relaycommon.RelayInfo{
++		RelayFormat: types.RelayFormatClaude,
++		ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "claude-test"},
++	}
++	sse := strings.Join([]string{
++		`data: {"type":"message_start","message":{"id":"msg_content","type":"message","role":"assistant","model":"claude-test","content":[],"usage":{"input_tokens":2,"output_tokens":1}}}`,
++		`data: {"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"encrypted-payload"}}`,
++		`data: {"type":"content_block_stop","index":0}`,
++		`data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":"Answer"}}`,
++		`data: {"type":"content_block_delta","index":1,"delta":{"type":"citations_delta","citation":{"type":"char_location","cited_text":"source","document_index":0,"start_char_index":0,"end_char_index":6}}}`,
++		`data: {"type":"content_block_stop","index":1}`,
++		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}`,
++		`data: {"type":"message_stop"}`,
++	}, "\n")
++	resp := &http.Response{
++		StatusCode: http.StatusOK,
++		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
++		Body:       io.NopCloser(strings.NewReader(sse)),
++	}
++
++	_, apiErr := ClaudeBufferedStreamHandler(c, resp, info)
++	require.Nil(t, apiErr)
++	var response dto.ClaudeResponse
++	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
++	require.Len(t, response.Content, 2)
++	assert.Equal(t, "redacted_thinking", response.Content[0].Type)
++	assert.Equal(t, "encrypted-payload", response.Content[0].Data)
++	require.Len(t, response.Content[1].Citations, 1)
++	var citation map[string]interface{}
++	require.NoError(t, common.Unmarshal(response.Content[1].Citations[0], &citation))
++	assert.Equal(t, "char_location", citation["type"])
++	assert.Equal(t, "source", citation["cited_text"])
++}
++
++func TestClaudeBufferedStreamEstimatesMissingUsageAndUpdatesModel(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	setClaudeBufferedTestTimeout(t, 30)
++	recorder := httptest.NewRecorder()
++	c, _ := gin.CreateTestContext(recorder)
++	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
++	info := &relaycommon.RelayInfo{
++		RelayFormat: types.RelayFormatClaude,
++		ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "configured-model"},
++	}
++	sse := strings.Join([]string{
++		`data: {"type":"message_start","message":{"id":"msg_usage","type":"message","role":"assistant","model":"claude-3-5-sonnet","content":[]}}`,
++		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
++		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"estimated output"}}`,
++		`data: {"type":"content_block_stop","index":0}`,
++		`data: {"type":"message_stop"}`,
++	}, "\n")
++	resp := &http.Response{
++		StatusCode: http.StatusOK,
++		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
++		Body:       io.NopCloser(strings.NewReader(sse)),
++	}
++
++	usage, apiErr := ClaudeBufferedStreamHandler(c, resp, info)
++	require.Nil(t, apiErr)
++	assert.Equal(t, "claude-3-5-sonnet", info.UpstreamModelName)
++	assert.Positive(t, usage.CompletionTokens)
++
++	var response dto.ClaudeResponse
++	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
++	require.NotNil(t, response.Usage)
++	assert.Positive(t, response.Usage.OutputTokens)
++}
++
++func TestClaudeBufferedStreamStopsWhenClientCancels(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	setClaudeBufferedTestTimeout(t, 30)
++	recorder := httptest.NewRecorder()
++	c, _ := gin.CreateTestContext(recorder)
++	requestContext, cancel := context.WithCancel(context.Background())
++	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil).WithContext(requestContext)
++	cancel()
++	body := newBlockingReadCloser()
++	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: body}
++	info := &relaycommon.RelayInfo{
++		RelayFormat: types.RelayFormatClaude,
++		ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "claude-test"},
++	}
++
++	_, apiErr := ClaudeBufferedStreamHandler(c, resp, info)
++	require.ErrorIs(t, apiErr, context.Canceled)
++	select {
++	case <-body.closed:
++	default:
++		t.Fatal("upstream body was not closed after client cancellation")
++	}
++}
++
++func TestClaudeBufferedStreamStopsOnIdleTimeout(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	setClaudeBufferedTestTimeout(t, 0)
++
++	recorder := httptest.NewRecorder()
++	c, _ := gin.CreateTestContext(recorder)
++	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
++	body := newBlockingReadCloser()
++	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: body}
++	info := &relaycommon.RelayInfo{
++		RelayFormat: types.RelayFormatClaude,
++		ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "claude-test"},
++	}
++
++	_, apiErr := ClaudeBufferedStreamHandler(c, resp, info)
++	require.Error(t, apiErr)
++	assert.Contains(t, apiErr.Error(), "Claude stream timed out")
++	select {
++	case <-body.closed:
++	default:
++		t.Fatal("upstream body was not closed after timeout")
++	}
++}
+diff --git a/relay/channel/claude/relay-claude.go b/relay/channel/claude/relay-claude.go
+index 2f424b32..4fd5a0cd 100644
+--- a/relay/channel/claude/relay-claude.go
++++ b/relay/channel/claude/relay-claude.go
+@@ -150,7 +150,10 @@ func countClaudeStreamBillableTools(c *gin.Context, info *relaycommon.RelayInfo,
+ 	}
+ }
+ 
+-func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo) {
++func finalizeClaudeUsage(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo) {
++	if claudeInfo.Usage == nil {
++		claudeInfo.Usage = &dto.Usage{}
++	}
+ 	if claudeInfo.Usage.PromptTokens == 0 {
+ 		//上游出错
+ 	}
+@@ -175,6 +178,10 @@ func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, clau
+ 	if claudeInfo.Usage != nil && claudeInfo.Usage.BillingUsage == nil {
+ 		claudeInfo.Usage.BillingUsage = dto.NewClaudeMessagesBillingUsage(buildMessageDeltaPatchUsage(nil, claudeInfo))
+ 	}
++}
++
++func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo) {
++	finalizeClaudeUsage(c, info, claudeInfo)
+ 
+ 	if info.RelayFormat == types.RelayFormatClaude {
+ 		//
 diff --git a/relaykit/dto/claude.go b/relaykit/dto/claude.go
-index a3a41e7..69e3149 100644
+index a3a41e75..198d90ee 100644
 --- a/relaykit/dto/claude.go
 +++ b/relaykit/dto/claude.go
-@@ -21,6 +21,7 @@ type ClaudeMediaMessage struct {
+@@ -21,10 +21,14 @@ type ClaudeMediaMessage struct {
  	Source       *ClaudeMessageSource `json:"source,omitempty"`
  	Usage        *ClaudeUsage         `json:"usage,omitempty"`
  	StopReason   *string              `json:"stop_reason,omitempty"`
@@ -524,3 +803,10 @@ index a3a41e7..69e3149 100644
  	PartialJson  *string              `json:"partial_json,omitempty"`
  	Role         string               `json:"role,omitempty"`
  	Thinking     *string              `json:"thinking,omitempty"`
+ 	Signature    string               `json:"signature,omitempty"`
++	Data         string               `json:"data,omitempty"`
++	Citation     json.RawMessage      `json:"citation,omitempty"`
++	Citations    []json.RawMessage    `json:"citations,omitempty"`
+ 	Delta        string               `json:"delta,omitempty"`
+ 	CacheControl json.RawMessage      `json:"cache_control,omitempty"`
+ 	// tool_calls

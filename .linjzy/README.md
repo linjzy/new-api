@@ -30,8 +30,10 @@ started manually. It:
    release is requested.
 2. Checks out the exact upstream tag commit.
 3. Applies every reviewed patch in `.linjzy/patches/` without a fallback merge.
-4. Runs the controller, DTO, service, relay, and sequential-key model regression tests.
-5. Builds the upstream Dockerfile for `linux/amd64`.
+4. Runs the controller, DTO, service, relay, model, and standalone relaykit tests.
+5. Builds the upstream Dockerfile for `linux/amd64`; the frontend stage runs
+   lint on every customized TypeScript file, the auto-refresh regression test,
+   typecheck, and the production build.
 6. Runs an isolated container smoke test.
 7. Pushes the public source branch and immutable GHCR image.
 8. Updates `candidate` only after all checks pass.

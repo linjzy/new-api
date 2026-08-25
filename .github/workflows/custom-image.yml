@@ -165,7 +165,8 @@ jobs:
       - name: Test Go customizations
         run: |
           go test ./controller ./dto ./service ./relay/...
-          go test ./model -run 'TestGetNextEnabledKeySequentialUsesFirstEnabledKey'
+          go test ./model
+          GOWORK=off go -C relaykit test ./...
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0

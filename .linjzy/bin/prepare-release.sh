@@ -22,11 +22,14 @@ die() {
 usage_customization_present() {
   grep -q 'USAGE_LOGS_AUTO_REFRESH_INTERVAL_MS' \
     "$SOURCE_DIR/web/src/features/usage-logs/constants.ts" &&
+    grep -q 'getUsageLogsRefetchInterval' \
+      "$SOURCE_DIR/web/src/features/usage-logs/lib/auto-refresh.ts" &&
+    [[ -f "$SOURCE_DIR/web/src/features/usage-logs/lib/__tests__/auto-refresh.test.ts" ]] &&
     grep -q 'onCheckedChange={handleAutoRefreshChange}' \
       "$SOURCE_DIR/web/src/features/usage-logs/index.tsx" &&
-    grep -q 'refetchIntervalInBackground: false' \
+    grep -q 'USAGE_LOGS_AUTO_REFRESH_ERROR_TOAST_ID' \
       "$SOURCE_DIR/web/src/features/usage-logs/components/usage-logs-table.tsx" &&
-    grep -q 'USAGE_LOGS_AUTO_REFRESH_INTERVAL_MS' \
+    grep -q 'USAGE_LOGS_AUTO_REFRESH_ERROR_TOAST_ID' \
       "$SOURCE_DIR/web/src/features/usage-logs/components/common-logs-stats.tsx"
 }
 
@@ -36,15 +39,18 @@ anthropic_customization_present() {
     "$SOURCE_DIR/relay/channel/claude/buffered_stream.go" &&
     grep -q 'return ClaudeBufferedStreamHandler' \
       "$SOURCE_DIR/relay/channel/claude/adaptor.go" &&
-    grep -q 'StopSequence.*stop_sequence' \
-      "$SOURCE_DIR/relaykit/dto/claude.go"
+    grep -q 'Citations.*citations' "$SOURCE_DIR/relaykit/dto/claude.go" &&
+    grep -q 'case "citations_delta"' \
+      "$SOURCE_DIR/relay/channel/claude/buffered_stream.go" &&
+    grep -q 'TestClaudeBufferedStreamStopsWhenClientCancels' \
+      "$SOURCE_DIR/relay/channel/claude/buffered_stream_test.go"
 }
 
 channel_test_customization_present() {
   grep -q 'ShouldChatCompletionsUseResponsesGlobal' \
     "$SOURCE_DIR/controller/channel-test.go" &&
     [[ -f "$SOURCE_DIR/controller/channel_test_endpoint_test.go" ]] &&
-    grep -q 'TestNormalizeChannelTestEndpointUsesResponsesCompatibilityPolicy' \
+    grep -q 'TestResolveChannelTestRequestPathUsesResponsesCompatibilityPolicyForChat' \
       "$SOURCE_DIR/controller/channel_test_endpoint_test.go"
 }
 
@@ -55,6 +61,9 @@ sequential_customization_present() {
       "$SOURCE_DIR/service/channel.go" &&
     grep -q 'HasSequentialChannel' \
       "$SOURCE_DIR/controller/relay.go" &&
+    [[ -f "$SOURCE_DIR/controller/relay_sequential_test.go" ]] &&
+    grep -q 'TestResolveLockedTaskRetryChannelRefreshesSequentialKeyState' \
+      "$SOURCE_DIR/controller/relay_sequential_test.go" &&
     grep -q 'p.ResetRetryNextTry()' \
       "$SOURCE_DIR/service/channel_select.go" &&
     [[ -f "$SOURCE_DIR/service/channel_sequential_test.go" ]] &&
@@ -63,6 +72,9 @@ sequential_customization_present() {
     [[ -f "$SOURCE_DIR/model/channel_sequential_test.go" ]] &&
     grep -q 'TestGetNextEnabledKeySequentialUsesFirstEnabledKey' \
       "$SOURCE_DIR/model/channel_sequential_test.go" &&
+    grep -q 'TestUpdateChannelStatusByKeyIndexDistinguishesDuplicateKeys' \
+      "$SOURCE_DIR/model/channel_sequential_test.go" &&
+    grep -q 'UpdateChannelStatusByKeyIndex' "$SOURCE_DIR/model/channel.go" &&
     grep -q "value: 'sequential'" \
       "$SOURCE_DIR/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx"
 }

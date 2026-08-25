@@ -1,45 +1,111 @@
 diff --git a/controller/channel-test.go b/controller/channel-test.go
-index b294979..45e402f 100644
+index b294979d..f87c2a26 100644
 --- a/controller/channel-test.go
 +++ b/controller/channel-test.go
-@@ -42,7 +42,7 @@ type testResult struct {
- 	newAPIError *types.NewAPIError
- }
+@@ -27,6 +27,7 @@ import (
+ 	"github.com/QuantumNous/new-api/relaykit/dto"
+ 	"github.com/QuantumNous/new-api/relaykit/types"
+ 	"github.com/QuantumNous/new-api/service"
++	"github.com/QuantumNous/new-api/setting/model_setting"
+ 	"github.com/QuantumNous/new-api/setting/operation_setting"
+ 	hosttypes "github.com/QuantumNous/new-api/types"
  
--func normalizeChannelTestEndpoint(channel *model.Channel, endpointType string) string {
-+func normalizeChannelTestEndpoint(channel *model.Channel, modelName, endpointType string) string {
- 	normalized := strings.TrimSpace(endpointType)
- 	if normalized != "" {
- 		return normalized
-@@ -50,6 +50,13 @@ func normalizeChannelTestEndpoint(channel *model.Channel, endpointType string) s
- 	if channel != nil && channel.Type == constant.ChannelTypeCodex {
- 		return string(constant.EndpointTypeOpenAIResponse)
- 	}
-+	if channel != nil && service.ShouldChatCompletionsUseResponsesGlobal(
-+		channel.Id,
-+		channel.Type,
-+		modelName,
-+	) {
-+		return string(constant.EndpointTypeOpenAIResponse)
-+	}
+@@ -53,6 +54,46 @@ func normalizeChannelTestEndpoint(channel *model.Channel, endpointType string) s
  	return normalized
  }
  
-@@ -108,7 +115,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
- 		}
++func resolveChannelTestRequestPath(channel *model.Channel, modelName, endpointType string) string {
++	if endpointType != "" {
++		if endpointInfo, ok := common.GetDefaultEndpointInfo(constant.EndpointType(endpointType)); ok {
++			return endpointInfo.Path
++		}
++		return "/v1/chat/completions"
++	}
++
++	requestPath := "/v1/chat/completions"
++	lowerModelName := strings.ToLower(modelName)
++	if strings.Contains(lowerModelName, "rerank") {
++		requestPath = "/v1/rerank"
++	}
++	if strings.Contains(lowerModelName, "embedding") ||
++		strings.HasPrefix(modelName, "m3e") ||
++		strings.Contains(modelName, "bge-") ||
++		strings.Contains(modelName, "embed") ||
++		(channel != nil && channel.Type == constant.ChannelTypeMokaAI) {
++		requestPath = "/v1/embeddings"
++	}
++	if channel != nil && channel.Type == constant.ChannelTypeVolcEngine && strings.Contains(modelName, "seedream") {
++		requestPath = "/v1/images/generations"
++	}
++	if strings.Contains(lowerModelName, "codex") {
++		requestPath = "/v1/responses"
++	}
++
++	if requestPath != "/v1/chat/completions" || channel == nil {
++		return requestPath
++	}
++	settings := model_setting.GetGlobalSettings()
++	if settings.PassThroughRequestEnabled || channel.GetSetting().PassThroughBodyEnabled {
++		return requestPath
++	}
++	if service.ShouldChatCompletionsUseResponsesGlobal(channel.Id, channel.Type, modelName) {
++		return "/v1/responses"
++	}
++	return requestPath
++}
++
+ func resolveChannelTestUserID(c *gin.Context) (int, error) {
+ 	if c != nil {
+ 		if userID := c.GetInt("id"); userID > 0 {
+@@ -109,41 +150,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
  	}
  
--	endpointType = normalizeChannelTestEndpoint(channel, endpointType)
-+	endpointType = normalizeChannelTestEndpoint(channel, testModel, endpointType)
- 
- 	requestPath := "/v1/chat/completions"
- 
+ 	endpointType = normalizeChannelTestEndpoint(channel, endpointType)
+-
+-	requestPath := "/v1/chat/completions"
+-
+-	// 如果指定了端点类型，使用指定的端点类型
+-	if endpointType != "" {
+-		if endpointInfo, ok := common.GetDefaultEndpointInfo(constant.EndpointType(endpointType)); ok {
+-			requestPath = endpointInfo.Path
+-		}
+-	} else {
+-		// 如果没有指定端点类型，使用原有的自动检测逻辑
+-
+-		if strings.Contains(strings.ToLower(testModel), "rerank") {
+-			requestPath = "/v1/rerank"
+-		}
+-
+-		// 先判断是否为 Embedding 模型
+-		if strings.Contains(strings.ToLower(testModel), "embedding") ||
+-			strings.HasPrefix(testModel, "m3e") || // m3e 系列模型
+-			strings.Contains(testModel, "bge-") || // bge 系列模型
+-			strings.Contains(testModel, "embed") ||
+-			channel.Type == constant.ChannelTypeMokaAI { // 其他 embedding 模型
+-			requestPath = "/v1/embeddings" // 修改请求路径
+-		}
+-
+-		// VolcEngine 图像生成模型
+-		if channel.Type == constant.ChannelTypeVolcEngine && strings.Contains(testModel, "seedream") {
+-			requestPath = "/v1/images/generations"
+-		}
+-
+-		// responses-only models
+-		if strings.Contains(strings.ToLower(testModel), "codex") {
+-			requestPath = "/v1/responses"
+-		}
+-
+-	}
++	requestPath := resolveChannelTestRequestPath(channel, testModel, endpointType)
+ 	// Gemini 原生流式通过 URL action（:streamGenerateContent）表达而非请求体字段，
+ 	// GeminiChatRequest.IsStream 依据请求 URL 判定，合成请求路径需与生产入口保持一致
+ 	if isStream && constant.EndpointType(endpointType) == constant.EndpointTypeGemini {
 diff --git a/controller/channel_test_endpoint_test.go b/controller/channel_test_endpoint_test.go
 new file mode 100644
-index 0000000..05e0a1e
+index 00000000..08955d03
 --- /dev/null
 +++ b/controller/channel_test_endpoint_test.go
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,68 @@
 +package controller
 +
 +import (
@@ -47,52 +113,64 @@ index 0000000..05e0a1e
 +
 +	"github.com/QuantumNous/new-api/constant"
 +	"github.com/QuantumNous/new-api/model"
++	"github.com/QuantumNous/new-api/relaykit/dto"
 +	"github.com/QuantumNous/new-api/setting/model_setting"
 +
 +	"github.com/stretchr/testify/require"
 +)
 +
-+func TestNormalizeChannelTestEndpointUsesResponsesCompatibilityPolicy(t *testing.T) {
++func TestResolveChannelTestRequestPathUsesResponsesCompatibilityPolicyForChat(t *testing.T) {
 +	settings := model_setting.GetGlobalSettings()
 +	previous := settings.ChatCompletionsToResponsesPolicy
++	previousPassThrough := settings.PassThroughRequestEnabled
 +	settings.ChatCompletionsToResponsesPolicy = model_setting.ChatCompletionsToResponsesPolicy{
 +		Enabled:       true,
 +		ChannelIDs:    []int{4},
-+		ModelPatterns: []string{"^gpt-5.*$"},
++		ModelPatterns: []string{".*"},
 +	}
++	settings.PassThroughRequestEnabled = false
 +	t.Cleanup(func() {
 +		settings.ChatCompletionsToResponsesPolicy = previous
++		settings.PassThroughRequestEnabled = previousPassThrough
 +	})
 +
 +	channel := &model.Channel{Id: 4, Type: constant.ChannelTypeOpenAI}
-+	require.Equal(
-+		t,
-+		string(constant.EndpointTypeOpenAIResponse),
-+		normalizeChannelTestEndpoint(channel, "gpt-5.6-sol", ""),
-+	)
-+	require.Empty(
-+		t,
-+		normalizeChannelTestEndpoint(channel, "claude-3-7-sonnet", ""),
-+	)
-+	require.Empty(
-+		t,
-+		normalizeChannelTestEndpoint(
-+			&model.Channel{Id: 5, Type: constant.ChannelTypeOpenAI},
-+			"gpt-5.6-sol",
-+			"",
-+		),
-+	)
++	require.Equal(t, "/v1/responses", resolveChannelTestRequestPath(channel, "gpt-5.6-sol", ""))
++	require.Equal(t, "/v1/embeddings", resolveChannelTestRequestPath(channel, "text-embedding-3-small", ""))
++	require.Equal(t, "/v1/rerank", resolveChannelTestRequestPath(channel, "cohere-rerank-v3", ""))
 +}
 +
-+func TestNormalizeChannelTestEndpointKeepsExplicitEndpoint(t *testing.T) {
++func TestResolveChannelTestRequestPathHonorsPassThroughAndExplicitEndpoint(t *testing.T) {
++	settings := model_setting.GetGlobalSettings()
++	previous := settings.ChatCompletionsToResponsesPolicy
++	previousPassThrough := settings.PassThroughRequestEnabled
++	settings.ChatCompletionsToResponsesPolicy = model_setting.ChatCompletionsToResponsesPolicy{
++		Enabled:       true,
++		ChannelIDs:    []int{4},
++		ModelPatterns: []string{".*"},
++	}
++	t.Cleanup(func() {
++		settings.ChatCompletionsToResponsesPolicy = previous
++		settings.PassThroughRequestEnabled = previousPassThrough
++	})
++
 +	channel := &model.Channel{Id: 4, Type: constant.ChannelTypeOpenAI}
-+	require.Equal(
-+		t,
++	settings.PassThroughRequestEnabled = true
++	require.Equal(t, "/v1/chat/completions", resolveChannelTestRequestPath(channel, "gpt-5.6-sol", ""))
++
++	settings.PassThroughRequestEnabled = false
++	channelSetting := dto.ChannelSettings{PassThroughBodyEnabled: true}
++	channel.SetSetting(channelSetting)
++	require.Equal(t, "/v1/chat/completions", resolveChannelTestRequestPath(channel, "gpt-5.6-sol", ""))
++
++	require.Equal(t, "/v1/chat/completions", resolveChannelTestRequestPath(
++		channel,
++		"gpt-5.6-sol",
 +		string(constant.EndpointTypeOpenAI),
-+		normalizeChannelTestEndpoint(
-+			channel,
-+			"gpt-5.6-sol",
-+			string(constant.EndpointTypeOpenAI),
-+		),
-+	)
++	))
++	require.Equal(t, string(constant.EndpointTypeOpenAI), normalizeChannelTestEndpoint(channel, string(constant.EndpointTypeOpenAI)))
++	require.Equal(t, string(constant.EndpointTypeOpenAIResponse), normalizeChannelTestEndpoint(
++		&model.Channel{Type: constant.ChannelTypeCodex},
++		"",
++	))
 +}
