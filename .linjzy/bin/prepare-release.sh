@@ -75,6 +75,12 @@ sequential_customization_present() {
     grep -q 'TestUpdateChannelStatusByKeyIndexDistinguishesDuplicateKeys' \
       "$SOURCE_DIR/model/channel_sequential_test.go" &&
     grep -q 'UpdateChannelStatusByKeyIndex' "$SOURCE_DIR/model/channel.go" &&
+    grep -q 'EnableAutoDisabledChannelKey' "$SOURCE_DIR/model/channel.go" &&
+    grep -q 'SetupContextForAutoDisabledChannelTestKey' \
+      "$SOURCE_DIR/middleware/distributor.go" &&
+    [[ -f "$SOURCE_DIR/middleware/distributor_channel_test_key_test.go" ]] &&
+    grep -q 'TestAutoDisabledChannelKeyRecoveryUsesEachExactIndex' \
+      "$SOURCE_DIR/controller/channel_test_internal_test.go" &&
     grep -q "value: 'sequential'" \
       "$SOURCE_DIR/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx"
 }
