@@ -5,7 +5,22 @@ COPY web/package.json web/bun.lock ./
 RUN bun install --frozen-lockfile
 COPY ./web ./
 COPY ./VERSION /build/VERSION
-RUN DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$(cat /build/VERSION) bun run build
+RUN bun x oxlint -c .oxlintrc.json \
+	      src/features/usage-logs/components/usage-logs-table.tsx \
+	      src/features/usage-logs/components/common-logs-stats.tsx \
+	      src/features/usage-logs/components/usage-logs-provider.tsx \
+	      src/features/usage-logs/constants.ts \
+	      src/features/usage-logs/index.tsx \
+      src/features/usage-logs/lib/auto-refresh.ts \
+      src/features/usage-logs/lib/__tests__/auto-refresh.test.ts \
+	      src/features/channels/components/channels-columns.tsx \
+	      src/features/channels/components/dialogs/multi-key-manage-dialog.tsx \
+	      src/features/channels/components/drawers/channel-mutate-drawer.tsx \
+	      src/features/channels/constants.ts \
+	      src/features/channels/lib/channel-form.ts \
+	      src/features/channels/types.ts && \
+    bun run test -- src/features/usage-logs/lib/__tests__/auto-refresh.test.ts && \
+    DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$(cat /build/VERSION) bun run build:check
 
 FROM golang:1.26.1-alpine@sha256:2389ebfa5b7f43eeafbd6be0c3700cc46690ef842ad962f6c5bd6be49ed82039 AS builder2
 ENV GO111MODULE=on CGO_ENABLED=0 GOWORK=off

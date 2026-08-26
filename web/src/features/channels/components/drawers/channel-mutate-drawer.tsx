@@ -720,6 +720,22 @@ export function ChannelMutateDrawer({
   // Watch form values for conditional rendering
   const multiKeyMode = form.watch('multi_key_mode')
   const multiKeyType = form.watch('multi_key_type')
+  let multiKeyDescription: ReactNode = t(
+    'Randomly select a key from the pool for each request'
+  )
+  if (multiKeyType === 'polling') {
+    multiKeyDescription = (
+      <span className='text-warning'>
+        {t(
+          'Polling mode requires Redis and memory cache, otherwise performance will be significantly degraded'
+        )}
+      </span>
+    )
+  } else if (multiKeyType === 'sequential') {
+    multiKeyDescription = t(
+      'Always use the first enabled key; when a request failure matches the auto-disable rules, automatically try the next one'
+    )
+  }
   const keyMode = form.watch('key_mode')
   const currentGroups = form.watch('group')
   const currentType = form.watch('type')
@@ -3203,6 +3219,10 @@ export function ChannelMutateDrawer({
                                               value: 'polling',
                                               label: t('Polling'),
                                             },
+                                            {
+                                              value: 'sequential',
+                                              label: t('Sequential'),
+                                            },
                                           ]}
                                           onValueChange={field.onChange}
                                           value={field.value}
@@ -3222,21 +3242,14 @@ export function ChannelMutateDrawer({
                                               <SelectItem value='polling'>
                                                 {t('Polling')}
                                               </SelectItem>
+                                              <SelectItem value='sequential'>
+                                                {t('Sequential')}
+                                              </SelectItem>
                                             </SelectGroup>
                                           </SelectContent>
                                         </Select>
                                         <FormDescription>
-                                          {multiKeyType === 'polling' ? (
-                                            <span className='text-warning'>
-                                              {t(
-                                                'Polling mode requires Redis and memory cache, otherwise performance will be significantly degraded'
-                                              )}
-                                            </span>
-                                          ) : (
-                                            t(
-                                              'Randomly select a key from the pool for each request'
-                                            )
-                                          )}
+                                          {multiKeyDescription}
                                         </FormDescription>
                                         <FormMessage />
                                       </FormItem>
