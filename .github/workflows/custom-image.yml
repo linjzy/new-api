@@ -80,7 +80,6 @@ jobs:
           patch_sha="$(
             sha256sum \
               .linjzy/patches/usage-logs-auto-refresh.patch \
-              .linjzy/patches/anthropic-buffered-nonstream.patch \
               .linjzy/patches/channel-test-responses-policy.patch \
               .linjzy/patches/sequential-key-mode.patch |
               awk '{print $1}' |

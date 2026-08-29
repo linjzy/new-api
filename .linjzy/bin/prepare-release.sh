@@ -6,9 +6,8 @@ RELEASE_TAG="${2:?release tag is required}"
 UPSTREAM_COMMIT="${3:?upstream commit is required}"
 SOURCE_REF="${4:?source ref is required}"
 USAGE_PATCH_FILE="${5:-$SOURCE_DIR/.linjzy/patches/usage-logs-auto-refresh.patch}"
-ANTHROPIC_PATCH_FILE="${6:-$SOURCE_DIR/.linjzy/patches/anthropic-buffered-nonstream.patch}"
-CHANNEL_TEST_PATCH_FILE="${7:-$SOURCE_DIR/.linjzy/patches/channel-test-responses-policy.patch}"
-SEQUENTIAL_PATCH_FILE="${8:-$SOURCE_DIR/.linjzy/patches/sequential-key-mode.patch}"
+CHANNEL_TEST_PATCH_FILE="${6:-$SOURCE_DIR/.linjzy/patches/channel-test-responses-policy.patch}"
+SEQUENTIAL_PATCH_FILE="${7:-$SOURCE_DIR/.linjzy/patches/sequential-key-mode.patch}"
 
 log() {
   printf '[prepare-release] %s\n' "$*"
@@ -31,19 +30,6 @@ usage_customization_present() {
       "$SOURCE_DIR/web/src/features/usage-logs/components/usage-logs-table.tsx" &&
     grep -q 'USAGE_LOGS_AUTO_REFRESH_ERROR_TOAST_ID' \
       "$SOURCE_DIR/web/src/features/usage-logs/components/common-logs-stats.tsx"
-}
-
-anthropic_customization_present() {
-  [[ -f "$SOURCE_DIR/relay/channel/claude/buffered_stream.go" ]] &&
-    grep -q 'func ClaudeBufferedStreamHandler' \
-    "$SOURCE_DIR/relay/channel/claude/buffered_stream.go" &&
-    grep -q 'return ClaudeBufferedStreamHandler' \
-      "$SOURCE_DIR/relay/channel/claude/adaptor.go" &&
-    grep -q 'Citations.*citations' "$SOURCE_DIR/relaykit/dto/claude.go" &&
-    grep -q 'case "citations_delta"' \
-      "$SOURCE_DIR/relay/channel/claude/buffered_stream.go" &&
-    grep -q 'TestClaudeBufferedStreamStopsWhenClientCancels' \
-      "$SOURCE_DIR/relay/channel/claude/buffered_stream_test.go"
 }
 
 channel_test_customization_present() {
@@ -105,7 +91,6 @@ apply_customization() {
 git -C "$SOURCE_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
   die "source directory is not a Git checkout"
 [[ -f "$USAGE_PATCH_FILE" ]] || die "customization patch not found: $USAGE_PATCH_FILE"
-[[ -f "$ANTHROPIC_PATCH_FILE" ]] || die "customization patch not found: $ANTHROPIC_PATCH_FILE"
 [[ -f "$CHANNEL_TEST_PATCH_FILE" ]] || die "customization patch not found: $CHANNEL_TEST_PATCH_FILE"
 [[ -f "$SEQUENTIAL_PATCH_FILE" ]] || die "customization patch not found: $SEQUENTIAL_PATCH_FILE"
 [[ "$RELEASE_TAG" != *[[:space:]]* ]] || die "invalid release tag"
@@ -122,10 +107,6 @@ apply_customization \
   "$USAGE_PATCH_FILE" \
   usage_customization_present
 apply_customization \
-  'Anthropic buffered non-stream' \
-  "$ANTHROPIC_PATCH_FILE" \
-  anthropic_customization_present
-apply_customization \
   'channel-test Responses policy' \
   "$CHANNEL_TEST_PATCH_FILE" \
   channel_test_customization_present
@@ -136,7 +117,7 @@ apply_customization \
 git -C "$SOURCE_DIR" diff --check
 
 PATCH_SHA256="$(
-  sha256sum "$USAGE_PATCH_FILE" "$ANTHROPIC_PATCH_FILE" "$CHANNEL_TEST_PATCH_FILE" "$SEQUENTIAL_PATCH_FILE" |
+  sha256sum "$USAGE_PATCH_FILE" "$CHANNEL_TEST_PATCH_FILE" "$SEQUENTIAL_PATCH_FILE" |
     awk '{print $1}' |
     sha256sum |
     awk '{print $1}'
