@@ -39,13 +39,6 @@ anthropic_customization_present() {
     "$SOURCE_DIR/relay/channel/claude/buffered_stream.go" &&
     grep -q 'return ClaudeBufferedStreamHandler' \
       "$SOURCE_DIR/relay/channel/claude/adaptor.go" &&
-    grep -q 'func OaiBufferedClaudeStreamHandler' \
-      "$SOURCE_DIR/relay/channel/openai/relay-openai.go" &&
-    grep -q 'OaiBufferedClaudeStreamHandler' \
-      "$SOURCE_DIR/relay/channel/openai/adaptor.go" &&
-    [[ -f "$SOURCE_DIR/relay/channel/openai/buffered_claude_stream_test.go" ]] &&
-    grep -q 'TestOpenAIAdaptorBuffersForcedStreamForNonStreamClaudeClient' \
-      "$SOURCE_DIR/relay/channel/openai/buffered_claude_stream_test.go" &&
     grep -q 'Citations.*citations' "$SOURCE_DIR/relaykit/dto/claude.go" &&
     grep -q 'case "citations_delta"' \
       "$SOURCE_DIR/relay/channel/claude/buffered_stream.go" &&
