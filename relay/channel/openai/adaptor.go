@@ -660,7 +660,12 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		usage, err = OaiResponsesCompactionHandler(c, resp)
 	default:
 		if info.IsStream {
-			usage, err = OaiStreamHandler(c, info, resp)
+			clientStream := info.Request != nil && info.Request.IsStream(c.Request)
+			if info.RelayFormat == types.RelayFormatClaude && !clientStream {
+				usage, err = OaiBufferedClaudeStreamHandler(c, info, resp)
+			} else {
+				usage, err = OaiStreamHandler(c, info, resp)
+			}
 		} else {
 			usage, err = OpenaiHandler(c, info, resp)
 		}

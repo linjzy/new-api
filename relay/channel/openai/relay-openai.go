@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
+	claudeapi "github.com/QuantumNous/new-api/relay/channel/claude"
 	"github.com/QuantumNous/new-api/relay/channel/openrouter"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -102,6 +103,14 @@ func sendStreamData(c *gin.Context, info *relaycommon.RelayInfo, data string, fo
 }
 
 func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+	return oaiStreamHandler(c, info, resp, false)
+}
+
+func OaiBufferedClaudeStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+	return oaiStreamHandler(c, info, resp, true)
+}
+
+func oaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response, bufferClaude bool) (*dto.Usage, *types.NewAPIError) {
 	if resp == nil || resp.Body == nil {
 		logger.LogError(c, "invalid response or response body")
 		return nil, types.NewOpenAIError(fmt.Errorf("invalid response"), types.ErrorCodeBadResponse, http.StatusInternalServerError)
@@ -121,15 +130,41 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	var secondLastStreamData string // 存储倒数第二个stream data，用于音频模型
 	seenStreamToolCalls := make(map[string]struct{})
 	var streamFunctionCallNames []string
+	var bufferedClaude *claudeapi.BufferedStreamAccumulator
+	var bufferedClaudeErr error
+	if bufferClaude {
+		bufferedClaude = claudeapi.NewBufferedStreamAccumulator()
+		info.DisablePing = true
+	}
 
 	// 检查是否为音频模型
 	isAudioModel := strings.Contains(strings.ToLower(model), "audio")
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		if lastStreamData != "" {
-			if err := HandleStreamFormat(c, info, lastStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent); err != nil {
+			var err error
+			if bufferedClaude != nil {
+				info.SendResponseCount++
+				var responses []*dto.ClaudeResponse
+				responses, err = convertClaudeFormat(c, lastStreamData, info)
+				if err == nil {
+					for _, response := range responses {
+						if err = bufferedClaude.Process(response); err != nil {
+							break
+						}
+					}
+				}
+			} else {
+				err = HandleStreamFormat(c, info, lastStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent)
+			}
+			if err != nil {
 				common.SysLog("error handling stream format: " + err.Error())
-				sr.Error(err)
+				if bufferedClaude != nil {
+					bufferedClaudeErr = err
+					sr.Stop(err)
+				} else {
+					sr.Error(err)
+				}
 			}
 		}
 		if len(data) > 0 {
@@ -187,6 +222,36 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 
 	for _, name := range streamFunctionCallNames {
 		info.CountBillableToolCall(dto.BuildInCallFunctionCall, name)
+	}
+	if bufferedClaude != nil {
+		if bufferedClaudeErr != nil {
+			return nil, types.NewError(bufferedClaudeErr, types.ErrorCodeBadResponseBody)
+		}
+		responses, err := finalizeClaudeStream(c, info, lastStreamData, usage)
+		if err != nil {
+			return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
+		}
+		for _, response := range responses {
+			if err := bufferedClaude.Process(response); err != nil {
+				return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
+			}
+		}
+		response, err := bufferedClaude.FinalResponse(model)
+		if err != nil {
+			return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
+		}
+		responseBody, err := common.Marshal(response)
+		if err != nil {
+			return nil, types.NewError(err, types.ErrorCodeJsonMarshalFailed)
+		}
+		for _, header := range []string{"Cache-Control", "Connection", "Transfer-Encoding", "X-Accel-Buffering"} {
+			c.Writer.Header().Del(header)
+			resp.Header.Del(header)
+		}
+		resp.Header.Set("Content-Type", "application/json; charset=utf-8")
+		info.IsStream = false
+		service.IOCopyBytesGracefully(c, resp, responseBody)
+		return usage, nil
 	}
 
 	HandleFinalResponse(c, info, lastStreamData, responseId, createAt, model, systemFingerprint, usage, containStreamUsage)
