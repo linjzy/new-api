@@ -46,6 +46,10 @@ anthropic_customization_present() {
     [[ -f "$SOURCE_DIR/relay/channel/openai/buffered_claude_stream_test.go" ]] &&
     grep -q 'TestOpenAIAdaptorBuffersForcedStreamForNonStreamClaudeClient' \
       "$SOURCE_DIR/relay/channel/openai/buffered_claude_stream_test.go" &&
+    grep -q 'TestOpenAIAdaptorFinalizesClaudeStreamWhenUpstreamEndsWithDoneOnly' \
+      "$SOURCE_DIR/relay/channel/openai/buffered_claude_stream_test.go" &&
+    grep -q 'FinalizeStreamResponseOpenAI2Claude' \
+      "$SOURCE_DIR/relaykit/relayconvert/response_compat.go" &&
     grep -q 'Citations.*citations' "$SOURCE_DIR/relaykit/dto/claude.go" &&
     grep -q 'case "citations_delta"' \
       "$SOURCE_DIR/relay/channel/claude/buffered_stream.go" &&
