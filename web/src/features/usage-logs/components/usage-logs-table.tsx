@@ -18,7 +18,12 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useQuery } from '@tanstack/react-query'
 import { getRouteApi } from '@tanstack/react-router'
-import { type ColumnDef } from '@tanstack/react-table'
+import type {
+  ColumnDef,
+  OnChangeFn,
+  PaginationState,
+} from '@tanstack/react-table'
+import { useCallback, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -36,6 +41,10 @@ import {
   LOG_TYPE_ALL_VALUE,
   LOG_TYPE_ENUM,
 } from '../constants'
+import {
+  getUsageLogsRefetchInterval,
+  USAGE_LOGS_AUTO_REFRESH_ERROR_TOAST_ID,
+} from '../lib/auto-refresh'
 import { useColumnsByCategory } from '../lib/columns'
 import { parseLogOther } from '../lib/format'
 import { fetchLogsByCategory } from '../lib/utils'
@@ -43,7 +52,7 @@ import type { LogCategory } from '../types'
 import { CommonLogsFilterBar } from './common-logs-filter-bar'
 import { TaskLogsFilterBar } from './task-logs-filter-bar'
 import { UsageLogsMobileList } from './usage-logs-mobile-card'
-import { useLogsViewScope } from './usage-logs-provider'
+import { useLogsViewScope, useUsageLogsContext } from './usage-logs-provider'
 
 const route = getRouteApi('/_authenticated/usage-logs/$section')
 
@@ -64,7 +73,14 @@ function getColumnVisibilityStorageKey(
 }
 
 function deserializeLogTypeFilter(value: unknown): unknown[] {
-  const values = Array.isArray(value) ? value : value ? [value] : []
+  let values: unknown[]
+  if (Array.isArray(value)) {
+    values = value
+  } else if (value) {
+    values = [value]
+  } else {
+    values = []
+  }
   return values.filter((item) => String(item) !== LOG_TYPE_ALL_VALUE)
 }
 
@@ -75,6 +91,7 @@ interface UsageLogsTableProps {
 export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
   const { t } = useTranslation()
   const { isAdminView: isAdmin } = useLogsViewScope()
+  const { autoRefresh, setAutoRefresh } = useUsageLogsContext()
   const isMobile = useMediaQuery('(max-width: 640px)')
   const searchParams = route.useSearch()
 
@@ -116,7 +133,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
     ],
   })
 
-  const { data, isLoading, isFetching } = useQuery({
+  const { data, isLoading, isFetching, error, errorUpdatedAt } = useQuery({
     queryKey: [
       'logs',
       logCategory,
@@ -138,8 +155,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
       })
 
       if (!result?.success) {
-        toast.error(result?.message || t('Failed to load logs'))
-        return DEFAULT_LOGS_DATA
+        throw new Error(result?.message || t('Failed to load logs'))
       }
 
       return result.data || DEFAULT_LOGS_DATA
@@ -150,7 +166,35 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
       }
       return undefined
     },
+    retry: false,
+    refetchInterval: (query) =>
+      getUsageLogsRefetchInterval(
+        autoRefresh,
+        pagination.pageIndex + 1,
+        query.state.status
+      ),
+    refetchIntervalInBackground: false,
   })
+
+  useEffect(() => {
+    if (!error || errorUpdatedAt === 0) return
+    toast.error(
+      error instanceof Error ? error.message : t('Failed to load logs'),
+      { id: USAGE_LOGS_AUTO_REFRESH_ERROR_TOAST_ID }
+    )
+    setAutoRefresh(false)
+  }, [error, errorUpdatedAt, setAutoRefresh, t])
+
+  const handlePaginationChange = useCallback<OnChangeFn<PaginationState>>(
+    (updater) => {
+      const next = typeof updater === 'function' ? updater(pagination) : updater
+      if (autoRefresh && next.pageIndex > 0) {
+        setAutoRefresh(false)
+      }
+      onPaginationChange(next)
+    },
+    [autoRefresh, onPaginationChange, pagination, setAutoRefresh]
+  )
 
   const logs = data?.items || []
   const columns = useColumnsByCategory(logCategory, isAdmin)
@@ -166,7 +210,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
     ),
     pagination,
     enableRowSelection: false,
-    onPaginationChange,
+    onPaginationChange: handlePaginationChange,
     onColumnFiltersChange,
     manualPagination: true,
     manualFiltering: true,

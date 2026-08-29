@@ -3,6 +3,7 @@ package controller
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -297,16 +298,137 @@ func TestResolveChannelTestUserIDUsesRequestUser(t *testing.T) {
 }
 
 func TestSelectChannelsForAutomaticTestPassiveRecoveryOnlyUsesAutoDisabled(t *testing.T) {
+	previousAutomaticEnable := common.AutomaticEnableChannelEnabled
+	common.AutomaticEnableChannelEnabled = true
+	t.Cleanup(func() {
+		common.AutomaticEnableChannelEnabled = previousAutomaticEnable
+	})
+
 	channels := []*model.Channel{
 		{Id: 1, Status: common.ChannelStatusEnabled},
 		{Id: 2, Status: common.ChannelStatusAutoDisabled},
 		{Id: 3, Status: common.ChannelStatusManuallyDisabled},
+		{
+			Id:     4,
+			Key:    "auto-disabled\nmanual-disabled",
+			Status: common.ChannelStatusEnabled,
+			ChannelInfo: model.ChannelInfo{
+				IsMultiKey: true,
+				MultiKeyStatusList: map[int]int{
+					0: common.ChannelStatusAutoDisabled,
+					1: common.ChannelStatusManuallyDisabled,
+				},
+			},
+		},
+		{
+			Id:     5,
+			Key:    "manual-disabled\nenabled",
+			Status: common.ChannelStatusEnabled,
+			ChannelInfo: model.ChannelInfo{
+				IsMultiKey: true,
+				MultiKeyStatusList: map[int]int{
+					0: common.ChannelStatusManuallyDisabled,
+				},
+			},
+		},
 	}
 
 	selected := selectChannelsForAutomaticTest(channels, operation_setting.ChannelTestModePassiveRecovery)
 
-	require.Len(t, selected, 1)
+	require.Len(t, selected, 2)
 	require.Equal(t, 2, selected[0].Id)
+	require.Equal(t, 4, selected[1].Id)
+}
+
+func TestAutoDisabledChannelKeyRecoveryUsesEachExactIndex(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	previousAutomaticEnable := common.AutomaticEnableChannelEnabled
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.AutomaticEnableChannelEnabled = true
+	common.MemoryCacheEnabled = false
+	t.Cleanup(func() {
+		common.AutomaticEnableChannelEnabled = previousAutomaticEnable
+		common.MemoryCacheEnabled = previousMemoryCache
+	})
+
+	channel := &model.Channel{
+		Name:   "recover-exact-keys",
+		Key:    "same\nsame\nmanual",
+		Status: common.ChannelStatusEnabled,
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 3,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+				1: common.ChannelStatusAutoDisabled,
+				2: common.ChannelStatusManuallyDisabled,
+			},
+			MultiKeyDisabledReason: map[int]string{0: "first", 1: "second", 2: "manual"},
+			MultiKeyDisabledTime:   map[int]int64{0: 100, 1: 200, 2: 300},
+		},
+	}
+	require.NoError(t, db.Create(channel).Error)
+
+	testedIndexes := make([]int, 0, 2)
+	summary := testAutoDisabledChannelKeys(context.Background(), channel, func(_ context.Context, _ *model.Channel, keyIndex int) testResult {
+		testedIndexes = append(testedIndexes, keyIndex)
+		if keyIndex == 0 {
+			return testResult{}
+		}
+		return testResult{localErr: errors.New("still rejected")}
+	})
+
+	assert.Equal(t, []int{0, 1}, testedIndexes)
+	assert.Equal(t, channelTestSummary{Tested: 2, Succeeded: 1, Failed: 1, Enabled: 1}, summary)
+
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 0)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[1])
+	assert.Equal(t, common.ChannelStatusManuallyDisabled, stored.ChannelInfo.MultiKeyStatusList[2])
+}
+
+func TestAutoDisabledChannelKeyRecoveryRejectsStaleSuccessfulCheck(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	previousAutomaticEnable := common.AutomaticEnableChannelEnabled
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.AutomaticEnableChannelEnabled = true
+	common.MemoryCacheEnabled = false
+	t.Cleanup(func() {
+		common.AutomaticEnableChannelEnabled = previousAutomaticEnable
+		common.MemoryCacheEnabled = previousMemoryCache
+	})
+
+	channel := &model.Channel{
+		Name:   "stale-recovery-result",
+		Key:    "old-key\nactive-key",
+		Status: common.ChannelStatusEnabled,
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:             true,
+			MultiKeySize:           2,
+			MultiKeyStatusList:     map[int]int{0: common.ChannelStatusAutoDisabled},
+			MultiKeyDisabledReason: map[int]string{0: "old rejection"},
+			MultiKeyDisabledTime:   map[int]int64{0: 100},
+		},
+	}
+	require.NoError(t, db.Create(channel).Error)
+
+	summary := testAutoDisabledChannelKeys(context.Background(), channel, func(_ context.Context, _ *model.Channel, _ int) testResult {
+		updatedInfo := channel.ChannelInfo
+		updatedInfo.MultiKeyDisabledTime = map[int]int64{0: 200}
+		require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channel.Id).Updates(map[string]any{
+			"key":          "replacement-key\nactive-key",
+			"channel_info": updatedInfo,
+		}).Error)
+		return testResult{}
+	})
+
+	assert.Equal(t, channelTestSummary{Tested: 1, Succeeded: 1}, summary)
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, "replacement-key\nactive-key", stored.Key)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
+	assert.Equal(t, int64(200), stored.ChannelInfo.MultiKeyDisabledTime[0])
 }
 
 func TestSelectChannelsForAutomaticTestScheduledSkipsManualDisabled(t *testing.T) {
