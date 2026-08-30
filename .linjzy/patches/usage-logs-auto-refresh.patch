@@ -1,5 +1,5 @@
 diff --git a/Dockerfile b/Dockerfile
-index 5be311b1..a3ab0a05 100644
+index 399a2ab8..497fbd27 100644
 --- a/Dockerfile
 +++ b/Dockerfile
 @@ -5,7 +5,22 @@ COPY web/package.json web/bun.lock ./
@@ -105,10 +105,10 @@ index dd754e22..a104d7ef 100644
      return (
        <div className='flex items-center gap-2'>
 diff --git a/web/src/features/usage-logs/components/usage-logs-provider.tsx b/web/src/features/usage-logs/components/usage-logs-provider.tsx
-index 50fa0ed3..460a3a4d 100644
+index 930634c4..77689c78 100644
 --- a/web/src/features/usage-logs/components/usage-logs-provider.tsx
 +++ b/web/src/features/usage-logs/components/usage-logs-provider.tsx
-@@ -36,6 +36,8 @@ interface UsageLogsContextValue {
+@@ -46,6 +46,8 @@ interface UsageLogsContextValue {
    setAffinityDialogOpen: (open: boolean) => void
    sensitiveVisible: boolean
    setSensitiveVisible: (visible: boolean) => void
@@ -117,7 +117,7 @@ index 50fa0ed3..460a3a4d 100644
    viewScope: LogsViewScope
    setViewScope: (scope: LogsViewScope) => void
  }
-@@ -51,6 +53,7 @@ export function UsageLogsProvider({ children }: { children: ReactNode }) {
+@@ -61,6 +63,7 @@ export function UsageLogsProvider({ children }: { children: ReactNode }) {
      useState<ChannelAffinityInfo | null>(null)
    const [affinityDialogOpen, setAffinityDialogOpen] = useState(false)
    const [sensitiveVisible, setSensitiveVisible] = useState(true)
@@ -125,7 +125,7 @@ index 50fa0ed3..460a3a4d 100644
    const [viewScope, setViewScope] = useState<LogsViewScope>('all')
  
    return (
-@@ -66,6 +69,8 @@ export function UsageLogsProvider({ children }: { children: ReactNode }) {
+@@ -76,6 +79,8 @@ export function UsageLogsProvider({ children }: { children: ReactNode }) {
          setAffinityDialogOpen,
          sensitiveVisible,
          setSensitiveVisible,
@@ -135,14 +135,14 @@ index 50fa0ed3..460a3a4d 100644
          setViewScope,
        }}
 diff --git a/web/src/features/usage-logs/components/usage-logs-table.tsx b/web/src/features/usage-logs/components/usage-logs-table.tsx
-index bb961239..57d7255c 100644
+index 8d57cf3a..3d642560 100644
 --- a/web/src/features/usage-logs/components/usage-logs-table.tsx
 +++ b/web/src/features/usage-logs/components/usage-logs-table.tsx
 @@ -18,7 +18,12 @@ For commercial licensing, please contact support@quantumnous.com
  */
  import { useQuery } from '@tanstack/react-query'
  import { getRouteApi } from '@tanstack/react-router'
--import { type ColumnDef } from '@tanstack/react-table'
+-import type { ColumnDef } from '@tanstack/react-table'
 +import type {
 +  ColumnDef,
 +  OnChangeFn,
@@ -163,40 +163,28 @@ index bb961239..57d7255c 100644
  import { useColumnsByCategory } from '../lib/columns'
  import { parseLogOther } from '../lib/format'
  import { fetchLogsByCategory } from '../lib/utils'
-@@ -43,7 +52,7 @@ import type { LogCategory } from '../types'
+@@ -43,7 +52,11 @@ import type { LogCategory } from '../types'
  import { CommonLogsFilterBar } from './common-logs-filter-bar'
  import { TaskLogsFilterBar } from './task-logs-filter-bar'
  import { UsageLogsMobileList } from './usage-logs-mobile-card'
--import { useLogsViewScope } from './usage-logs-provider'
-+import { useLogsViewScope, useUsageLogsContext } from './usage-logs-provider'
+-import { useLogsViewScope, type LogsViewAccess } from './usage-logs-provider'
++import {
++  useLogsViewScope,
++  useUsageLogsContext,
++  type LogsViewAccess,
++} from './usage-logs-provider'
  
  const route = getRouteApi('/_authenticated/usage-logs/$section')
  
-@@ -64,7 +73,14 @@ function getColumnVisibilityStorageKey(
- }
- 
- function deserializeLogTypeFilter(value: unknown): unknown[] {
--  const values = Array.isArray(value) ? value : value ? [value] : []
-+  let values: unknown[]
-+  if (Array.isArray(value)) {
-+    values = value
-+  } else if (value) {
-+    values = [value]
-+  } else {
-+    values = []
-+  }
-   return values.filter((item) => String(item) !== LOG_TYPE_ALL_VALUE)
- }
- 
-@@ -75,6 +91,7 @@ interface UsageLogsTableProps {
- export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
-   const { t } = useTranslation()
-   const { isAdminView: isAdmin } = useLogsViewScope()
+@@ -84,6 +97,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
+     isRootView: isRoot,
+     viewAccess,
+   } = useLogsViewScope()
 +  const { autoRefresh, setAutoRefresh } = useUsageLogsContext()
    const isMobile = useMediaQuery('(max-width: 640px)')
    const searchParams = route.useSearch()
  
-@@ -116,7 +133,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
+@@ -125,7 +139,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
      ],
    })
  
@@ -205,7 +193,7 @@ index bb961239..57d7255c 100644
      queryKey: [
        'logs',
        logCategory,
-@@ -138,8 +155,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
+@@ -147,8 +161,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
        })
  
        if (!result?.success) {
@@ -215,7 +203,7 @@ index bb961239..57d7255c 100644
        }
  
        return result.data || DEFAULT_LOGS_DATA
-@@ -150,8 +166,36 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
+@@ -162,8 +175,36 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
        }
        return undefined
      },
@@ -250,9 +238,9 @@ index bb961239..57d7255c 100644
 +  )
 +
    const logs = data?.items || []
-   const columns = useColumnsByCategory(logCategory, isAdmin)
+   const columns = useColumnsByCategory(logCategory, isAdmin, isRoot)
    const isLoadingData = isLoading || (isFetching && !data)
-@@ -166,7 +210,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
+@@ -178,7 +219,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
      ),
      pagination,
      enableRowSelection: false,
@@ -262,7 +250,7 @@ index bb961239..57d7255c 100644
      manualPagination: true,
      manualFiltering: true,
 diff --git a/web/src/features/usage-logs/constants.ts b/web/src/features/usage-logs/constants.ts
-index a2dff48b..e8ae974d 100644
+index 7bc23448..0ee6ebd7 100644
 --- a/web/src/features/usage-logs/constants.ts
 +++ b/web/src/features/usage-logs/constants.ts
 @@ -44,6 +44,9 @@ export const DEFAULT_LOGS_DATA = {
