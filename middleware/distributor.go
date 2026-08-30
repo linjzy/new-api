@@ -577,6 +577,18 @@ func getTaskOriginModelName(c *gin.Context) string {
 }
 
 func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, modelName string) *types.NewAPIError {
+	return setupContextForSelectedChannel(c, channel, modelName, nil)
+}
+
+// SetupContextForAutoDisabledChannelTestKey prepares a recovery check with one
+// exact auto-disabled multi-key credential. Normal relay selection must
+// continue to use SetupContextForSelectedChannel so disabled keys never
+// receive user traffic.
+func SetupContextForAutoDisabledChannelTestKey(c *gin.Context, channel *model.Channel, modelName string, keyIndex int) *types.NewAPIError {
+	return setupContextForSelectedChannel(c, channel, modelName, &keyIndex)
+}
+
+func setupContextForSelectedChannel(c *gin.Context, channel *model.Channel, modelName string, selectedKeyIndex *int) *types.NewAPIError {
 	c.Set("original_model", modelName) // for retry
 	expectedPlugin := c.GetString("expected_task_plugin_key")
 	if channel == nil {
@@ -640,9 +652,32 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
 	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
 
-	key, index, newAPIError := channel.GetNextEnabledKey()
-	if newAPIError != nil {
-		return newAPIError
+	var key string
+	var index int
+	if selectedKeyIndex == nil {
+		var newAPIError *types.NewAPIError
+		key, index, newAPIError = channel.GetNextEnabledKey()
+		if newAPIError != nil {
+			return newAPIError
+		}
+	} else {
+		keys := channel.GetKeys()
+		index = *selectedKeyIndex
+		if !channel.ChannelInfo.IsMultiKey || index < 0 || index >= len(keys) {
+			return types.NewError(
+				fmt.Errorf("channel key index %d is unavailable", index),
+				types.ErrorCodeChannelNoAvailableKey,
+				types.ErrOptionWithSkipRetry(),
+			)
+		}
+		if channel.ChannelInfo.MultiKeyStatusList[index] != common.ChannelStatusAutoDisabled {
+			return types.NewError(
+				fmt.Errorf("channel key index %d is not auto-disabled", index),
+				types.ErrorCodeChannelNoAvailableKey,
+				types.ErrOptionWithSkipRetry(),
+			)
+		}
+		key = keys[index]
 	}
 	if channel.ChannelInfo.IsMultiKey {
 		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, true)
