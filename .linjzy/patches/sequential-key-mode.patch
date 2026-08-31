@@ -1,0 +1,1834 @@
+diff --git a/constant/multi_key_mode.go b/constant/multi_key_mode.go
+index cd0cdbff..2a5e00d8 100644
+--- a/constant/multi_key_mode.go
++++ b/constant/multi_key_mode.go
+@@ -3,6 +3,7 @@ package constant
+ type MultiKeyMode string
+ 
+ const (
+-	MultiKeyModeRandom  MultiKeyMode = "random"  // 随机
+-	MultiKeyModePolling MultiKeyMode = "polling" // 轮询
++	MultiKeyModeRandom     MultiKeyMode = "random"     // 随机
++	MultiKeyModePolling    MultiKeyMode = "polling"    // 轮询
++	MultiKeyModeSequential MultiKeyMode = "sequential" // 顺序优先
+ )
+diff --git a/controller/channel-test.go b/controller/channel-test.go
+index ac872360..ffe7aa5b 100644
+--- a/controller/channel-test.go
++++ b/controller/channel-test.go
+@@ -110,7 +110,7 @@ func resolveChannelTestUserID(c *gin.Context) (int, error) {
+ 	return rootUser.Id, nil
+ }
+ 
+-func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool) testResult {
++func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool, keyIndex *int) testResult {
+ 	if ctx == nil {
+ 		ctx = context.Background()
+ 	}
+@@ -175,7 +175,12 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+ 	group, _ := model.GetUserGroup(testUserID, false)
+ 	c.Set("group", group)
+ 
+-	newAPIError := middleware.SetupContextForSelectedChannel(c, channel, testModel)
++	var newAPIError *types.NewAPIError
++	if keyIndex == nil {
++		newAPIError = middleware.SetupContextForSelectedChannel(c, channel, testModel)
++	} else {
++		newAPIError = middleware.SetupContextForAutoDisabledChannelTestKey(c, channel, testModel, *keyIndex)
++	}
+ 	if newAPIError != nil {
+ 		return testResult{
+ 			context:     c,
+@@ -874,7 +879,7 @@ func TestChannel(c *gin.Context) {
+ 	if c.Request != nil {
+ 		requestCtx = c.Request.Context()
+ 	}
+-	result := testChannel(requestCtx, channel, testUserID, testModel, endpointType, isStream)
++	result := testChannel(requestCtx, channel, testUserID, testModel, endpointType, isStream, nil)
+ 	if result.localErr != nil {
+ 		resp := gin.H{
+ 			"success": false,
+@@ -917,11 +922,57 @@ type channelTestSummary struct {
+ 	Enabled   int `json:"enabled"`
+ }
+ 
+-func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, testUserID int, allowDisable bool, disableThreshold int64) channelTestSummary {
++type channelKeyTestFunc func(context.Context, *model.Channel, int) testResult
++
++func testAutoDisabledChannelKeys(ctx context.Context, channel *model.Channel, testKey channelKeyTestFunc) channelTestSummary {
++	summary := channelTestSummary{}
++	if !common.AutomaticEnableChannelEnabled || channel == nil || channel.Status == common.ChannelStatusManuallyDisabled {
++		return summary
++	}
++	if ctx == nil {
++		ctx = context.Background()
++	}
++
++	keys := channel.GetKeys()
++	for _, keyIndex := range channel.AutoDisabledKeyIndexes() {
++		if ctx.Err() != nil {
++			return summary
++		}
++		expectedKey := keys[keyIndex]
++		expectedDisabledTime := channel.ChannelInfo.MultiKeyDisabledTime[keyIndex]
++		result := testKey(ctx, channel, keyIndex)
++		if ctx.Err() != nil {
++			return summary
++		}
++
++		summary.Tested++
++		if result.localErr != nil || result.newAPIError != nil {
++			summary.Failed++
++			continue
++		}
++
++		summary.Succeeded++
++		if model.EnableAutoDisabledChannelKey(channel.Id, keyIndex, expectedKey, expectedDisabledTime) {
++			summary.Enabled++
++		}
++	}
++	return summary
++}
++
++func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, testUserID int, allowDisable bool, disableThreshold int64, recoveryOnly bool) channelTestSummary {
+ 	summary := channelTestSummary{}
++	hasAutoDisabledKeys := len(channel.AutoDisabledKeyIndexes()) > 0
++	testKey := func(ctx context.Context, channel *model.Channel, keyIndex int) testResult {
++		return testChannel(ctx, channel, testUserID, "", "", shouldUseStreamForAutomaticChannelTest(channel), &keyIndex)
++	}
++	if common.AutomaticEnableChannelEnabled && hasAutoDisabledKeys &&
++		(recoveryOnly || channel.Status == common.ChannelStatusAutoDisabled) {
++		return testAutoDisabledChannelKeys(ctx, channel, testKey)
++	}
++
+ 	isChannelEnabled := channel.Status == common.ChannelStatusEnabled
+ 	tik := time.Now()
+-	result := testChannel(ctx, channel, testUserID, "", "", shouldUseStreamForAutomaticChannelTest(channel))
++	result := testChannel(ctx, channel, testUserID, "", "", shouldUseStreamForAutomaticChannelTest(channel), nil)
+ 	milliseconds := time.Since(tik).Milliseconds()
+ 	if ctx.Err() != nil {
+ 		return summary
+@@ -960,6 +1011,13 @@ func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, test
+ 	}
+ 
+ 	channel.UpdateResponseTime(milliseconds)
++	if common.AutomaticEnableChannelEnabled && hasAutoDisabledKeys {
++		recoverySummary := testAutoDisabledChannelKeys(ctx, channel, testKey)
++		summary.Tested += recoverySummary.Tested
++		summary.Succeeded += recoverySummary.Succeeded
++		summary.Failed += recoverySummary.Failed
++		summary.Enabled += recoverySummary.Enabled
++	}
+ 	return summary
+ }
+ 
+@@ -1059,7 +1117,7 @@ func runChannelTestWorkers(
+ // performChannelTests runs channel health checks with the configured bounded
+ // concurrency and honors cancellation when a system-task runner loses its
+ // lease.
+-func performChannelTests(ctx context.Context, channels []*model.Channel, testUserID int, allowDisable bool, concurrency int, report func(processed, total int)) channelTestSummary {
++func performChannelTests(ctx context.Context, channels []*model.Channel, testUserID int, allowDisable bool, recoveryOnly bool, concurrency int, report func(processed, total int)) channelTestSummary {
+ 	if ctx == nil {
+ 		ctx = context.Background()
+ 	}
+@@ -1072,7 +1130,7 @@ func performChannelTests(ctx context.Context, channels []*model.Channel, testUse
+ 		channels,
+ 		concurrency,
+ 		func(ctx context.Context, channel *model.Channel) channelTestSummary {
+-			return testChannelForHealthCheck(ctx, channel, testUserID, allowDisable, disableThreshold)
++			return testChannelForHealthCheck(ctx, channel, testUserID, allowDisable, disableThreshold, recoveryOnly)
+ 		},
+ 		report,
+ 	)
+@@ -1100,8 +1158,9 @@ func runChannelTestTask(ctx context.Context, mode string, notify bool, report fu
+ 	}
+ 	selected := selectChannelsForAutomaticTest(channels, mode)
+ 	allowDisable := mode != operation_setting.ChannelTestModePassiveRecovery
++	recoveryOnly := mode == operation_setting.ChannelTestModePassiveRecovery
+ 	concurrency := operation_setting.GetMonitorSetting().ChannelTestConcurrency
+-	summary := performChannelTests(ctx, selected, testUserID, allowDisable, concurrency, report)
++	summary := performChannelTests(ctx, selected, testUserID, allowDisable, recoveryOnly, concurrency, report)
+ 	if notify && (ctx == nil || ctx.Err() == nil) {
+ 		service.NotifyRootUser(dto.NotifyTypeChannelTest, "通道测试完成", "所有通道测试已完成")
+ 	}
+@@ -1118,7 +1177,9 @@ func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*m
+ 			continue
+ 		}
+ 		if mode == operation_setting.ChannelTestModePassiveRecovery && channel.Status != common.ChannelStatusAutoDisabled {
+-			continue
++			if !common.AutomaticEnableChannelEnabled || len(channel.AutoDisabledKeyIndexes()) == 0 {
++				continue
++			}
+ 		}
+ 		selected = append(selected, channel)
+ 	}
+diff --git a/controller/channel_test_internal_test.go b/controller/channel_test_internal_test.go
+index 85da7f7b..9bc0655f 100644
+--- a/controller/channel_test_internal_test.go
++++ b/controller/channel_test_internal_test.go
+@@ -3,6 +3,7 @@ package controller
+ import (
+ 	"bytes"
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"net/http"
+ 	"net/http/httptest"
+@@ -297,16 +298,137 @@ func TestResolveChannelTestUserIDUsesRequestUser(t *testing.T) {
+ }
+ 
+ func TestSelectChannelsForAutomaticTestPassiveRecoveryOnlyUsesAutoDisabled(t *testing.T) {
++	previousAutomaticEnable := common.AutomaticEnableChannelEnabled
++	common.AutomaticEnableChannelEnabled = true
++	t.Cleanup(func() {
++		common.AutomaticEnableChannelEnabled = previousAutomaticEnable
++	})
++
+ 	channels := []*model.Channel{
+ 		{Id: 1, Status: common.ChannelStatusEnabled},
+ 		{Id: 2, Status: common.ChannelStatusAutoDisabled},
+ 		{Id: 3, Status: common.ChannelStatusManuallyDisabled},
++		{
++			Id:     4,
++			Key:    "auto-disabled\nmanual-disabled",
++			Status: common.ChannelStatusEnabled,
++			ChannelInfo: model.ChannelInfo{
++				IsMultiKey: true,
++				MultiKeyStatusList: map[int]int{
++					0: common.ChannelStatusAutoDisabled,
++					1: common.ChannelStatusManuallyDisabled,
++				},
++			},
++		},
++		{
++			Id:     5,
++			Key:    "manual-disabled\nenabled",
++			Status: common.ChannelStatusEnabled,
++			ChannelInfo: model.ChannelInfo{
++				IsMultiKey: true,
++				MultiKeyStatusList: map[int]int{
++					0: common.ChannelStatusManuallyDisabled,
++				},
++			},
++		},
+ 	}
+ 
+ 	selected := selectChannelsForAutomaticTest(channels, operation_setting.ChannelTestModePassiveRecovery)
+ 
+-	require.Len(t, selected, 1)
++	require.Len(t, selected, 2)
+ 	require.Equal(t, 2, selected[0].Id)
++	require.Equal(t, 4, selected[1].Id)
++}
++
++func TestAutoDisabledChannelKeyRecoveryUsesEachExactIndex(t *testing.T) {
++	db := setupModelListControllerTestDB(t)
++	previousAutomaticEnable := common.AutomaticEnableChannelEnabled
++	previousMemoryCache := common.MemoryCacheEnabled
++	common.AutomaticEnableChannelEnabled = true
++	common.MemoryCacheEnabled = false
++	t.Cleanup(func() {
++		common.AutomaticEnableChannelEnabled = previousAutomaticEnable
++		common.MemoryCacheEnabled = previousMemoryCache
++	})
++
++	channel := &model.Channel{
++		Name:   "recover-exact-keys",
++		Key:    "same\nsame\nmanual",
++		Status: common.ChannelStatusEnabled,
++		ChannelInfo: model.ChannelInfo{
++			IsMultiKey:   true,
++			MultiKeySize: 3,
++			MultiKeyStatusList: map[int]int{
++				0: common.ChannelStatusAutoDisabled,
++				1: common.ChannelStatusAutoDisabled,
++				2: common.ChannelStatusManuallyDisabled,
++			},
++			MultiKeyDisabledReason: map[int]string{0: "first", 1: "second", 2: "manual"},
++			MultiKeyDisabledTime:   map[int]int64{0: 100, 1: 200, 2: 300},
++		},
++	}
++	require.NoError(t, db.Create(channel).Error)
++
++	testedIndexes := make([]int, 0, 2)
++	summary := testAutoDisabledChannelKeys(context.Background(), channel, func(_ context.Context, _ *model.Channel, keyIndex int) testResult {
++		testedIndexes = append(testedIndexes, keyIndex)
++		if keyIndex == 0 {
++			return testResult{}
++		}
++		return testResult{localErr: errors.New("still rejected")}
++	})
++
++	assert.Equal(t, []int{0, 1}, testedIndexes)
++	assert.Equal(t, channelTestSummary{Tested: 2, Succeeded: 1, Failed: 1, Enabled: 1}, summary)
++
++	var stored model.Channel
++	require.NoError(t, db.First(&stored, channel.Id).Error)
++	assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 0)
++	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[1])
++	assert.Equal(t, common.ChannelStatusManuallyDisabled, stored.ChannelInfo.MultiKeyStatusList[2])
++}
++
++func TestAutoDisabledChannelKeyRecoveryRejectsStaleSuccessfulCheck(t *testing.T) {
++	db := setupModelListControllerTestDB(t)
++	previousAutomaticEnable := common.AutomaticEnableChannelEnabled
++	previousMemoryCache := common.MemoryCacheEnabled
++	common.AutomaticEnableChannelEnabled = true
++	common.MemoryCacheEnabled = false
++	t.Cleanup(func() {
++		common.AutomaticEnableChannelEnabled = previousAutomaticEnable
++		common.MemoryCacheEnabled = previousMemoryCache
++	})
++
++	channel := &model.Channel{
++		Name:   "stale-recovery-result",
++		Key:    "old-key\nactive-key",
++		Status: common.ChannelStatusEnabled,
++		ChannelInfo: model.ChannelInfo{
++			IsMultiKey:             true,
++			MultiKeySize:           2,
++			MultiKeyStatusList:     map[int]int{0: common.ChannelStatusAutoDisabled},
++			MultiKeyDisabledReason: map[int]string{0: "old rejection"},
++			MultiKeyDisabledTime:   map[int]int64{0: 100},
++		},
++	}
++	require.NoError(t, db.Create(channel).Error)
++
++	summary := testAutoDisabledChannelKeys(context.Background(), channel, func(_ context.Context, _ *model.Channel, _ int) testResult {
++		updatedInfo := channel.ChannelInfo
++		updatedInfo.MultiKeyDisabledTime = map[int]int64{0: 200}
++		require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channel.Id).Updates(map[string]any{
++			"key":          "replacement-key\nactive-key",
++			"channel_info": updatedInfo,
++		}).Error)
++		return testResult{}
++	})
++
++	assert.Equal(t, channelTestSummary{Tested: 1, Succeeded: 1}, summary)
++	var stored model.Channel
++	require.NoError(t, db.First(&stored, channel.Id).Error)
++	assert.Equal(t, "replacement-key\nactive-key", stored.Key)
++	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
++	assert.Equal(t, int64(200), stored.ChannelInfo.MultiKeyDisabledTime[0])
+ }
+ 
+ func TestSelectChannelsForAutomaticTestScheduledSkipsManualDisabled(t *testing.T) {
+diff --git a/controller/relay.go b/controller/relay.go
+index 0f7792ef..cdf992be 100644
+--- a/controller/relay.go
++++ b/controller/relay.go
+@@ -193,7 +193,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+ 	relayInfo.RetryIndex = 0
+ 	relayInfo.LastError = nil
+ 
+-	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
++	for ; retryParam.GetRetry() <= common.RetryTimes || retryParam.HasSequentialChannel(); retryParam.IncreaseRetry() {
+ 		relayInfo.RetryIndex = retryParam.GetRetry()
+ 		channel, channelErr := getChannel(c, relayInfo, retryParam)
+ 		if channelErr != nil {
+@@ -238,7 +238,34 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+ 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
+ 		relayInfo.LastError = newAPIError
+ 
+-		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
++		// On the first attempt getChannel intentionally returns a lightweight
++		// placeholder because the distributor already selected the channel. Use
++		// the cached channel for mode/status decisions; otherwise sequential mode
++		// is mistaken for a normal channel and its fallback becomes accidental.
++		channelForError := resolveRelayChannel(channel)
++		if channelForError == nil {
++			channelForError = channel
++		}
++		channelError := types.NewChannelError(
++			channel.Id,
++			channel.Type,
++			channel.Name,
++			channelForError != nil && channelForError.ChannelInfo.IsMultiKey,
++			common.GetContextKeyString(c, constant.ContextKeyChannelKey),
++			channelForError.GetAutoBan(),
++		)
++		sequentialKeyDisabled := processChannelErrorForChannel(c, *channelError, newAPIError, channelForError)
++
++		// A qualifying sequential-key failure retires only the used key and pins
++		// the next attempt to the same channel. Pinning suppresses the loop's next
++		// retry increment, so every enabled key is tried without consuming the
++		// normal channel retry budget.
++		if service.SequentialKeyAutoSkip(channelForError) &&
++			service.ShouldDisableChannelForChannel(channelForError, newAPIError) &&
++			sequentialKeyDisabled && sequentialKeyAvailable(channelForError.Id) {
++			retryParam.SetSequentialChannel(channelForError.Id)
++			continue
++		}
+ 
+ 		if !shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry()) {
+ 			break
+@@ -300,6 +327,21 @@ func fastTokenCountMetaForPricing(request dto.Request) *types.TokenCountMeta {
+ }
+ 
+ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service.RetryParam) (*model.Channel, *types.NewAPIError) {
++	if pinnedChannelID := retryParam.TakeSequentialChannel(); pinnedChannelID > 0 {
++		channel, err := model.CacheGetChannel(pinnedChannelID)
++		if err != nil {
++			return nil, types.NewError(err, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
++		}
++		if !service.SequentialKeyAutoSkip(channel) {
++			return nil, types.NewError(errors.New("sequential key channel changed mode"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
++		}
++		info.PriceData.GroupRatioInfo = helper.HandleGroupRatio(c, info)
++		if newAPIError := middleware.SetupContextForSelectedChannel(c, channel, info.OriginModelName); newAPIError != nil {
++			return nil, newAPIError
++		}
++		return channel, nil
++	}
++
+ 	if info.ChannelMeta == nil {
+ 		autoBan := c.GetBool("auto_ban")
+ 		autoBanInt := 1
+@@ -330,6 +372,25 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
+ 	return channel, nil
+ }
+ 
++func resolveRelayChannel(channel *model.Channel) *model.Channel {
++	if channel == nil || channel.Id <= 0 {
++		return channel
++	}
++	if cached, err := model.CacheGetChannel(channel.Id); err == nil && cached != nil {
++		return cached
++	}
++	return channel
++}
++
++func sequentialKeyAvailable(channelID int) bool {
++	channel, err := model.CacheGetChannel(channelID)
++	if err != nil || channel == nil {
++		return false
++	}
++	_, _, keyErr := channel.GetNextEnabledKey()
++	return keyErr == nil
++}
++
+ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) bool {
+ 	if openaiErr == nil {
+ 		return false
+@@ -363,13 +424,30 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
+ }
+ 
+ func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError) {
++	channel, _ := model.CacheGetChannel(channelError.ChannelId)
++	processChannelErrorForChannel(c, channelError, err, channel)
++}
++
++func processChannelErrorForChannel(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError, channel *model.Channel) bool {
+ 	logger.LogError(c, fmt.Sprintf("channel error (channel #%d, status code: %d): %s", channelError.ChannelId, err.StatusCode, common.LocalLogPreview(err.Error())))
+ 	// 不要使用context获取渠道信息，异步处理时可能会出现渠道信息不一致的情况
+ 	// do not use context to get channel info, there may be inconsistent channel info when processing asynchronously
+-	if service.ShouldDisableChannel(err) && channelError.AutoBan {
+-		gopool.Go(func() {
+-			service.DisableChannel(channelError, err.ErrorWithStatusCode())
+-		})
++	if channel != nil {
++		channelError.IsMultiKey = channel.ChannelInfo.IsMultiKey
++	}
++	sequentialKeyDisabled := false
++	if service.ShouldDisableChannelForChannel(channel, err) && channelError.AutoBan {
++		if service.SequentialKeyAutoSkip(channel) {
++			sequentialKeyDisabled = service.DisableSequentialKey(
++				channelError,
++				common.GetContextKeyInt(c, constant.ContextKeyChannelMultiKeyIndex),
++				err.ErrorWithStatusCode(),
++			)
++		} else {
++			gopool.Go(func() {
++				service.DisableChannel(channelError, err.ErrorWithStatusCode())
++			})
++		}
+ 	}
+ 
+ 	if constant.ErrorLogEnabled && types.IsRecordErrorLog(err) {
+@@ -408,6 +486,7 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
+ 		model.RecordErrorLog(c, userId, channelId, modelName, tokenName, err.MaskSensitiveErrorWithStatusCode(), tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other)
+ 	}
+ 
++	return sequentialKeyDisabled
+ }
+ 
+ func RelayMidjourney(c *gin.Context) {
+@@ -598,7 +677,7 @@ func executeTaskSubmissionWith(
+ 		Retry:       common.GetPointer(0),
+ 	}
+ 
+-	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
++	for ; retryParam.GetRetry() <= common.RetryTimes || retryParam.HasSequentialChannel(); retryParam.IncreaseRetry() {
+ 		stage = "select_channel"
+ 		if requestErr := c.Request.Context().Err(); requestErr != nil {
+ 			diagnostics.cancelled("before_attempt", retryParam.GetRetry()+1)
+@@ -608,8 +687,20 @@ func executeTaskSubmissionWith(
+ 		var channel *model.Channel
+ 
+ 		if lockedCh, ok := relayInfo.LockedChannel.(*model.Channel); ok && lockedCh != nil {
+-			channel = lockedCh
+-			if retryParam.GetRetry() > 0 {
++			// A locked task channel already provides the sequential fallback
++			// target; consume the one-shot pin so the next failure must opt in
++			// again.
++			sequentialKeyFallback := retryParam.TakeSequentialChannel() > 0
++			var refreshErr error
++			channel, refreshErr = resolveLockedTaskRetryChannel(lockedCh, sequentialKeyFallback)
++			if refreshErr != nil {
++				taskErr = service.TaskErrorWrapperLocal(refreshErr, "refresh_locked_channel_failed", http.StatusInternalServerError)
++				break
++			}
++			if sequentialKeyFallback {
++				relayInfo.LockedChannel = channel
++			}
++			if sequentialKeyFallback || retryParam.GetRetry() > 0 {
+ 				if setupErr := middleware.SetupContextForSelectedChannel(c, channel, relayInfo.OriginModelName); setupErr != nil {
+ 					taskErr = service.TaskErrorWrapperLocal(setupErr.Err, "setup_locked_channel_failed", http.StatusInternalServerError)
+ 					break
+@@ -651,15 +742,25 @@ func executeTaskSubmissionWith(
+ 			break
+ 		}
+ 
++		retrySequentialKey := false
+ 		if !taskErr.LocalError {
+-			processChannelError(c,
+-				*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey,
+-					common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()),
+-				types.NewOpenAIError(taskErr.Error, types.ErrorCodeBadResponseStatusCode, taskErr.StatusCode))
++			channelError := types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey,
++				common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan())
++			channelAPIError := types.NewOpenAIError(taskErr.Error, types.ErrorCodeBadResponseStatusCode, taskErr.StatusCode)
++			sequentialKeyDisabled := processChannelErrorForChannel(c, *channelError, channelAPIError, channel)
++			if service.SequentialKeyAutoSkip(channel) &&
++				service.ShouldDisableChannelForChannel(channel, channelAPIError) &&
++				sequentialKeyDisabled && sequentialKeyAvailable(channel.Id) {
++				retryParam.SetSequentialChannel(channel.Id)
++				retrySequentialKey = true
++			}
+ 		}
+ 
+-		willRetry := shouldRetryTaskRelay(c, channel.Id, taskErr, common.RetryTimes-retryParam.GetRetry())
++		willRetry := retrySequentialKey || shouldRetryTaskRelay(c, channel.Id, taskErr, common.RetryTimes-retryParam.GetRetry())
+ 		diagnostics.attemptFailed(retryParam.GetRetry()+1, channel, taskErr, willRetry)
++		if retrySequentialKey {
++			continue
++		}
+ 		if !willRetry {
+ 			break
+ 		}
+@@ -824,6 +925,20 @@ func respondTaskSubmissionError(c *gin.Context, taskErr *taskdto.TaskError) {
+ 	respondTaskError(c, taskErr)
+ }
+ 
++func resolveLockedTaskRetryChannel(lockedChannel *model.Channel, sequentialKeyFallback bool) (*model.Channel, error) {
++	if !sequentialKeyFallback {
++		return lockedChannel, nil
++	}
++	refreshedChannel, err := model.CacheGetChannel(lockedChannel.Id)
++	if err != nil {
++		return nil, err
++	}
++	if refreshedChannel == nil {
++		return nil, errors.New("refreshed locked channel is nil")
++	}
++	return refreshedChannel, nil
++}
++
+ // respondTaskError 统一输出 Task 错误响应（含 429 限流提示改写）
+ func respondTaskError(c *gin.Context, taskErr *taskdto.TaskError) {
+ 	if taskErr.StatusCode == http.StatusTooManyRequests {
+diff --git a/controller/relay_sequential_test.go b/controller/relay_sequential_test.go
+new file mode 100644
+index 00000000..2de44e8f
+--- /dev/null
++++ b/controller/relay_sequential_test.go
+@@ -0,0 +1,55 @@
++package controller
++
++import (
++	"testing"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/QuantumNous/new-api/constant"
++	"github.com/QuantumNous/new-api/model"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestResolveLockedTaskRetryChannelRefreshesSequentialKeyState(t *testing.T) {
++	db := setupModelListControllerTestDB(t)
++	previousMemoryCacheEnabled := common.MemoryCacheEnabled
++	common.MemoryCacheEnabled = false
++	t.Cleanup(func() {
++		common.MemoryCacheEnabled = previousMemoryCacheEnabled
++	})
++
++	channel := model.Channel{
++		Name:   "locked-sequential-task",
++		Key:    "first\nsecond",
++		Status: common.ChannelStatusEnabled,
++		ChannelInfo: model.ChannelInfo{
++			IsMultiKey:   true,
++			MultiKeySize: 2,
++			MultiKeyMode: constant.MultiKeyModeSequential,
++		},
++	}
++	require.NoError(t, db.Create(&channel).Error)
++
++	lockedSnapshot, err := model.GetChannelById(channel.Id, true)
++	require.NoError(t, err)
++	require.True(t, model.UpdateChannelStatusByKeyIndex(
++		channel.Id,
++		"first",
++		0,
++		common.ChannelStatusAutoDisabled,
++		"provider rejected key",
++	))
++
++	staleKey, staleIndex, staleErr := lockedSnapshot.GetNextEnabledKey()
++	require.Nil(t, staleErr)
++	assert.Equal(t, "first", staleKey)
++	assert.Equal(t, 0, staleIndex)
++
++	refreshedChannel, err := resolveLockedTaskRetryChannel(lockedSnapshot, true)
++	require.NoError(t, err)
++	key, index, apiErr := refreshedChannel.GetNextEnabledKey()
++	require.Nil(t, apiErr)
++	assert.Equal(t, "second", key)
++	assert.Equal(t, 1, index)
++}
+diff --git a/middleware/distributor.go b/middleware/distributor.go
+index e61bea44..17cd446c 100644
+--- a/middleware/distributor.go
++++ b/middleware/distributor.go
+@@ -577,6 +577,18 @@ func getTaskOriginModelName(c *gin.Context) string {
+ }
+ 
+ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, modelName string) *types.NewAPIError {
++	return setupContextForSelectedChannel(c, channel, modelName, nil)
++}
++
++// SetupContextForAutoDisabledChannelTestKey prepares a recovery check with one
++// exact auto-disabled multi-key credential. Normal relay selection must
++// continue to use SetupContextForSelectedChannel so disabled keys never
++// receive user traffic.
++func SetupContextForAutoDisabledChannelTestKey(c *gin.Context, channel *model.Channel, modelName string, keyIndex int) *types.NewAPIError {
++	return setupContextForSelectedChannel(c, channel, modelName, &keyIndex)
++}
++
++func setupContextForSelectedChannel(c *gin.Context, channel *model.Channel, modelName string, selectedKeyIndex *int) *types.NewAPIError {
+ 	c.Set("original_model", modelName) // for retry
+ 	expectedPlugin := c.GetString("expected_task_plugin_key")
+ 	if channel == nil {
+@@ -640,9 +652,32 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
+ 	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
+ 	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
+ 
+-	key, index, newAPIError := channel.GetNextEnabledKey()
+-	if newAPIError != nil {
+-		return newAPIError
++	var key string
++	var index int
++	if selectedKeyIndex == nil {
++		var newAPIError *types.NewAPIError
++		key, index, newAPIError = channel.GetNextEnabledKey()
++		if newAPIError != nil {
++			return newAPIError
++		}
++	} else {
++		keys := channel.GetKeys()
++		index = *selectedKeyIndex
++		if !channel.ChannelInfo.IsMultiKey || index < 0 || index >= len(keys) {
++			return types.NewError(
++				fmt.Errorf("channel key index %d is unavailable", index),
++				types.ErrorCodeChannelNoAvailableKey,
++				types.ErrOptionWithSkipRetry(),
++			)
++		}
++		if channel.ChannelInfo.MultiKeyStatusList[index] != common.ChannelStatusAutoDisabled {
++			return types.NewError(
++				fmt.Errorf("channel key index %d is not auto-disabled", index),
++				types.ErrorCodeChannelNoAvailableKey,
++				types.ErrOptionWithSkipRetry(),
++			)
++		}
++		key = keys[index]
+ 	}
+ 	if channel.ChannelInfo.IsMultiKey {
+ 		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, true)
+diff --git a/middleware/distributor_channel_test_key_test.go b/middleware/distributor_channel_test_key_test.go
+new file mode 100644
+index 00000000..0036ed27
+--- /dev/null
++++ b/middleware/distributor_channel_test_key_test.go
+@@ -0,0 +1,73 @@
++package middleware
++
++import (
++	"testing"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/QuantumNous/new-api/constant"
++	"github.com/QuantumNous/new-api/model"
++
++	"github.com/gin-gonic/gin"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestSetupContextForAutoDisabledChannelTestKeyUsesExactCredential(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	context, _ := gin.CreateTestContext(nil)
++	channel := &model.Channel{
++		Id:   7,
++		Name: "recovery-test",
++		Key:  "disabled-key\nenabled-key",
++		ChannelInfo: model.ChannelInfo{
++			IsMultiKey: true,
++			MultiKeyStatusList: map[int]int{
++				0: common.ChannelStatusAutoDisabled,
++			},
++		},
++	}
++
++	apiErr := SetupContextForAutoDisabledChannelTestKey(context, channel, "gpt-test", 0)
++
++	require.Nil(t, apiErr)
++	assert.Equal(t, "disabled-key", common.GetContextKeyString(context, constant.ContextKeyChannelKey))
++	assert.Equal(t, 0, common.GetContextKeyInt(context, constant.ContextKeyChannelMultiKeyIndex))
++	assert.True(t, common.GetContextKeyBool(context, constant.ContextKeyChannelIsMultiKey))
++}
++
++func TestSetupContextForAutoDisabledChannelTestKeyRejectsInvalidIndex(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	context, _ := gin.CreateTestContext(nil)
++	channel := &model.Channel{
++		Id:  7,
++		Key: "only-key",
++		ChannelInfo: model.ChannelInfo{
++			IsMultiKey: true,
++		},
++	}
++
++	apiErr := SetupContextForAutoDisabledChannelTestKey(context, channel, "gpt-test", 1)
++
++	require.NotNil(t, apiErr)
++	assert.Contains(t, apiErr.Error(), "channel key index 1 is unavailable")
++}
++
++func TestSetupContextForAutoDisabledChannelTestKeyRejectsManualDisable(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	context, _ := gin.CreateTestContext(nil)
++	channel := &model.Channel{
++		Id:  7,
++		Key: "manual-key",
++		ChannelInfo: model.ChannelInfo{
++			IsMultiKey: true,
++			MultiKeyStatusList: map[int]int{
++				0: common.ChannelStatusManuallyDisabled,
++			},
++		},
++	}
++
++	apiErr := SetupContextForAutoDisabledChannelTestKey(context, channel, "gpt-test", 0)
++
++	require.NotNil(t, apiErr)
++	assert.Contains(t, apiErr.Error(), "channel key index 0 is not auto-disabled")
++}
+diff --git a/model/channel.go b/model/channel.go
+index 397e9428..9e216392 100644
+--- a/model/channel.go
++++ b/model/channel.go
+@@ -6,6 +6,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"math/rand"
++	"sort"
+ 	"strings"
+ 	"sync"
+ 
+@@ -196,6 +197,25 @@ func (channel *Channel) GetKeys() []string {
+ 	return keys
+ }
+ 
++// AutoDisabledKeyIndexes returns valid multi-key indexes that were disabled
++// automatically. Manually disabled keys are deliberately excluded from
++// automatic recovery.
++func (channel *Channel) AutoDisabledKeyIndexes() []int {
++	if channel == nil || !channel.ChannelInfo.IsMultiKey {
++		return nil
++	}
++
++	keys := channel.GetKeys()
++	indexes := make([]int, 0, len(channel.ChannelInfo.MultiKeyStatusList))
++	for index, status := range channel.ChannelInfo.MultiKeyStatusList {
++		if index >= 0 && index < len(keys) && status == common.ChannelStatusAutoDisabled {
++			indexes = append(indexes, index)
++		}
++	}
++	sort.Ints(indexes)
++	return indexes
++}
++
+ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
+ 	// If not in multi-key mode, return the original key string directly.
+ 	if !channel.ChannelInfo.IsMultiKey {
+@@ -276,6 +296,10 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
+ 		}
+ 		// Fallback – should not happen, but return first enabled key
+ 		return keys[enabledIdx[0]], enabledIdx[0], nil
++	case constant.MultiKeyModeSequential:
++		// Sequential mode always starts with the first enabled key. Relay retry
++		// logic retires a failed key before asking for the next one.
++		return keys[enabledIdx[0]], enabledIdx[0], nil
+ 	default:
+ 		// Unknown mode, default to first enabled key (or original key string)
+ 		return keys[enabledIdx[0]], enabledIdx[0], nil
+@@ -663,29 +687,36 @@ func CleanupChannelPollingLocks() {
+ 	})
+ }
+ 
+-func handlerMultiKeyUpdate(channel *Channel, usingKey string, status int, reason string) {
++func handlerMultiKeyUpdate(channel *Channel, usingKey string, usingKeyIndex int, status int, reason string) bool {
+ 	keys := channel.GetKeys()
+ 	if len(keys) == 0 {
+ 		channel.Status = status
+ 	} else {
+-		keyIndex := -1
+-		for i, key := range keys {
+-			if key == usingKey {
+-				keyIndex = i
+-				break
++		keyIndex := usingKeyIndex
++		if keyIndex >= 0 {
++			if keyIndex >= len(keys) || keys[keyIndex] != usingKey {
++				common.SysLog(fmt.Sprintf("failed to update multi-key status: channel_id=%d, using key index does not match", channel.Id))
++				return false
++			}
++		} else {
++			for i, key := range keys {
++				if key == usingKey {
++					keyIndex = i
++					break
++				}
+ 			}
+ 		}
+ 		if keyIndex < 0 {
+ 			if usingKey != "" {
+ 				common.SysLog(fmt.Sprintf("failed to update multi-key status: channel_id=%d, using key not found", channel.Id))
+-				return
++				return false
+ 			}
+ 			channel.Status = status
+ 			info := channel.GetOtherInfo()
+ 			info["status_reason"] = reason
+ 			info["status_time"] = common.GetTimestamp()
+ 			channel.SetOtherInfo(info)
+-			return
++			return true
+ 		}
+ 		if channel.ChannelInfo.MultiKeyStatusList == nil {
+ 			channel.ChannelInfo.MultiKeyStatusList = make(map[int]int)
+@@ -713,6 +744,7 @@ func handlerMultiKeyUpdate(channel *Channel, usingKey string, status int, reason
+ 			channel.Status = common.ChannelStatusEnabled
+ 		}
+ 	}
++	return true
+ }
+ 
+ func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
+@@ -729,6 +761,92 @@ func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
+ }
+ 
+ func UpdateChannelStatus(channelId int, usingKey string, status int, reason string) bool {
++	return updateChannelStatus(channelId, usingKey, -1, status, reason)
++}
++
++// UpdateChannelStatusByKeyIndex updates the exact credential selected for a
++// multi-key request. The index disambiguates duplicate key values.
++func UpdateChannelStatusByKeyIndex(channelId int, usingKey string, usingKeyIndex int, status int, reason string) bool {
++	return updateChannelStatus(channelId, usingKey, usingKeyIndex, status, reason)
++}
++
++// EnableAutoDisabledChannelKey restores one exact credential after that same
++// credential passes a recovery check. The expected key and disable timestamp
++// prevent a stale check result from enabling a credential that an operator
++// replaced or whose status changed while the upstream request was in flight.
++func EnableAutoDisabledChannelKey(channelId int, keyIndex int, expectedKey string, expectedDisabledTime int64) bool {
++	if common.MemoryCacheEnabled {
++		channelStatusLock.Lock()
++		defer channelStatusLock.Unlock()
++	}
++
++	pollingLock := GetChannelPollingLock(channelId)
++	pollingLock.Lock()
++	defer pollingLock.Unlock()
++
++	updated := false
++	err := DB.Transaction(func(tx *gorm.DB) error {
++		channel := &Channel{}
++		if err := lockForUpdate(tx).First(channel, "id = ?", channelId).Error; err != nil {
++			return err
++		}
++		if channel.Status == common.ChannelStatusManuallyDisabled || !channel.ChannelInfo.IsMultiKey {
++			return nil
++		}
++
++		keys := channel.GetKeys()
++		if keyIndex < 0 || keyIndex >= len(keys) || keys[keyIndex] != expectedKey {
++			return nil
++		}
++		if channel.ChannelInfo.MultiKeyStatusList[keyIndex] != common.ChannelStatusAutoDisabled {
++			return nil
++		}
++		if channel.ChannelInfo.MultiKeyDisabledTime[keyIndex] != expectedDisabledTime {
++			return nil
++		}
++
++		delete(channel.ChannelInfo.MultiKeyStatusList, keyIndex)
++		delete(channel.ChannelInfo.MultiKeyDisabledReason, keyIndex)
++		delete(channel.ChannelInfo.MultiKeyDisabledTime, keyIndex)
++
++		updates := map[string]any{
++			"channel_info": channel.ChannelInfo,
++		}
++		if channel.Status == common.ChannelStatusAutoDisabled {
++			channel.Status = common.ChannelStatusEnabled
++			info := channel.GetOtherInfo()
++			delete(info, "status_reason")
++			delete(info, "status_time")
++			channel.SetOtherInfo(info)
++			updates["status"] = channel.Status
++			updates["other_info"] = channel.OtherInfo
++			if err := tx.Model(&Ability{}).
++				Where("channel_id = ?", channelId).
++				Select("enabled").
++				Update("enabled", true).Error; err != nil {
++				return err
++			}
++		}
++
++		if err := tx.Model(&Channel{}).Where("id = ?", channelId).Updates(updates).Error; err != nil {
++			return err
++		}
++		updated = true
++		return nil
++	})
++	if err != nil {
++		common.SysLog(fmt.Sprintf("failed to auto-enable channel key: channel_id=%d, key_index=%d, error=%v", channelId, keyIndex, err))
++		return false
++	}
++	if !updated {
++		return false
++	}
++
++	InitChannelCache()
++	return true
++}
++
++func updateChannelStatus(channelId int, usingKey string, usingKeyIndex int, status int, reason string) bool {
+ 	if common.MemoryCacheEnabled {
+ 		channelStatusLock.Lock()
+ 		defer channelStatusLock.Unlock()
+@@ -749,7 +867,9 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
+ 		if channelCache.ChannelInfo.IsMultiKey {
+ 			beforeStatus := channelCache.Status
+ 			// 如果是多Key模式，更新缓存中的状态
+-			handlerMultiKeyUpdate(channelCache, usingKey, status, reason)
++			if !handlerMultiKeyUpdate(channelCache, usingKey, usingKeyIndex, status, reason) {
++				return false
++			}
+ 			if beforeStatus != channelCache.Status {
+ 				CacheUpdateChannelStatus(channelId, channelCache.Status)
+ 			}
+@@ -783,7 +903,9 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
+ 
+ 		if channel.ChannelInfo.IsMultiKey {
+ 			beforeStatus := channel.Status
+-			handlerMultiKeyUpdate(channel, usingKey, status, reason)
++			if !handlerMultiKeyUpdate(channel, usingKey, usingKeyIndex, status, reason) {
++				return false
++			}
+ 			if beforeStatus != channel.Status {
+ 				shouldUpdateAbilities = true
+ 			}
+diff --git a/model/channel_sequential_test.go b/model/channel_sequential_test.go
+new file mode 100644
+index 00000000..d92ae6a2
+--- /dev/null
++++ b/model/channel_sequential_test.go
+@@ -0,0 +1,197 @@
++package model
++
++import (
++	"testing"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/QuantumNous/new-api/constant"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestGetNextEnabledKeySequentialUsesFirstEnabledKey(t *testing.T) {
++	channel := &Channel{
++		Key: "first\nsecond\nthird",
++		ChannelInfo: ChannelInfo{
++			IsMultiKey:   true,
++			MultiKeyMode: constant.MultiKeyModeSequential,
++			MultiKeyStatusList: map[int]int{
++				0: common.ChannelStatusAutoDisabled,
++				2: common.ChannelStatusAutoDisabled,
++			},
++		},
++	}
++
++	key, index, err := channel.GetNextEnabledKey()
++	require.Nil(t, err)
++	require.Equal(t, "second", key)
++	require.Equal(t, 1, index)
++
++	// Sequential selection is stable until the failed key is explicitly
++	// retired; it must not advance a cursor as polling mode does.
++	key, index, err = channel.GetNextEnabledKey()
++	require.Nil(t, err)
++	require.Equal(t, "second", key)
++	require.Equal(t, 1, index)
++}
++
++func TestAutoDisabledKeyIndexesOnlyReturnsValidAutomaticEntries(t *testing.T) {
++	channel := &Channel{
++		Key: "first\nsecond\nthird",
++		ChannelInfo: ChannelInfo{
++			IsMultiKey: true,
++			MultiKeyStatusList: map[int]int{
++				-1: common.ChannelStatusAutoDisabled,
++				0:  common.ChannelStatusAutoDisabled,
++				1:  common.ChannelStatusManuallyDisabled,
++				2:  common.ChannelStatusAutoDisabled,
++				3:  common.ChannelStatusAutoDisabled,
++			},
++		},
++	}
++
++	assert.Equal(t, []int{0, 2}, channel.AutoDisabledKeyIndexes())
++}
++
++func TestUpdateChannelStatusByKeyIndexDistinguishesDuplicateKeys(t *testing.T) {
++	setupChannelStatusTest(t)
++
++	channel := Channel{
++		Name:   "sequential-duplicate-keys",
++		Key:    "same\nsame",
++		Status: common.ChannelStatusEnabled,
++		ChannelInfo: ChannelInfo{
++			IsMultiKey:   true,
++			MultiKeySize: 2,
++			MultiKeyMode: constant.MultiKeyModeSequential,
++		},
++	}
++	require.NoError(t, DB.Create(&channel).Error)
++	require.False(t, UpdateChannelStatusByKeyIndex(
++		channel.Id,
++		"same",
++		2,
++		common.ChannelStatusAutoDisabled,
++		"stale key index",
++	))
++
++	require.True(t, UpdateChannelStatusByKeyIndex(
++		channel.Id,
++		"same",
++		0,
++		common.ChannelStatusAutoDisabled,
++		"first credential rejected",
++	))
++	refreshed, err := GetChannelById(channel.Id, true)
++	require.NoError(t, err)
++	key, index, apiErr := refreshed.GetNextEnabledKey()
++	require.Nil(t, apiErr)
++	assert.Equal(t, "same", key)
++	assert.Equal(t, 1, index)
++
++	require.True(t, UpdateChannelStatusByKeyIndex(
++		channel.Id,
++		"same",
++		1,
++		common.ChannelStatusAutoDisabled,
++		"second credential rejected",
++	))
++	refreshed, err = GetChannelById(channel.Id, true)
++	require.NoError(t, err)
++	assert.Equal(t, common.ChannelStatusAutoDisabled, refreshed.Status)
++	assert.Equal(t, common.ChannelStatusAutoDisabled, refreshed.ChannelInfo.MultiKeyStatusList[0])
++	assert.Equal(t, common.ChannelStatusAutoDisabled, refreshed.ChannelInfo.MultiKeyStatusList[1])
++}
++
++func TestEnableAutoDisabledChannelKeyClearsOnlyExactAutomaticEntry(t *testing.T) {
++	setupChannelStatusTest(t)
++
++	channel := Channel{
++		Name:   "recover-one-key",
++		Key:    "first\nsecond\nthird",
++		Status: common.ChannelStatusEnabled,
++		ChannelInfo: ChannelInfo{
++			IsMultiKey:   true,
++			MultiKeySize: 3,
++			MultiKeyMode: constant.MultiKeyModeSequential,
++			MultiKeyStatusList: map[int]int{
++				0: common.ChannelStatusAutoDisabled,
++				1: common.ChannelStatusManuallyDisabled,
++				2: common.ChannelStatusAutoDisabled,
++			},
++			MultiKeyDisabledReason: map[int]string{
++				0: "first rejected",
++				1: "operator disabled",
++				2: "third rejected",
++			},
++			MultiKeyDisabledTime: map[int]int64{
++				0: 100,
++				1: 200,
++				2: 300,
++			},
++		},
++	}
++	require.NoError(t, DB.Create(&channel).Error)
++
++	require.False(t, EnableAutoDisabledChannelKey(channel.Id, 0, "first", 99))
++	require.False(t, EnableAutoDisabledChannelKey(channel.Id, 1, "second", 200))
++	require.True(t, EnableAutoDisabledChannelKey(channel.Id, 0, "first", 100))
++
++	stored, err := GetChannelById(channel.Id, true)
++	require.NoError(t, err)
++	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
++	assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 0)
++	assert.NotContains(t, stored.ChannelInfo.MultiKeyDisabledReason, 0)
++	assert.NotContains(t, stored.ChannelInfo.MultiKeyDisabledTime, 0)
++	assert.Equal(t, common.ChannelStatusManuallyDisabled, stored.ChannelInfo.MultiKeyStatusList[1])
++	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[2])
++	assert.Equal(t, "operator disabled", stored.ChannelInfo.MultiKeyDisabledReason[1])
++	assert.Equal(t, int64(300), stored.ChannelInfo.MultiKeyDisabledTime[2])
++}
++
++func TestEnableAutoDisabledChannelKeyRestoresFullyDisabledChannel(t *testing.T) {
++	setupChannelStatusTest(t)
++
++	channel := Channel{
++		Name:      "recover-disabled-channel",
++		Key:       "first\nsecond",
++		Models:    "gpt-test",
++		Group:     "default",
++		Status:    common.ChannelStatusAutoDisabled,
++		OtherInfo: `{"status_reason":"All keys are disabled","status_time":123,"preserved":"value"}`,
++		ChannelInfo: ChannelInfo{
++			IsMultiKey:   true,
++			MultiKeySize: 2,
++			MultiKeyMode: constant.MultiKeyModeSequential,
++			MultiKeyStatusList: map[int]int{
++				0: common.ChannelStatusAutoDisabled,
++				1: common.ChannelStatusAutoDisabled,
++			},
++			MultiKeyDisabledReason: map[int]string{0: "first rejected", 1: "second rejected"},
++			MultiKeyDisabledTime:   map[int]int64{0: 100, 1: 200},
++		},
++	}
++	require.NoError(t, DB.Create(&channel).Error)
++	require.NoError(t, DB.Create(&Ability{
++		Group:     channel.Group,
++		Model:     channel.Models,
++		ChannelId: channel.Id,
++		Enabled:   false,
++	}).Error)
++
++	require.True(t, EnableAutoDisabledChannelKey(channel.Id, 1, "second", 200))
++
++	stored, err := GetChannelById(channel.Id, true)
++	require.NoError(t, err)
++	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
++	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
++	assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 1)
++	otherInfo := stored.GetOtherInfo()
++	assert.NotContains(t, otherInfo, "status_reason")
++	assert.NotContains(t, otherInfo, "status_time")
++	assert.Equal(t, "value", otherInfo["preserved"])
++
++	var ability Ability
++	require.NoError(t, DB.Where("channel_id = ?", channel.Id).First(&ability).Error)
++	assert.True(t, ability.Enabled)
++}
+diff --git a/service/channel.go b/service/channel.go
+index f348e081..10d336e4 100644
+--- a/service/channel.go
++++ b/service/channel.go
+@@ -5,6 +5,7 @@ import (
+ 	"strings"
+ 
+ 	"github.com/QuantumNous/new-api/common"
++	"github.com/QuantumNous/new-api/constant"
+ 	"github.com/QuantumNous/new-api/model"
+ 	"github.com/QuantumNous/new-api/relaykit/dto"
+ 	"github.com/QuantumNous/new-api/relaykit/types"
+@@ -17,20 +18,40 @@ func formatNotifyType(channelId int, status int) string {
+ 
+ // disable & notify
+ func DisableChannel(channelError types.ChannelError, reason string) {
++	disableChannel(channelError, reason)
++}
++
++func disableChannel(channelError types.ChannelError, reason string) bool {
++	return disableChannelKey(channelError, -1, reason)
++}
++
++func disableChannelKey(channelError types.ChannelError, usingKeyIndex int, reason string) bool {
+ 	common.SysLog(fmt.Sprintf("通道「%s」（#%d）发生错误，准备禁用，原因：%s", channelError.ChannelName, channelError.ChannelId, common.LocalLogPreview(reason)))
+ 
+ 	// 检查是否启用自动禁用功能
+ 	if !channelError.AutoBan {
+ 		common.SysLog(fmt.Sprintf("通道「%s」（#%d）未启用自动禁用功能，跳过禁用操作", channelError.ChannelName, channelError.ChannelId))
+-		return
++		return false
+ 	}
+ 
+-	success := model.UpdateChannelStatus(channelError.ChannelId, channelError.UsingKey, common.ChannelStatusAutoDisabled, reason)
++	var success bool
++	if usingKeyIndex >= 0 {
++		success = model.UpdateChannelStatusByKeyIndex(
++			channelError.ChannelId,
++			channelError.UsingKey,
++			usingKeyIndex,
++			common.ChannelStatusAutoDisabled,
++			reason,
++		)
++	} else {
++		success = model.UpdateChannelStatus(channelError.ChannelId, channelError.UsingKey, common.ChannelStatusAutoDisabled, reason)
++	}
+ 	if success {
+ 		subject := fmt.Sprintf("通道「%s」（#%d）已被禁用", channelError.ChannelName, channelError.ChannelId)
+ 		content := fmt.Sprintf("通道「%s」（#%d）已被禁用，原因：%s", channelError.ChannelName, channelError.ChannelId, reason)
+ 		NotifyRootUser(formatNotifyType(channelError.ChannelId, common.ChannelStatusAutoDisabled), subject, content)
+ 	}
++	return success
+ }
+ 
+ func EnableChannel(channelId int, usingKey string, channelName string) {
+@@ -42,10 +63,7 @@ func EnableChannel(channelId int, usingKey string, channelName string) {
+ 	}
+ }
+ 
+-func ShouldDisableChannel(err *types.NewAPIError) bool {
+-	if !common.AutomaticDisableChannelEnabled {
+-		return false
+-	}
++func shouldDisableChannelCore(err *types.NewAPIError) bool {
+ 	if err == nil {
+ 		return false
+ 	}
+@@ -64,6 +82,47 @@ func ShouldDisableChannel(err *types.NewAPIError) bool {
+ 	return search
+ }
+ 
++func ShouldDisableChannel(err *types.NewAPIError) bool {
++	if !common.AutomaticDisableChannelEnabled {
++		return false
++	}
++	return shouldDisableChannelCore(err)
++}
++
++// SequentialKeyAutoSkip reports whether a channel uses sequential multi-key
++// fallback. The nil check matters on the first relay attempt, where the
++// distributor has already selected a channel but relay metadata is not built
++// yet and the retry loop may only have a lightweight channel placeholder.
++func SequentialKeyAutoSkip(channel *model.Channel) bool {
++	return channel != nil && channel.ChannelInfo.IsMultiKey &&
++		channel.ChannelInfo.MultiKeyMode == constant.MultiKeyModeSequential
++}
++
++// ShouldDisableChannelForChannel decides whether a failed request should
++// disable the channel (or, in sequential multi-key mode, the used key).
++// Sequential mode deliberately evaluates the status/keyword rules directly:
++// retiring a bad key is the mode's contract and must not depend on the global
++// channel auto-disable switch.
++func ShouldDisableChannelForChannel(channel *model.Channel, err *types.NewAPIError) bool {
++	if SequentialKeyAutoSkip(channel) {
++		if types.IsSkipRetryError(err) {
++			return false
++		}
++		return shouldDisableChannelCore(err)
++	}
++	return ShouldDisableChannel(err)
++}
++
++// DisableSequentialKey retires a failing key synchronously. The next retry is
++// selected immediately after this call, so an asynchronous update could pick
++// the same invalid key again.
++func DisableSequentialKey(channelError types.ChannelError, usingKeyIndex int, reason string) bool {
++	if !channelError.IsMultiKey {
++		return false
++	}
++	return disableChannelKey(channelError, usingKeyIndex, reason)
++}
++
+ func ShouldEnableChannel(newAPIError *types.NewAPIError, status int) bool {
+ 	if !common.AutomaticEnableChannelEnabled {
+ 		return false
+diff --git a/service/channel_select.go b/service/channel_select.go
+index d37d4f6d..7f623ead 100644
+--- a/service/channel_select.go
++++ b/service/channel_select.go
+@@ -42,6 +42,10 @@ type RetryParam struct {
+ 	RequestPath  string
+ 	Retry        *int
+ 	resetNextTry bool
++	// sequentialChannelID is set only after a sequential multi-key failure
++	// retires the current key. The next attempt must stay on that channel so
++	// key priority is not accidentally replaced by channel priority/weight.
++	sequentialChannelID int
+ }
+ 
+ func (p *RetryParam) GetRetry() int {
+@@ -70,6 +74,26 @@ func (p *RetryParam) ResetRetryNextTry() {
+ 	p.resetNextTry = true
+ }
+ 
++// SetSequentialChannel pins one same-channel key fallback and suppresses the
++// loop's next channel retry increment. Rotating keys must not consume RetryTimes.
++func (p *RetryParam) SetSequentialChannel(channelID int) {
++	p.sequentialChannelID = channelID
++	p.ResetRetryNextTry()
++}
++
++// TakeSequentialChannel returns the channel pinned for one key fallback and
++// clears the pin before the request is sent. A subsequent key failure must opt
++// in again; after the keys are exhausted, the normal channel retry advances.
++func (p *RetryParam) TakeSequentialChannel() int {
++	channelID := p.sequentialChannelID
++	p.sequentialChannelID = 0
++	return channelID
++}
++
++func (p *RetryParam) HasSequentialChannel() bool {
++	return p.sequentialChannelID > 0
++}
++
+ // CacheGetRandomSatisfiedChannel tries to get a random channel that satisfies the requirements.
+ // 尝试获取一个满足要求的随机渠道。
+ //
+diff --git a/service/channel_sequential_test.go b/service/channel_sequential_test.go
+new file mode 100644
+index 00000000..cb77c9ce
+--- /dev/null
++++ b/service/channel_sequential_test.go
+@@ -0,0 +1,76 @@
++package service
++
++import (
++	"errors"
++	"net/http"
++	"testing"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/QuantumNous/new-api/constant"
++	"github.com/QuantumNous/new-api/model"
++	"github.com/QuantumNous/new-api/relaykit/types"
++	"github.com/stretchr/testify/require"
++)
++
++func TestSequentialKeyAutoSkip(t *testing.T) {
++	sequential := &model.Channel{ChannelInfo: model.ChannelInfo{
++		IsMultiKey:   true,
++		MultiKeyMode: constant.MultiKeyModeSequential,
++	}}
++	nonSequential := &model.Channel{ChannelInfo: model.ChannelInfo{
++		IsMultiKey:   true,
++		MultiKeyMode: constant.MultiKeyModePolling,
++	}}
++
++	require.True(t, SequentialKeyAutoSkip(sequential))
++	require.False(t, SequentialKeyAutoSkip(nonSequential))
++	require.False(t, SequentialKeyAutoSkip(nil))
++}
++
++func TestShouldDisableChannelForChannelSequentialIgnoresGlobalSwitch(t *testing.T) {
++	previous := common.AutomaticDisableChannelEnabled
++	common.AutomaticDisableChannelEnabled = false
++	t.Cleanup(func() {
++		common.AutomaticDisableChannelEnabled = previous
++	})
++
++	sequential := &model.Channel{ChannelInfo: model.ChannelInfo{
++		IsMultiKey:   true,
++		MultiKeyMode: constant.MultiKeyModeSequential,
++	}}
++	normal := &model.Channel{ChannelInfo: model.ChannelInfo{
++		IsMultiKey:   true,
++		MultiKeyMode: constant.MultiKeyModeRandom,
++	}}
++	unauthorized := types.NewOpenAIError(errors.New("invalid token"), types.ErrorCodeBadResponseStatusCode, http.StatusUnauthorized)
++	notDisableStatus := types.NewOpenAIError(errors.New("not found"), types.ErrorCodeBadResponseStatusCode, http.StatusNotFound)
++
++	require.True(t, ShouldDisableChannelForChannel(sequential, unauthorized))
++	require.False(t, ShouldDisableChannelForChannel(normal, unauthorized))
++	require.False(t, ShouldDisableChannelForChannel(sequential, notDisableStatus))
++	configurationError := types.NewError(
++		errors.New("mapped model is invalid"),
++		types.ErrorCodeChannelModelMappedError,
++		types.ErrOptionWithSkipRetry(),
++	)
++	require.False(t, ShouldDisableChannelForChannel(sequential, configurationError))
++}
++
++func TestRetryParamSequentialChannelPinDoesNotConsumeChannelRetry(t *testing.T) {
++	retry := 2
++	param := &RetryParam{Retry: &retry}
++	require.False(t, param.HasSequentialChannel())
++
++	for i := 0; i < 3; i++ {
++		param.SetSequentialChannel(17)
++		param.IncreaseRetry()
++		require.Equal(t, 2, param.GetRetry())
++		require.True(t, param.HasSequentialChannel())
++		require.Equal(t, 17, param.TakeSequentialChannel())
++		require.False(t, param.HasSequentialChannel())
++	}
++
++	param.IncreaseRetry()
++	require.Equal(t, 3, param.GetRetry())
++	require.Equal(t, 0, param.TakeSequentialChannel())
++}
+diff --git a/web/src/features/channels/components/channels-columns.tsx b/web/src/features/channels/components/channels-columns.tsx
+index ad6fadcd..820d8404 100644
+--- a/web/src/features/channels/components/channels-columns.tsx
++++ b/web/src/features/channels/components/channels-columns.tsx
+@@ -21,6 +21,7 @@ import { useQueryClient } from '@tanstack/react-query'
+ import type { ColumnDef } from '@tanstack/react-table'
+ import {
+   AlertTriangle,
++  ArrowDownWideNarrow,
+   ChevronDown,
+   ChevronRight,
+   ListOrdered,
+@@ -787,12 +788,15 @@ export function useChannelsColumns(
+           const channel = row.original as Channel
+           const isMultiKey = isMultiKeyChannel(channel)
+           const multiKeyMode = channel.channel_info?.multi_key_mode ?? 'random'
+-          const MultiKeyModeIcon =
+-            multiKeyMode === 'random' ? Shuffle : ListOrdered
+-          const multiKeyTooltip =
+-            multiKeyMode === 'random'
+-              ? t('Multi-key: Random rotation')
+-              : t('Multi-key: Polling rotation')
++          let MultiKeyModeIcon = ListOrdered
++          let multiKeyTooltip = t('Multi-key: Polling rotation')
++          if (multiKeyMode === 'random') {
++            MultiKeyModeIcon = Shuffle
++            multiKeyTooltip = t('Multi-key: Random rotation')
++          } else if (multiKeyMode === 'sequential') {
++            MultiKeyModeIcon = ArrowDownWideNarrow
++            multiKeyTooltip = t('Multi-key: Sequential priority')
++          }
+ 
+           const ionetMeta = parseIonetMeta(channel.other_info)
+           const isIonet = ionetMeta?.source === 'ionet'
+diff --git a/web/src/features/channels/components/dialogs/multi-key-manage-dialog.tsx b/web/src/features/channels/components/dialogs/multi-key-manage-dialog.tsx
+index 22f75214..d349da9e 100644
+--- a/web/src/features/channels/components/dialogs/multi-key-manage-dialog.tsx
++++ b/web/src/features/channels/components/dialogs/multi-key-manage-dialog.tsx
+@@ -149,7 +149,7 @@ export function MultiKeyManageDialog({
+   }
+ 
+   const handleStatusFilterChange = (value: string) => {
+-    const newFilter = value === 'all' ? null : parseInt(value)
++    const newFilter = value === 'all' ? null : Number.parseInt(value)
+     setStatusFilter(newFilter)
+     setCurrentPage(1)
+     loadKeyStatus(1, pageSize, newFilter)
+@@ -235,6 +235,13 @@ export function MultiKeyManageDialog({
+ 
+   if (!currentRow) return null
+ 
++  let multiKeyModeLabel = t('Polling')
++  if (currentRow.channel_info?.multi_key_mode === 'random') {
++    multiKeyModeLabel = t('Random')
++  } else if (currentRow.channel_info?.multi_key_mode === 'sequential') {
++    multiKeyModeLabel = t('Sequential')
++  }
++
+   return (
+     <>
+       <Dialog
+@@ -250,11 +257,7 @@ export function MultiKeyManageDialog({
+             />
+             {currentRow.channel_info?.multi_key_mode && (
+               <StatusBadge
+-                label={
+-                  currentRow.channel_info.multi_key_mode === 'random'
+-                    ? t('Random')
+-                    : t('Polling')
+-                }
++                label={multiKeyModeLabel}
+                 variant='neutral'
+                 copyable={false}
+               />
+@@ -294,12 +297,10 @@ export function MultiKeyManageDialog({
+           {/* Toolbar */}
+           <div className='flex shrink-0 items-center justify-between'>
+             <Select
+-              items={[
+-                ...MULTI_KEY_FILTER_OPTIONS.map((option) => ({
+-                  value: option.value,
+-                  label: t(option.label),
+-                })),
+-              ]}
++              items={MULTI_KEY_FILTER_OPTIONS.map((option) => ({
++                value: option.value,
++                label: t(option.label),
++              }))}
+               value={statusFilter === null ? 'all' : statusFilter.toString()}
+               onValueChange={(v) => v !== null && handleStatusFilterChange(v)}
+             >
+@@ -378,15 +379,17 @@ export function MultiKeyManageDialog({
+ 
+           {/* Table */}
+           <div className='min-h-0 flex-1 overflow-auto rounded-md border'>
+-            {isLoading ? (
++            {isLoading && (
+               <div className='flex items-center justify-center py-12'>
+                 <Loader2 className='text-muted-foreground h-8 w-8 animate-spin' />
+               </div>
+-            ) : keys.length === 0 ? (
++            )}
++            {!isLoading && keys.length === 0 && (
+               <div className='text-muted-foreground py-12 text-center'>
+                 {t('No keys found')}
+               </div>
+-            ) : (
++            )}
++            {!isLoading && keys.length > 0 && (
+               <StaticDataTable
+                 className='rounded-none border-0'
+                 tableClassName='min-w-[800px]'
+diff --git a/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx b/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx
+index 93f6a0a1..cd906059 100644
+--- a/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx
++++ b/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx
+@@ -728,6 +728,22 @@ export function ChannelMutateDrawer({
+   // Watch form values for conditional rendering
+   const multiKeyMode = form.watch('multi_key_mode')
+   const multiKeyType = form.watch('multi_key_type')
++  let multiKeyDescription: ReactNode = t(
++    'Randomly select a key from the pool for each request'
++  )
++  if (multiKeyType === 'polling') {
++    multiKeyDescription = (
++      <span className='text-warning'>
++        {t(
++          'Polling mode requires Redis and memory cache, otherwise performance will be significantly degraded'
++        )}
++      </span>
++    )
++  } else if (multiKeyType === 'sequential') {
++    multiKeyDescription = t(
++      'Always use the first enabled key; when a request failure matches the auto-disable rules, automatically try the next one'
++    )
++  }
+   const keyMode = form.watch('key_mode')
+   const currentGroups = form.watch('group')
+   const currentType = form.watch('type')
+@@ -3297,6 +3313,10 @@ export function ChannelMutateDrawer({
+                                               value: 'polling',
+                                               label: t('Polling'),
+                                             },
++                                            {
++                                              value: 'sequential',
++                                              label: t('Sequential'),
++                                            },
+                                           ]}
+                                           onValueChange={field.onChange}
+                                           value={field.value}
+@@ -3316,21 +3336,14 @@ export function ChannelMutateDrawer({
+                                               <SelectItem value='polling'>
+                                                 {t('Polling')}
+                                               </SelectItem>
++                                              <SelectItem value='sequential'>
++                                                {t('Sequential')}
++                                              </SelectItem>
+                                             </SelectGroup>
+                                           </SelectContent>
+                                         </Select>
+                                         <FormDescription>
+-                                          {multiKeyType === 'polling' ? (
+-                                            <span className='text-warning'>
+-                                              {t(
+-                                                'Polling mode requires Redis and memory cache, otherwise performance will be significantly degraded'
+-                                              )}
+-                                            </span>
+-                                          ) : (
+-                                            t(
+-                                              'Randomly select a key from the pool for each request'
+-                                            )
+-                                          )}
++                                          {multiKeyDescription}
+                                         </FormDescription>
+                                         <FormMessage />
+                                       </FormItem>
+diff --git a/web/src/features/channels/constants.ts b/web/src/features/channels/constants.ts
+index 4fd49567..cee7f4cb 100644
+--- a/web/src/features/channels/constants.ts
++++ b/web/src/features/channels/constants.ts
+@@ -203,6 +203,7 @@ export const MULTI_KEY_STATUS_CONFIG = {
+ export const MULTI_KEY_MODES = [
+   { value: 'random', label: 'Random' },
+   { value: 'polling', label: 'Polling' },
++  { value: 'sequential', label: 'Sequential' },
+ ] as const
+ 
+ export const ADD_MODE_OPTIONS = [
+diff --git a/web/src/features/channels/lib/channel-form.ts b/web/src/features/channels/lib/channel-form.ts
+index f31a5c42..eebc4a35 100644
+--- a/web/src/features/channels/lib/channel-form.ts
++++ b/web/src/features/channels/lib/channel-form.ts
+@@ -251,7 +251,7 @@ export const channelFormSchema = z
+     other: z.string().optional(),
+     // Multi-key options (not sent to backend directly)
+     multi_key_mode: z.enum(['single', 'batch', 'multi_to_single']).optional(),
+-    multi_key_type: z.enum(['random', 'polling']).optional(),
++    multi_key_type: z.enum(['random', 'polling', 'sequential']).optional(),
+     batch_add_set_key_prefix_2_name: z.boolean().optional(),
+     key_mode: z.enum(['append', 'replace']).optional(), // For editing multi-key channels
+     // Channel extra settings (stored in setting JSON, not sent directly)
+@@ -794,7 +794,7 @@ function normalizeBaseUrl(value: string | undefined): string {
+  */
+ export function transformFormDataToCreatePayload(formData: ChannelFormValues): {
+   mode: 'single' | 'batch' | 'multi_to_single'
+-  multi_key_mode?: 'random' | 'polling'
++  multi_key_mode?: 'random' | 'polling' | 'sequential'
+   batch_add_set_key_prefix_2_name?: boolean
+   channel: Partial<Channel>
+ } {
+diff --git a/web/src/features/channels/types.ts b/web/src/features/channels/types.ts
+index 6b53c336..216a63a9 100644
+--- a/web/src/features/channels/types.ts
++++ b/web/src/features/channels/types.ts
+@@ -29,7 +29,7 @@ export const channelInfoSchema = z.object({
+   multi_key_disabled_reason: z.record(z.string(), z.string()).optional(),
+   multi_key_disabled_time: z.record(z.string(), z.number()).optional(),
+   multi_key_polling_index: z.number().default(0),
+-  multi_key_mode: z.enum(['random', 'polling']).default('random'),
++  multi_key_mode: z.enum(['random', 'polling', 'sequential']).default('random'),
+ })
+ 
+ export type ChannelInfo = z.infer<typeof channelInfoSchema>
+@@ -364,7 +364,7 @@ export interface ChannelFormData {
+   other?: string
+   // Multi-key specific
+   multi_key_mode?: 'single' | 'batch' | 'multi_to_single'
+-  multi_key_type?: 'random' | 'polling'
++  multi_key_type?: 'random' | 'polling' | 'sequential'
+   batch_add_set_key_prefix_2_name?: boolean
+ }
+ 
+@@ -374,7 +374,7 @@ export interface ChannelFormData {
+ 
+ export interface AddChannelRequest {
+   mode: 'single' | 'batch' | 'multi_to_single'
+-  multi_key_mode?: 'random' | 'polling'
++  multi_key_mode?: 'random' | 'polling' | 'sequential'
+   batch_add_set_key_prefix_2_name?: boolean
+   channel: Partial<Channel>
+ }
+diff --git a/web/src/i18n/locales/en.json b/web/src/i18n/locales/en.json
+index a65405c6..7c1f3064 100644
+--- a/web/src/i18n/locales/en.json
++++ b/web/src/i18n/locales/en.json
+@@ -364,6 +364,7 @@
+     "Allowed Ports": "Allowed Ports",
+     "Already have an account?": "Already have an account?",
+     "Always matches (default tier).": "Always matches (default tier).",
++    "Always use the first enabled key; when a request failure matches the auto-disable rules, automatically try the next one": "Always use the first enabled key; when a request failure matches the auto-disable rules, automatically try the next one",
+     "Amount": "Amount",
+     "Amount cannot be changed when editing.": "Amount cannot be changed when editing.",
+     "Amount discount": "Amount discount",
+@@ -2924,6 +2925,7 @@
+     "Multi-Key Strategy": "Multi-Key Strategy",
+     "Multi-key: Polling rotation": "Multi-key: Polling rotation",
+     "Multi-key: Random rotation": "Multi-key: Random rotation",
++    "Multi-key: Sequential priority": "Multi-key: Sequential priority",
+     "Multi-protocol Compatible": "Multi-protocol Compatible",
+     "Multi-region deployment for stable global access": "Multi-region deployment for stable global access",
+     "Multi-step thinking before final answer": "Multi-step thinking before final answer",
+@@ -3812,6 +3814,7 @@
+     "Quota:": "Quota:",
+     "Radius": "Radius",
+     "Random": "Random",
++    "Sequential": "Sequential",
+     "Randomly select a key from the pool for each request": "Randomly select a key from the pool for each request",
+     "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.",
+     "Rankings": "Rankings",
+diff --git a/web/src/i18n/locales/fr.json b/web/src/i18n/locales/fr.json
+index 901736b0..64e68f0c 100644
+--- a/web/src/i18n/locales/fr.json
++++ b/web/src/i18n/locales/fr.json
+@@ -364,6 +364,7 @@
+     "Allowed Ports": "Ports autorisés",
+     "Already have an account?": "Vous avez déjà un compte ?",
+     "Always matches (default tier).": "Toujours appliqué (palier par défaut).",
++    "Always use the first enabled key; when a request failure matches the auto-disable rules, automatically try the next one": "Toujours utiliser la première clé activée ; lorsqu'un échec correspond aux règles de désactivation automatique, essayer automatiquement la suivante",
+     "Amount": "Montant",
+     "Amount cannot be changed when editing.": "Le montant ne peut pas être modifié lors de la modification.",
+     "Amount discount": "Remise sur le montant",
+@@ -2924,6 +2925,7 @@
+     "Multi-Key Strategy": "Stratégie multi-clés",
+     "Multi-key: Polling rotation": "Multi-clé : Rotation par sondage",
+     "Multi-key: Random rotation": "Multi-clé : Rotation aléatoire",
++    "Multi-key: Sequential priority": "Multi-clés : priorité séquentielle",
+     "Multi-protocol Compatible": "Compatible multi-protocole",
+     "Multi-region deployment for stable global access": "Déploiement multirégional pour un accès mondial stable",
+     "Multi-step thinking before final answer": "Raisonnement en plusieurs étapes avant la réponse finale",
+@@ -3812,6 +3814,7 @@
+     "Quota:": "Quota :",
+     "Radius": "Rayon",
+     "Random": "Aléatoire",
++    "Sequential": "Séquentiel",
+     "Randomly select a key from the pool for each request": "Sélectionner aléatoirement une clé du pool pour chaque requête",
+     "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "Les données de classement sont actuellement simulées à des fins d'aperçu et seront remplacées par des analyses en direct une fois l'intégration backend livrée.",
+     "Rankings": "Classements",
+diff --git a/web/src/i18n/locales/ja.json b/web/src/i18n/locales/ja.json
+index 3cf134da..8b46bb5b 100644
+--- a/web/src/i18n/locales/ja.json
++++ b/web/src/i18n/locales/ja.json
+@@ -364,6 +364,7 @@
+     "Allowed Ports": "許可するポート",
+     "Already have an account?": "アカウントをお持ちの方？",
+     "Always matches (default tier).": "常に一致（デフォルト ティア）。",
++    "Always use the first enabled key; when a request failure matches the auto-disable rules, automatically try the next one": "常に最初の有効なキーを使用し、リクエスト失敗が自動無効化ルールに一致した場合は自動的に次のキーを試します",
+     "Amount": "金額",
+     "Amount cannot be changed when editing.": "編集時は金額を変更できません。",
+     "Amount discount": "割引額",
+@@ -2924,6 +2925,7 @@
+     "Multi-Key Strategy": "マルチキー戦略",
+     "Multi-key: Polling rotation": "マルチキー：ポーリングローテーション",
+     "Multi-key: Random rotation": "マルチキー：ランダムローテーション",
++    "Multi-key: Sequential priority": "マルチキー：順番優先",
+     "Multi-protocol Compatible": "マルチプロトコル互換",
+     "Multi-region deployment for stable global access": "安定したグローバルアクセスを実現するマルチリージョンデプロイメント",
+     "Multi-step thinking before final answer": "最終回答の前に複数ステップで思考",
+@@ -3812,6 +3814,7 @@
+     "Quota:": "クォータ：",
+     "Radius": "角丸",
+     "Random": "ランダム",
++    "Sequential": "順次",
+     "Randomly select a key from the pool for each request": "各リクエストごとにプールからランダムにキーを選択",
+     "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "現在のランキングデータはプレビュー用のシミュレーションです。バックエンド連携が完了次第、リアルタイム分析データに置き換わります。",
+     "Rankings": "ランキング",
+diff --git a/web/src/i18n/locales/ru.json b/web/src/i18n/locales/ru.json
+index 97932b58..d1886279 100644
+--- a/web/src/i18n/locales/ru.json
++++ b/web/src/i18n/locales/ru.json
+@@ -364,6 +364,7 @@
+     "Allowed Ports": "Разрешенные порты",
+     "Already have an account?": "Уже есть аккаунт?",
+     "Always matches (default tier).": "Всегда совпадает (уровень по умолчанию).",
++    "Always use the first enabled key; when a request failure matches the auto-disable rules, automatically try the next one": "Всегда использовать первый включённый ключ; если ошибка запроса соответствует правилам автоотключения, автоматически попробовать следующий",
+     "Amount": "Сумма",
+     "Amount cannot be changed when editing.": "Количество нельзя изменить при редактировании.",
+     "Amount discount": "Скидка на сумму",
+@@ -2924,6 +2925,7 @@
+     "Multi-Key Strategy": "Стратегия нескольких ключей",
+     "Multi-key: Polling rotation": "Мульти-ключ: Циклическая ротация",
+     "Multi-key: Random rotation": "Мульти-ключ: Случайная ротация",
++    "Multi-key: Sequential priority": "Мульти-ключ: последовательный приоритет",
+     "Multi-protocol Compatible": "Совместимо с несколькими протоколами",
+     "Multi-region deployment for stable global access": "Мультирегиональное развертывание для стабильного глобального доступа",
+     "Multi-step thinking before final answer": "Многошаговые рассуждения перед итоговым ответом",
+@@ -3812,6 +3814,7 @@
+     "Quota:": "Квота:",
+     "Radius": "Радиус",
+     "Random": "Случайный",
++    "Sequential": "Последовательно",
+     "Randomly select a key from the pool for each request": "Случайно выбирать ключ из пула для каждого запроса",
+     "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "Сейчас данные рейтинга смоделированы для превью; после внедрения бэкенда они будут заменены реальной аналитикой.",
+     "Rankings": "Рейтинги",
+diff --git a/web/src/i18n/locales/vi.json b/web/src/i18n/locales/vi.json
+index 7e1bc1ea..9bdf961c 100644
+--- a/web/src/i18n/locales/vi.json
++++ b/web/src/i18n/locales/vi.json
+@@ -364,6 +364,7 @@
+     "Allowed Ports": "Cổng được phép",
+     "Already have an account?": "Đã có tài khoản?",
+     "Always matches (default tier).": "Luôn khớp (bậc mặc định).",
++    "Always use the first enabled key; when a request failure matches the auto-disable rules, automatically try the next one": "Luôn dùng khóa đang bật đầu tiên; khi lỗi yêu cầu khớp quy tắc tự động vô hiệu hóa, tự động thử khóa tiếp theo",
+     "Amount": "Số lượng",
+     "Amount cannot be changed when editing.": "Số tiền không thể thay đổi khi chỉnh sửa.",
+     "Amount discount": "Số tiền giảm giá",
+@@ -2924,6 +2925,7 @@
+     "Multi-Key Strategy": "Chiến lược đa khóa",
+     "Multi-key: Polling rotation": "Đa khóa: Xoay vòng tuần tự",
+     "Multi-key: Random rotation": "Đa khóa: Xoay vòng ngẫu nhiên",
++    "Multi-key: Sequential priority": "Đa khóa: ưu tiên tuần tự",
+     "Multi-protocol Compatible": "Tương thích đa giao thức",
+     "Multi-region deployment for stable global access": "Triển khai đa khu vực để truy cập toàn cầu ổn định",
+     "Multi-step thinking before final answer": "Suy luận nhiều bước trước khi đưa ra câu trả lời cuối",
+@@ -3812,6 +3814,7 @@
+     "Quota:": "Hạn ngạch:",
+     "Radius": "Bo góc",
+     "Random": "Ngẫu nhiên",
++    "Sequential": "Tuần tự",
+     "Randomly select a key from the pool for each request": "Chọn ngẫu nhiên một khóa từ kho cho mỗi yêu cầu",
+     "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "Dữ liệu xếp hạng hiện đang được mô phỏng để xem trước và sẽ được thay bằng dữ liệu thực sau khi tích hợp backend.",
+     "Rankings": "Bảng xếp hạng",
+diff --git a/web/src/i18n/locales/zh-TW.json b/web/src/i18n/locales/zh-TW.json
+index 6cc8c1d6..64cc58fb 100644
+--- a/web/src/i18n/locales/zh-TW.json
++++ b/web/src/i18n/locales/zh-TW.json
+@@ -364,6 +364,7 @@
+     "Allowed Ports": "允許的端口",
+     "Already have an account?": "已有用戶？",
+     "Always matches (default tier).": "始終匹配（預設檔位）。",
++    "Always use the first enabled key; when a request failure matches the auto-disable rules, automatically try the next one": "始終使用第一個已啟用的金鑰；當請求失敗符合自動停用規則時，自動嘗試下一個",
+     "Amount": "金額",
+     "Amount cannot be changed when editing.": "編輯時無法更改數量。",
+     "Amount discount": "金額折扣",
+@@ -2924,6 +2925,7 @@
+     "Multi-Key Strategy": "多金鑰策略",
+     "Multi-key: Polling rotation": "多金鑰：輪詢",
+     "Multi-key: Random rotation": "多金鑰：隨機",
++    "Multi-key: Sequential priority": "多密鑰：順序優先",
+     "Multi-protocol Compatible": "兼容多協定",
+     "Multi-region deployment for stable global access": "多區域部署，實現穩定的全球存取",
+     "Multi-step thinking before final answer": "在給出最終答案前進行多步推理",
+@@ -3812,6 +3814,7 @@
+     "Quota:": "Quota:",
+     "Radius": "圓角",
+     "Random": "隨機",
++    "Sequential": "順序",
+     "Randomly select a key from the pool for each request": "每次請求從池中隨機選擇一個金鑰",
+     "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "目前排行榜數據為預覽用模擬數據，後端整合完成後將替換為真實分析數據。",
+     "Rankings": "排行榜",
+diff --git a/web/src/i18n/locales/zh.json b/web/src/i18n/locales/zh.json
+index 90dec7d6..d49048a5 100644
+--- a/web/src/i18n/locales/zh.json
++++ b/web/src/i18n/locales/zh.json
+@@ -364,6 +364,7 @@
+     "Allowed Ports": "允许的端口",
+     "Already have an account?": "已有账户？",
+     "Always matches (default tier).": "始终匹配（默认档位）。",
++    "Always use the first enabled key; when a request failure matches the auto-disable rules, automatically try the next one": "始终使用第一个已启用的密钥；当请求失败符合自动禁用规则时，自动尝试下一个",
+     "Amount": "金额",
+     "Amount cannot be changed when editing.": "编辑时无法更改数量。",
+     "Amount discount": "金额折扣",
+@@ -2924,6 +2925,7 @@
+     "Multi-Key Strategy": "多密钥策略",
+     "Multi-key: Polling rotation": "多密钥：轮询",
+     "Multi-key: Random rotation": "多密钥：随机",
++    "Multi-key: Sequential priority": "多密钥：顺序优先",
+     "Multi-protocol Compatible": "兼容多协议",
+     "Multi-region deployment for stable global access": "多区域部署，实现稳定的全球访问",
+     "Multi-step thinking before final answer": "在给出最终答案前进行多步推理",
+@@ -3812,6 +3814,7 @@
+     "Quota:": "Quota:",
+     "Radius": "圆角",
+     "Random": "随机",
++    "Sequential": "顺序",
+     "Randomly select a key from the pool for each request": "每次请求从池中随机选择一个密钥",
+     "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "当前排行榜数据为预览用模拟数据，后端集成完成后将替换为真实分析数据。",
+     "Rankings": "排行榜",
