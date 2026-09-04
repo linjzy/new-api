@@ -314,7 +314,7 @@ index 85da7f7b..9bc0655f 100644
  
  func TestSelectChannelsForAutomaticTestScheduledSkipsManualDisabled(t *testing.T) {
 diff --git a/controller/relay.go b/controller/relay.go
-index 0f7792ef..cdf992be 100644
+index 9da14e339f303f78b684c3c87d07b97bc1579b7f..40f47bdcd41358768628283ce7a129062472eabd 100644
 --- a/controller/relay.go
 +++ b/controller/relay.go
 @@ -193,7 +193,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
@@ -330,7 +330,7 @@ index 0f7792ef..cdf992be 100644
  		newAPIError = service.NormalizeViolationFeeError(newAPIError)
  		relayInfo.LastError = newAPIError
  
--		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
+-		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError, relayInfo)
 +		// On the first attempt getChannel intentionally returns a lightweight
 +		// placeholder because the distributor already selected the channel. Use
 +		// the cached channel for mode/status decisions; otherwise sequential mode
@@ -347,7 +347,7 @@ index 0f7792ef..cdf992be 100644
 +			common.GetContextKeyString(c, constant.ContextKeyChannelKey),
 +			channelForError.GetAutoBan(),
 +		)
-+		sequentialKeyDisabled := processChannelErrorForChannel(c, *channelError, newAPIError, channelForError)
++		sequentialKeyDisabled := processChannelErrorForChannel(c, *channelError, newAPIError, channelForError, relayInfo)
 +
 +		// A qualifying sequential-key failure retires only the used key and pins
 +		// the next attempt to the same channel. Pinning suppresses the loop's next
@@ -362,7 +362,7 @@ index 0f7792ef..cdf992be 100644
  
  		if !shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry()) {
  			break
-@@ -300,6 +327,21 @@ func fastTokenCountMetaForPricing(request dto.Request) *types.TokenCountMeta {
+@@ -332,6 +359,21 @@ func fastTokenCountMetaForPricing(request dto.Request) *types.TokenCountMeta {
  }
  
  func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service.RetryParam) (*model.Channel, *types.NewAPIError) {
@@ -384,7 +384,7 @@ index 0f7792ef..cdf992be 100644
  	if info.ChannelMeta == nil {
  		autoBan := c.GetBool("auto_ban")
  		autoBanInt := 1
-@@ -330,6 +372,25 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
+@@ -362,6 +404,25 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
  	return channel, nil
  }
  
@@ -410,15 +410,15 @@ index 0f7792ef..cdf992be 100644
  func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) bool {
  	if openaiErr == nil {
  		return false
-@@ -363,13 +424,30 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
+@@ -395,13 +456,30 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
  }
  
- func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError) {
+ func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError, relayInfo *relaycommon.RelayInfo) {
 +	channel, _ := model.CacheGetChannel(channelError.ChannelId)
-+	processChannelErrorForChannel(c, channelError, err, channel)
++	processChannelErrorForChannel(c, channelError, err, channel, relayInfo)
 +}
 +
-+func processChannelErrorForChannel(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError, channel *model.Channel) bool {
++func processChannelErrorForChannel(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError, channel *model.Channel, relayInfo *relaycommon.RelayInfo) bool {
  	logger.LogError(c, fmt.Sprintf("channel error (channel #%d, status code: %d): %s", channelError.ChannelId, err.StatusCode, common.LocalLogPreview(err.Error())))
  	// 不要使用context获取渠道信息，异步处理时可能会出现渠道信息不一致的情况
  	// do not use context to get channel info, there may be inconsistent channel info when processing asynchronously
@@ -445,15 +445,15 @@ index 0f7792ef..cdf992be 100644
  	}
  
  	if constant.ErrorLogEnabled && types.IsRecordErrorLog(err) {
-@@ -408,6 +486,7 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
- 		model.RecordErrorLog(c, userId, channelId, modelName, tokenName, err.MaskSensitiveErrorWithStatusCode(), tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other)
+@@ -428,6 +506,7 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
+ 		model.RecordErrorLog(c, userId, channelError.ChannelId, modelName, tokenName, err.MaskSensitiveErrorWithStatusCode(), tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other)
  	}
  
 +	return sequentialKeyDisabled
  }
  
  func RelayMidjourney(c *gin.Context) {
-@@ -598,7 +677,7 @@ func executeTaskSubmissionWith(
+@@ -618,7 +697,7 @@ func executeTaskSubmissionWith(
  		Retry:       common.GetPointer(0),
  	}
  
@@ -462,7 +462,7 @@ index 0f7792ef..cdf992be 100644
  		stage = "select_channel"
  		if requestErr := c.Request.Context().Err(); requestErr != nil {
  			diagnostics.cancelled("before_attempt", retryParam.GetRetry()+1)
-@@ -608,8 +687,20 @@ func executeTaskSubmissionWith(
+@@ -628,8 +707,20 @@ func executeTaskSubmissionWith(
  		var channel *model.Channel
  
  		if lockedCh, ok := relayInfo.LockedChannel.(*model.Channel); ok && lockedCh != nil {
@@ -485,7 +485,7 @@ index 0f7792ef..cdf992be 100644
  				if setupErr := middleware.SetupContextForSelectedChannel(c, channel, relayInfo.OriginModelName); setupErr != nil {
  					taskErr = service.TaskErrorWrapperLocal(setupErr.Err, "setup_locked_channel_failed", http.StatusInternalServerError)
  					break
-@@ -651,15 +742,25 @@ func executeTaskSubmissionWith(
+@@ -671,16 +762,25 @@ func executeTaskSubmissionWith(
  			break
  		}
  
@@ -494,11 +494,12 @@ index 0f7792ef..cdf992be 100644
 -			processChannelError(c,
 -				*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey,
 -					common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()),
--				types.NewOpenAIError(taskErr.Error, types.ErrorCodeBadResponseStatusCode, taskErr.StatusCode))
+-				types.NewOpenAIError(taskErr.Error, types.ErrorCodeBadResponseStatusCode, taskErr.StatusCode),
+-				relayInfo)
 +			channelError := types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey,
 +				common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan())
 +			channelAPIError := types.NewOpenAIError(taskErr.Error, types.ErrorCodeBadResponseStatusCode, taskErr.StatusCode)
-+			sequentialKeyDisabled := processChannelErrorForChannel(c, *channelError, channelAPIError, channel)
++			sequentialKeyDisabled := processChannelErrorForChannel(c, *channelError, channelAPIError, channel, relayInfo)
 +			if service.SequentialKeyAutoSkip(channel) &&
 +				service.ShouldDisableChannelForChannel(channel, channelAPIError) &&
 +				sequentialKeyDisabled && sequentialKeyAvailable(channel.Id) {
@@ -516,7 +517,7 @@ index 0f7792ef..cdf992be 100644
  		if !willRetry {
  			break
  		}
-@@ -824,6 +925,20 @@ func respondTaskSubmissionError(c *gin.Context, taskErr *taskdto.TaskError) {
+@@ -848,6 +948,20 @@ func respondTaskSubmissionError(c *gin.Context, taskErr *taskdto.TaskError) {
  	respondTaskError(c, taskErr)
  }
  
