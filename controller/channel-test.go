@@ -26,6 +26,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	hosttypes "github.com/QuantumNous/new-api/types"
 
@@ -52,6 +53,46 @@ func normalizeChannelTestEndpoint(channel *model.Channel, endpointType string) s
 	return normalized
 }
 
+func resolveChannelTestRequestPath(channel *model.Channel, modelName, endpointType string) string {
+	if endpointType != "" {
+		if endpointInfo, ok := common.GetDefaultEndpointInfo(constant.EndpointType(endpointType)); ok {
+			return endpointInfo.Path
+		}
+		return "/v1/chat/completions"
+	}
+
+	requestPath := "/v1/chat/completions"
+	lowerModelName := strings.ToLower(modelName)
+	if strings.Contains(lowerModelName, "rerank") {
+		requestPath = "/v1/rerank"
+	}
+	if strings.Contains(lowerModelName, "embedding") ||
+		strings.HasPrefix(modelName, "m3e") ||
+		strings.Contains(modelName, "bge-") ||
+		strings.Contains(modelName, "embed") ||
+		(channel != nil && channel.Type == constant.ChannelTypeMokaAI) {
+		requestPath = "/v1/embeddings"
+	}
+	if channel != nil && channel.Type == constant.ChannelTypeVolcEngine && strings.Contains(modelName, "seedream") {
+		requestPath = "/v1/images/generations"
+	}
+	if strings.Contains(lowerModelName, "codex") {
+		requestPath = "/v1/responses"
+	}
+
+	if requestPath != "/v1/chat/completions" || channel == nil {
+		return requestPath
+	}
+	settings := model_setting.GetGlobalSettings()
+	if settings.PassThroughRequestEnabled || channel.GetSetting().PassThroughBodyEnabled {
+		return requestPath
+	}
+	if service.ShouldChatCompletionsUseResponsesGlobal(channel.Id, channel.Type, modelName) {
+		return "/v1/responses"
+	}
+	return requestPath
+}
+
 func resolveChannelTestUserID(c *gin.Context) (int, error) {
 	if c != nil {
 		if userID := c.GetInt("id"); userID > 0 {
@@ -69,7 +110,7 @@ func resolveChannelTestUserID(c *gin.Context) (int, error) {
 	return rootUser.Id, nil
 }
 
-func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool) testResult {
+func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool, keyIndex *int) testResult {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -109,41 +150,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	}
 
 	endpointType = normalizeChannelTestEndpoint(channel, endpointType)
-
-	requestPath := "/v1/chat/completions"
-
-	// 如果指定了端点类型，使用指定的端点类型
-	if endpointType != "" {
-		if endpointInfo, ok := common.GetDefaultEndpointInfo(constant.EndpointType(endpointType)); ok {
-			requestPath = endpointInfo.Path
-		}
-	} else {
-		// 如果没有指定端点类型，使用原有的自动检测逻辑
-
-		if strings.Contains(strings.ToLower(testModel), "rerank") {
-			requestPath = "/v1/rerank"
-		}
-
-		// 先判断是否为 Embedding 模型
-		if strings.Contains(strings.ToLower(testModel), "embedding") ||
-			strings.HasPrefix(testModel, "m3e") || // m3e 系列模型
-			strings.Contains(testModel, "bge-") || // bge 系列模型
-			strings.Contains(testModel, "embed") ||
-			channel.Type == constant.ChannelTypeMokaAI { // 其他 embedding 模型
-			requestPath = "/v1/embeddings" // 修改请求路径
-		}
-
-		// VolcEngine 图像生成模型
-		if channel.Type == constant.ChannelTypeVolcEngine && strings.Contains(testModel, "seedream") {
-			requestPath = "/v1/images/generations"
-		}
-
-		// responses-only models
-		if strings.Contains(strings.ToLower(testModel), "codex") {
-			requestPath = "/v1/responses"
-		}
-
-	}
+	requestPath := resolveChannelTestRequestPath(channel, testModel, endpointType)
 	// Gemini 原生流式通过 URL action（:streamGenerateContent）表达而非请求体字段，
 	// GeminiChatRequest.IsStream 依据请求 URL 判定，合成请求路径需与生产入口保持一致
 	if isStream && constant.EndpointType(endpointType) == constant.EndpointTypeGemini {
@@ -168,7 +175,12 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	group, _ := model.GetUserGroup(testUserID, false)
 	c.Set("group", group)
 
-	newAPIError := middleware.SetupContextForSelectedChannel(c, channel, testModel)
+	var newAPIError *types.NewAPIError
+	if keyIndex == nil {
+		newAPIError = middleware.SetupContextForSelectedChannel(c, channel, testModel)
+	} else {
+		newAPIError = middleware.SetupContextForAutoDisabledChannelTestKey(c, channel, testModel, *keyIndex)
+	}
 	if newAPIError != nil {
 		return testResult{
 			context:     c,
@@ -874,7 +886,7 @@ func TestChannel(c *gin.Context) {
 	if c.Request != nil {
 		requestCtx = c.Request.Context()
 	}
-	result := testChannel(requestCtx, channel, testUserID, testModel, endpointType, isStream)
+	result := testChannel(requestCtx, channel, testUserID, testModel, endpointType, isStream, nil)
 	if result.localErr != nil {
 		resp := gin.H{
 			"success": false,
@@ -917,11 +929,57 @@ type channelTestSummary struct {
 	Enabled   int `json:"enabled"`
 }
 
-func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, testUserID int, allowDisable bool, disableThreshold int64) channelTestSummary {
+type channelKeyTestFunc func(context.Context, *model.Channel, int) testResult
+
+func testAutoDisabledChannelKeys(ctx context.Context, channel *model.Channel, testKey channelKeyTestFunc) channelTestSummary {
 	summary := channelTestSummary{}
+	if !common.AutomaticEnableChannelEnabled || channel == nil || channel.Status == common.ChannelStatusManuallyDisabled {
+		return summary
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	keys := channel.GetKeys()
+	for _, keyIndex := range channel.AutoDisabledKeyIndexes() {
+		if ctx.Err() != nil {
+			return summary
+		}
+		expectedKey := keys[keyIndex]
+		expectedDisabledTime := channel.ChannelInfo.MultiKeyDisabledTime[keyIndex]
+		result := testKey(ctx, channel, keyIndex)
+		if ctx.Err() != nil {
+			return summary
+		}
+
+		summary.Tested++
+		if result.localErr != nil || result.newAPIError != nil {
+			summary.Failed++
+			continue
+		}
+
+		summary.Succeeded++
+		if model.EnableAutoDisabledChannelKey(channel.Id, keyIndex, expectedKey, expectedDisabledTime) {
+			summary.Enabled++
+		}
+	}
+	return summary
+}
+
+func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, testUserID int, allowDisable bool, disableThreshold int64, recoveryOnly bool) channelTestSummary {
+	summary := channelTestSummary{}
+	hasAutoDisabledKeys := len(channel.AutoDisabledKeyIndexes()) > 0
+	testKey := func(ctx context.Context, channel *model.Channel, keyIndex int) testResult {
+		return testChannel(ctx, channel, testUserID, "", "", shouldUseStreamForAutomaticChannelTest(channel), &keyIndex)
+	}
+	if common.AutomaticEnableChannelEnabled && hasAutoDisabledKeys &&
+		(recoveryOnly || channel.Status == common.ChannelStatusAutoDisabled) {
+		return testAutoDisabledChannelKeys(ctx, channel, testKey)
+	}
+
 	isChannelEnabled := channel.Status == common.ChannelStatusEnabled
 	tik := time.Now()
-	result := testChannel(ctx, channel, testUserID, "", "", shouldUseStreamForAutomaticChannelTest(channel))
+	result := testChannel(ctx, channel, testUserID, "", "", shouldUseStreamForAutomaticChannelTest(channel), nil)
 	milliseconds := time.Since(tik).Milliseconds()
 	if ctx.Err() != nil {
 		return summary
@@ -960,6 +1018,13 @@ func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, test
 	}
 
 	channel.UpdateResponseTime(milliseconds)
+	if common.AutomaticEnableChannelEnabled && hasAutoDisabledKeys {
+		recoverySummary := testAutoDisabledChannelKeys(ctx, channel, testKey)
+		summary.Tested += recoverySummary.Tested
+		summary.Succeeded += recoverySummary.Succeeded
+		summary.Failed += recoverySummary.Failed
+		summary.Enabled += recoverySummary.Enabled
+	}
 	return summary
 }
 
@@ -1059,7 +1124,7 @@ func runChannelTestWorkers(
 // performChannelTests runs channel health checks with the configured bounded
 // concurrency and honors cancellation when a system-task runner loses its
 // lease.
-func performChannelTests(ctx context.Context, channels []*model.Channel, testUserID int, allowDisable bool, concurrency int, report func(processed, total int)) channelTestSummary {
+func performChannelTests(ctx context.Context, channels []*model.Channel, testUserID int, allowDisable bool, recoveryOnly bool, concurrency int, report func(processed, total int)) channelTestSummary {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1072,7 +1137,7 @@ func performChannelTests(ctx context.Context, channels []*model.Channel, testUse
 		channels,
 		concurrency,
 		func(ctx context.Context, channel *model.Channel) channelTestSummary {
-			return testChannelForHealthCheck(ctx, channel, testUserID, allowDisable, disableThreshold)
+			return testChannelForHealthCheck(ctx, channel, testUserID, allowDisable, disableThreshold, recoveryOnly)
 		},
 		report,
 	)
@@ -1100,8 +1165,9 @@ func runChannelTestTask(ctx context.Context, mode string, notify bool, report fu
 	}
 	selected := selectChannelsForAutomaticTest(channels, mode)
 	allowDisable := mode != operation_setting.ChannelTestModePassiveRecovery
+	recoveryOnly := mode == operation_setting.ChannelTestModePassiveRecovery
 	concurrency := operation_setting.GetMonitorSetting().ChannelTestConcurrency
-	summary := performChannelTests(ctx, selected, testUserID, allowDisable, concurrency, report)
+	summary := performChannelTests(ctx, selected, testUserID, allowDisable, recoveryOnly, concurrency, report)
 	if notify && (ctx == nil || ctx.Err() == nil) {
 		service.NotifyRootUser(dto.NotifyTypeChannelTest, "通道测试完成", "所有通道测试已完成")
 	}
@@ -1118,7 +1184,9 @@ func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*m
 			continue
 		}
 		if mode == operation_setting.ChannelTestModePassiveRecovery && channel.Status != common.ChannelStatusAutoDisabled {
-			continue
+			if !common.AutomaticEnableChannelEnabled || len(channel.AutoDisabledKeyIndexes()) == 0 {
+				continue
+			}
 		}
 		selected = append(selected, channel)
 	}
