@@ -39,3 +39,14 @@ started manually. It:
 8. Updates `candidate` only after all checks pass.
 
 The workflow does not contain or use production-server credentials.
+
+## Upstream test fixes
+
+`task-plugin-model-drift-test.patch` makes the final task decoder regression
+test independent of JavaScript runtime reuse. The test uses an injected host
+clock to return the pinned model on the initial decode and a different model
+on the final decode of the same request. A module-local call counter is
+unreliable because the engine's `sync.Pool` may return a fresh runtime.
+The patch preserves the HTTP 400 and pinned-model rejection assertions and
+changes no production code. It is included in the patch hash so builds use a
+new immutable source branch and image instead of reusing an older test tree.

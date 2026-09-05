@@ -81,7 +81,8 @@ jobs:
             sha256sum \
               .linjzy/patches/usage-logs-auto-refresh.patch \
               .linjzy/patches/channel-test-responses-policy.patch \
-              .linjzy/patches/sequential-key-mode.patch |
+              .linjzy/patches/sequential-key-mode.patch \
+              .linjzy/patches/task-plugin-model-drift-test.patch |
               awk '{print $1}' |
               sha256sum |
               awk '{print $1}'
