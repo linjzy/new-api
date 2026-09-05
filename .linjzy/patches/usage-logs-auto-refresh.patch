@@ -1,0 +1,453 @@
+diff --git a/Dockerfile b/Dockerfile
+index 399a2ab8..497fbd27 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -5,7 +5,22 @@ COPY web/package.json web/bun.lock ./
+ RUN bun install --frozen-lockfile
+ COPY ./web ./
+ COPY ./VERSION /build/VERSION
+-RUN DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$(cat /build/VERSION) bun run build
++RUN bun x oxlint -c .oxlintrc.json \
++	      src/features/usage-logs/components/usage-logs-table.tsx \
++	      src/features/usage-logs/components/common-logs-stats.tsx \
++	      src/features/usage-logs/components/usage-logs-provider.tsx \
++	      src/features/usage-logs/constants.ts \
++	      src/features/usage-logs/index.tsx \
++      src/features/usage-logs/lib/auto-refresh.ts \
++      src/features/usage-logs/lib/__tests__/auto-refresh.test.ts \
++	      src/features/channels/components/channels-columns.tsx \
++	      src/features/channels/components/dialogs/multi-key-manage-dialog.tsx \
++	      src/features/channels/components/drawers/channel-mutate-drawer.tsx \
++	      src/features/channels/constants.ts \
++	      src/features/channels/lib/channel-form.ts \
++	      src/features/channels/types.ts && \
++    bun run test -- src/features/usage-logs/lib/__tests__/auto-refresh.test.ts && \
++    DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$(cat /build/VERSION) bun run build:check
+ 
+ FROM golang:1.26.1-alpine@sha256:2389ebfa5b7f43eeafbd6be0c3700cc46690ef842ad962f6c5bd6be49ed82039 AS builder2
+ ENV GO111MODULE=on CGO_ENABLED=0 GOWORK=off
+diff --git a/web/src/features/usage-logs/components/common-logs-stats.tsx b/web/src/features/usage-logs/components/common-logs-stats.tsx
+index dd754e22..a104d7ef 100644
+--- a/web/src/features/usage-logs/components/common-logs-stats.tsx
++++ b/web/src/features/usage-logs/components/common-logs-stats.tsx
+@@ -18,7 +18,9 @@ For commercial licensing, please contact support@quantumnous.com
+ */
+ import { useQuery } from '@tanstack/react-query'
+ import { getRouteApi } from '@tanstack/react-router'
++import { useEffect } from 'react'
+ import { useTranslation } from 'react-i18next'
++import { toast } from 'sonner'
+ 
+ import { Skeleton } from '@/components/ui/skeleton'
+ import { formatLogQuota } from '@/lib/format'
+@@ -26,6 +28,10 @@ import { cn } from '@/lib/utils'
+ 
+ import { getLogStats, getUserLogStats } from '../api'
+ import { DEFAULT_LOG_STATS } from '../constants'
++import {
++  getUsageLogsRefetchInterval,
++  USAGE_LOGS_AUTO_REFRESH_ERROR_TOAST_ID,
++} from '../lib/auto-refresh'
+ import { buildApiParams } from '../lib/utils'
+ import { useLogsViewScope, useUsageLogsContext } from './usage-logs-provider'
+ 
+@@ -51,9 +57,15 @@ export function CommonLogsStats() {
+   const { t } = useTranslation()
+   const { isAdminView: isAdmin } = useLogsViewScope()
+   const searchParams = route.useSearch()
+-  const { sensitiveVisible } = useUsageLogsContext()
++  const { sensitiveVisible, autoRefresh, setAutoRefresh } =
++    useUsageLogsContext()
+ 
+-  const { data: stats, isLoading } = useQuery({
++  const {
++    data: stats,
++    isLoading,
++    error,
++    errorUpdatedAt,
++  } = useQuery({
+     queryKey: ['usage-logs-stats', isAdmin, searchParams],
+     queryFn: async () => {
+       const params = buildApiParams({
+@@ -68,13 +80,31 @@ export function CommonLogsStats() {
+         ? await getLogStats(params)
+         : await getUserLogStats(params)
+ 
+-      return result.success
+-        ? result.data || DEFAULT_LOG_STATS
+-        : DEFAULT_LOG_STATS
++      if (!result.success) {
++        throw new Error(result.message || t('Failed to load logs'))
++      }
++      return result.data || DEFAULT_LOG_STATS
+     },
+     placeholderData: (previousData) => previousData,
++    retry: false,
++    refetchInterval: (query) =>
++      getUsageLogsRefetchInterval(
++        autoRefresh,
++        searchParams.page ?? 1,
++        query.state.status
++      ),
++    refetchIntervalInBackground: false,
+   })
+ 
++  useEffect(() => {
++    if (!error || errorUpdatedAt === 0) return
++    toast.error(
++      error instanceof Error ? error.message : t('Failed to load logs'),
++      { id: USAGE_LOGS_AUTO_REFRESH_ERROR_TOAST_ID }
++    )
++    setAutoRefresh(false)
++  }, [error, errorUpdatedAt, setAutoRefresh, t])
++
+   if (isLoading) {
+     return (
+       <div className='flex items-center gap-2'>
+diff --git a/web/src/features/usage-logs/components/usage-logs-provider.tsx b/web/src/features/usage-logs/components/usage-logs-provider.tsx
+index 930634c4..77689c78 100644
+--- a/web/src/features/usage-logs/components/usage-logs-provider.tsx
++++ b/web/src/features/usage-logs/components/usage-logs-provider.tsx
+@@ -46,6 +46,8 @@ interface UsageLogsContextValue {
+   setAffinityDialogOpen: (open: boolean) => void
+   sensitiveVisible: boolean
+   setSensitiveVisible: (visible: boolean) => void
++  autoRefresh: boolean
++  setAutoRefresh: (enabled: boolean) => void
+   viewScope: LogsViewScope
+   setViewScope: (scope: LogsViewScope) => void
+ }
+@@ -61,6 +63,7 @@ export function UsageLogsProvider({ children }: { children: ReactNode }) {
+     useState<ChannelAffinityInfo | null>(null)
+   const [affinityDialogOpen, setAffinityDialogOpen] = useState(false)
+   const [sensitiveVisible, setSensitiveVisible] = useState(true)
++  const [autoRefresh, setAutoRefresh] = useState(false)
+   const [viewScope, setViewScope] = useState<LogsViewScope>('all')
+ 
+   return (
+@@ -76,6 +79,8 @@ export function UsageLogsProvider({ children }: { children: ReactNode }) {
+         setAffinityDialogOpen,
+         sensitiveVisible,
+         setSensitiveVisible,
++        autoRefresh,
++        setAutoRefresh,
+         viewScope,
+         setViewScope,
+       }}
+diff --git a/web/src/features/usage-logs/components/usage-logs-table.tsx b/web/src/features/usage-logs/components/usage-logs-table.tsx
+index 8d57cf3a..3d642560 100644
+--- a/web/src/features/usage-logs/components/usage-logs-table.tsx
++++ b/web/src/features/usage-logs/components/usage-logs-table.tsx
+@@ -18,7 +18,12 @@ For commercial licensing, please contact support@quantumnous.com
+ */
+ import { useQuery } from '@tanstack/react-query'
+ import { getRouteApi } from '@tanstack/react-router'
+-import type { ColumnDef } from '@tanstack/react-table'
++import type {
++  ColumnDef,
++  OnChangeFn,
++  PaginationState,
++} from '@tanstack/react-table'
++import { useCallback, useEffect } from 'react'
+ import { useTranslation } from 'react-i18next'
+ import { toast } from 'sonner'
+ 
+@@ -36,6 +41,10 @@ import {
+   LOG_TYPE_ALL_VALUE,
+   LOG_TYPE_ENUM,
+ } from '../constants'
++import {
++  getUsageLogsRefetchInterval,
++  USAGE_LOGS_AUTO_REFRESH_ERROR_TOAST_ID,
++} from '../lib/auto-refresh'
+ import { useColumnsByCategory } from '../lib/columns'
+ import { parseLogOther } from '../lib/format'
+ import { fetchLogsByCategory } from '../lib/utils'
+@@ -43,7 +52,11 @@ import type { LogCategory } from '../types'
+ import { CommonLogsFilterBar } from './common-logs-filter-bar'
+ import { TaskLogsFilterBar } from './task-logs-filter-bar'
+ import { UsageLogsMobileList } from './usage-logs-mobile-card'
+-import { useLogsViewScope, type LogsViewAccess } from './usage-logs-provider'
++import {
++  useLogsViewScope,
++  useUsageLogsContext,
++  type LogsViewAccess,
++} from './usage-logs-provider'
+ 
+ const route = getRouteApi('/_authenticated/usage-logs/$section')
+ 
+@@ -84,6 +97,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
+     isRootView: isRoot,
+     viewAccess,
+   } = useLogsViewScope()
++  const { autoRefresh, setAutoRefresh } = useUsageLogsContext()
+   const isMobile = useMediaQuery('(max-width: 640px)')
+   const searchParams = route.useSearch()
+ 
+@@ -125,7 +139,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
+     ],
+   })
+ 
+-  const { data, isLoading, isFetching } = useQuery({
++  const { data, isLoading, isFetching, error, errorUpdatedAt } = useQuery({
+     queryKey: [
+       'logs',
+       logCategory,
+@@ -147,8 +161,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
+       })
+ 
+       if (!result?.success) {
+-        toast.error(result?.message || t('Failed to load logs'))
+-        return DEFAULT_LOGS_DATA
++        throw new Error(result?.message || t('Failed to load logs'))
+       }
+ 
+       return result.data || DEFAULT_LOGS_DATA
+@@ -162,8 +175,36 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
+       }
+       return undefined
+     },
++    retry: false,
++    refetchInterval: (query) =>
++      getUsageLogsRefetchInterval(
++        autoRefresh,
++        pagination.pageIndex + 1,
++        query.state.status
++      ),
++    refetchIntervalInBackground: false,
+   })
+ 
++  useEffect(() => {
++    if (!error || errorUpdatedAt === 0) return
++    toast.error(
++      error instanceof Error ? error.message : t('Failed to load logs'),
++      { id: USAGE_LOGS_AUTO_REFRESH_ERROR_TOAST_ID }
++    )
++    setAutoRefresh(false)
++  }, [error, errorUpdatedAt, setAutoRefresh, t])
++
++  const handlePaginationChange = useCallback<OnChangeFn<PaginationState>>(
++    (updater) => {
++      const next = typeof updater === 'function' ? updater(pagination) : updater
++      if (autoRefresh && next.pageIndex > 0) {
++        setAutoRefresh(false)
++      }
++      onPaginationChange(next)
++    },
++    [autoRefresh, onPaginationChange, pagination, setAutoRefresh]
++  )
++
+   const logs = data?.items || []
+   const columns = useColumnsByCategory(logCategory, isAdmin, isRoot)
+   const isLoadingData = isLoading || (isFetching && !data)
+@@ -178,7 +219,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
+     ),
+     pagination,
+     enableRowSelection: false,
+-    onPaginationChange,
++    onPaginationChange: handlePaginationChange,
+     onColumnFiltersChange,
+     manualPagination: true,
+     manualFiltering: true,
+diff --git a/web/src/features/usage-logs/constants.ts b/web/src/features/usage-logs/constants.ts
+index 7bc23448..0ee6ebd7 100644
+--- a/web/src/features/usage-logs/constants.ts
++++ b/web/src/features/usage-logs/constants.ts
+@@ -44,6 +44,9 @@ export const DEFAULT_LOGS_DATA = {
+   total: 0,
+ }
+ 
++/** Polling interval used while live refresh is enabled. */
++export const USAGE_LOGS_AUTO_REFRESH_INTERVAL_MS = 10_000
++
+ // ============================================================================
+ // Log Type Enum
+ // ============================================================================
+diff --git a/web/src/features/usage-logs/index.tsx b/web/src/features/usage-logs/index.tsx
+index 20467b71..8ab57ef0 100644
+--- a/web/src/features/usage-logs/index.tsx
++++ b/web/src/features/usage-logs/index.tsx
+@@ -16,12 +16,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
+ 
+ For commercial licensing, please contact support@quantumnous.com
+ */
++import { useQueryClient } from '@tanstack/react-query'
+ import { getRouteApi, useNavigate } from '@tanstack/react-router'
+ import { useCallback, useMemo } from 'react'
+ import { useTranslation } from 'react-i18next'
+ 
+ import { SectionPageLayout } from '@/components/layout'
+ import type { NavGroup } from '@/components/layout/types'
++import { Switch } from '@/components/ui/switch'
+ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+ import { CacheStatsDialog } from '@/features/system-settings/general/channel-affinity/cache-stats-dialog'
+ import { useSidebarConfig } from '@/hooks/use-sidebar-config'
+@@ -58,7 +60,9 @@ const SECTION_META: Record<UsageLogsSectionId, { titleKey: string }> = {
+ function UsageLogsContent() {
+   const { t } = useTranslation()
+   const navigate = useNavigate()
++  const queryClient = useQueryClient()
+   const params = route.useParams()
++  const searchParams = route.useSearch()
+   const activeCategory: UsageLogsSectionId =
+     params.section && isUsageLogsSectionId(params.section)
+       ? params.section
+@@ -70,6 +74,8 @@ function UsageLogsContent() {
+     affinityTarget,
+     affinityDialogOpen,
+     setAffinityDialogOpen,
++    autoRefresh,
++    setAutoRefresh,
+   } = useUsageLogsContext()
+   const { canManageScope, viewScope, setViewScope } = useLogsViewScope()
+   const tabNavGroups = useMemo<NavGroup[]>(
+@@ -117,6 +123,28 @@ function UsageLogsContent() {
+     [setViewScope]
+   )
+ 
++  const handleAutoRefreshChange = useCallback(
++    async (enabled: boolean) => {
++      if (!enabled) {
++        setAutoRefresh(false)
++        return
++      }
++
++      await navigate({
++        to: '/usage-logs/$section',
++        params: { section: activeCategory },
++        search: { ...searchParams, page: 1 },
++        replace: true,
++      })
++      setAutoRefresh(true)
++      await Promise.all([
++        queryClient.invalidateQueries({ queryKey: ['logs'] }),
++        queryClient.invalidateQueries({ queryKey: ['usage-logs-stats'] }),
++      ])
++    },
++    [activeCategory, navigate, queryClient, searchParams, setAutoRefresh]
++  )
++
+   const pageMeta =
+     activeCategory === 'common' ? SECTION_META.common : SECTION_META.task
+   const showTaskSwitcher =
+@@ -128,16 +156,27 @@ function UsageLogsContent() {
+         <SectionPageLayout.Title>
+           {t(pageMeta.titleKey)}
+         </SectionPageLayout.Title>
+-        {canManageScope && (
+-          <SectionPageLayout.Actions>
+-            <Tabs value={viewScope} onValueChange={handleViewScopeChange}>
+-              <TabsList>
+-                <TabsTrigger value='all'>{t('All')}</TabsTrigger>
+-                <TabsTrigger value='self'>{t('Only Mine')}</TabsTrigger>
+-              </TabsList>
+-            </Tabs>
+-          </SectionPageLayout.Actions>
+-        )}
++        <SectionPageLayout.Actions>
++          <div className='flex flex-wrap items-center gap-3'>
++            {canManageScope && (
++              <Tabs value={viewScope} onValueChange={handleViewScopeChange}>
++                <TabsList>
++                  <TabsTrigger value='all'>{t('All')}</TabsTrigger>
++                  <TabsTrigger value='self'>{t('Only Mine')}</TabsTrigger>
++                </TabsList>
++              </Tabs>
++            )}
++            <label className='border-border/70 bg-card flex items-center gap-2 rounded-md border px-3 py-1.5'>
++              <span className='text-muted-foreground text-xs'>
++                {t('Auto refresh')}
++              </span>
++              <Switch
++                checked={autoRefresh}
++                onCheckedChange={handleAutoRefreshChange}
++              />
++            </label>
++          </div>
++        </SectionPageLayout.Actions>
+         <SectionPageLayout.Content>
+           <div className='flex h-full min-h-0 flex-col gap-4'>
+             {showTaskSwitcher && (
+diff --git a/web/src/features/usage-logs/lib/__tests__/auto-refresh.test.ts b/web/src/features/usage-logs/lib/__tests__/auto-refresh.test.ts
+new file mode 100644
+index 00000000..624e55ab
+--- /dev/null
++++ b/web/src/features/usage-logs/lib/__tests__/auto-refresh.test.ts
+@@ -0,0 +1,36 @@
++/*
++Copyright (C) 2023-2026 QuantumNous
++
++This program is free software: you can redistribute it and/or modify
++it under the terms of the GNU Affero General Public License as
++published by the Free Software Foundation, either version 3 of the
++License, or (at your option) any later version.
++
++This program is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++GNU Affero General Public License for more details.
++
++You should have received a copy of the GNU Affero General Public License
++along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++For commercial licensing, please contact support@quantumnous.com
++*/
++import { describe, expect, test } from 'vitest'
++
++import { USAGE_LOGS_AUTO_REFRESH_INTERVAL_MS } from '../../constants'
++import { getUsageLogsRefetchInterval } from '../auto-refresh'
++
++describe('usage logs auto refresh interval', () => {
++  test('polls only while page one has a non-error query', () => {
++    expect(getUsageLogsRefetchInterval(true, 1, 'success')).toBe(
++      USAGE_LOGS_AUTO_REFRESH_INTERVAL_MS
++    )
++    expect(getUsageLogsRefetchInterval(true, 1, 'pending')).toBe(
++      USAGE_LOGS_AUTO_REFRESH_INTERVAL_MS
++    )
++    expect(getUsageLogsRefetchInterval(true, 1, 'error')).toBe(false)
++    expect(getUsageLogsRefetchInterval(true, 2, 'success')).toBe(false)
++    expect(getUsageLogsRefetchInterval(false, 1, 'success')).toBe(false)
++  })
++})
+diff --git a/web/src/features/usage-logs/lib/auto-refresh.ts b/web/src/features/usage-logs/lib/auto-refresh.ts
+new file mode 100644
+index 00000000..40d8486b
+--- /dev/null
++++ b/web/src/features/usage-logs/lib/auto-refresh.ts
+@@ -0,0 +1,35 @@
++/*
++Copyright (C) 2023-2026 QuantumNous
++
++This program is free software: you can redistribute it and/or modify
++it under the terms of the GNU Affero General Public License as
++published by the Free Software Foundation, either version 3 of the
++License, or (at your option) any later version.
++
++This program is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++GNU Affero General Public License for more details.
++
++You should have received a copy of the GNU Affero General Public License
++along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++For commercial licensing, please contact support@quantumnous.com
++*/
++import { USAGE_LOGS_AUTO_REFRESH_INTERVAL_MS } from '../constants'
++
++type UsageLogsQueryStatus = 'pending' | 'error' | 'success'
++
++export const USAGE_LOGS_AUTO_REFRESH_ERROR_TOAST_ID =
++  'usage-logs-auto-refresh-error'
++
++export function getUsageLogsRefetchInterval(
++  autoRefresh: boolean,
++  page: number,
++  queryStatus: UsageLogsQueryStatus
++): number | false {
++  if (!autoRefresh || page !== 1 || queryStatus === 'error') {
++    return false
++  }
++  return USAGE_LOGS_AUTO_REFRESH_INTERVAL_MS
++}

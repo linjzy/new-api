@@ -12,6 +12,7 @@ import (
 	"net/textproto"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -294,22 +295,31 @@ export function parseTaskResult(){return {status:"SUCCESS"}}
 func TestTaskAdaptorReDecodesFinalCandidateAndRejectsModelDrift(t *testing.T) {
 	source := `
 export const meta = {apiVersion:1,key:"redecode",name:"Redecode",version:"1.0.0",author:{name:"Test"},models:["claimed-model"],fetchMode:"per_task",protocols:[{name:"openai_responses",supports:["sync","background"]}]};
-let calls = 0;
-export const protocols = {openai_responses:{decodeRequest:function(ctx){calls++;return {kind:"submit",model:calls === 1 ? ctx.model : "drifted-model",requestBody:ctx.body.value};},renderFinal:function(){return {};}}};
+export const protocols = {openai_responses:{decodeRequest:function(ctx){return {kind:"submit",model:utils.unixNow() === 1 ? ctx.model : "drifted-model",requestBody:ctx.body.value};},renderFinal:function(){return {};}}};
 export function buildSubmitRequest(ctx){return {url:ctx.baseUrl+"/submit"}} export function parseSubmitResponse(){return {taskId:"one"}} export function buildQueryRequest(){return {}} export function parseTaskResult(){return {status:"SUCCESS"}}
 `
-	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
+	// Hook calls may use different pooled runtimes. Control the decoder from
+	// the host clock instead of relying on a JavaScript module-local counter.
+	decodeTime := time.Unix(1, 0)
+	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{
+		Now: func() time.Time { return decodeTime },
+	})
 	require.NoError(t, err)
 	protocolContext := pluginruntime.ProtocolRequestContext{
 		RouteRequestContext: pluginruntime.RouteRequestContext{Body: map[string]any{"kind": "json", "value": map[string]any{"model": "claimed-model"}}, RequestBody: map[string]any{"model": "claimed-model"}},
 		Protocol:            "openai_responses", Model: "claimed-model",
 	}
-	_, err = plugin.Engine.CallPath(context.Background(), "protocols", []string{"openai_responses", "decodeRequest"}, protocolContext.JSValue())
+	initialValue, err := plugin.Engine.CallPath(context.Background(), "protocols", []string{"openai_responses", "decodeRequest"}, protocolContext.JSValue())
 	require.NoError(t, err)
+	initial, ok := initialValue.(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "claimed-model", initial["model"])
+	decodeTime = time.Unix(2, 0)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	c.Set(pluginruntime.ContextKeyPinnedEndpoint, pluginruntime.PinnedEndpoint{Plugin: plugin, Protocol: "openai_responses", Model: "claimed-model"})
 	c.Set(pluginruntime.ContextKeyProtocolRequest, protocolContext)
+	c.Set("task_request", initial["requestBody"])
 	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}, OriginModelName: "claimed-model"}
 	adaptor := New(plugin)
 	adaptor.Init(info)
