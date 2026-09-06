@@ -1,5 +1,5 @@
 diff --git a/constant/multi_key_mode.go b/constant/multi_key_mode.go
-index cd0cdbff..2a5e00d8 100644
+index cd0cdbff5..2a5e00d86 100644
 --- a/constant/multi_key_mode.go
 +++ b/constant/multi_key_mode.go
 @@ -3,6 +3,7 @@ package constant
@@ -13,7 +13,7 @@ index cd0cdbff..2a5e00d8 100644
 +	MultiKeyModeSequential MultiKeyMode = "sequential" // 顺序优先
  )
 diff --git a/controller/channel-test.go b/controller/channel-test.go
-index ac872360..ffe7aa5b 100644
+index 61fd9477d..30634be83 100644
 --- a/controller/channel-test.go
 +++ b/controller/channel-test.go
 @@ -110,7 +110,7 @@ func resolveChannelTestUserID(c *gin.Context) (int, error) {
@@ -39,7 +39,7 @@ index ac872360..ffe7aa5b 100644
  	if newAPIError != nil {
  		return testResult{
  			context:     c,
-@@ -874,7 +879,7 @@ func TestChannel(c *gin.Context) {
+@@ -881,7 +886,7 @@ func TestChannel(c *gin.Context) {
  	if c.Request != nil {
  		requestCtx = c.Request.Context()
  	}
@@ -48,7 +48,7 @@ index ac872360..ffe7aa5b 100644
  	if result.localErr != nil {
  		resp := gin.H{
  			"success": false,
-@@ -917,11 +922,57 @@ type channelTestSummary struct {
+@@ -924,11 +929,57 @@ type channelTestSummary struct {
  	Enabled   int `json:"enabled"`
  }
  
@@ -108,7 +108,7 @@ index ac872360..ffe7aa5b 100644
  	milliseconds := time.Since(tik).Milliseconds()
  	if ctx.Err() != nil {
  		return summary
-@@ -960,6 +1011,13 @@ func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, test
+@@ -967,6 +1018,13 @@ func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, test
  	}
  
  	channel.UpdateResponseTime(milliseconds)
@@ -122,7 +122,7 @@ index ac872360..ffe7aa5b 100644
  	return summary
  }
  
-@@ -1059,7 +1117,7 @@ func runChannelTestWorkers(
+@@ -1066,7 +1124,7 @@ func runChannelTestWorkers(
  // performChannelTests runs channel health checks with the configured bounded
  // concurrency and honors cancellation when a system-task runner loses its
  // lease.
@@ -131,7 +131,7 @@ index ac872360..ffe7aa5b 100644
  	if ctx == nil {
  		ctx = context.Background()
  	}
-@@ -1072,7 +1130,7 @@ func performChannelTests(ctx context.Context, channels []*model.Channel, testUse
+@@ -1079,7 +1137,7 @@ func performChannelTests(ctx context.Context, channels []*model.Channel, testUse
  		channels,
  		concurrency,
  		func(ctx context.Context, channel *model.Channel) channelTestSummary {
@@ -140,7 +140,7 @@ index ac872360..ffe7aa5b 100644
  		},
  		report,
  	)
-@@ -1100,8 +1158,9 @@ func runChannelTestTask(ctx context.Context, mode string, notify bool, report fu
+@@ -1107,8 +1165,9 @@ func runChannelTestTask(ctx context.Context, mode string, notify bool, report fu
  	}
  	selected := selectChannelsForAutomaticTest(channels, mode)
  	allowDisable := mode != operation_setting.ChannelTestModePassiveRecovery
@@ -151,7 +151,7 @@ index ac872360..ffe7aa5b 100644
  	if notify && (ctx == nil || ctx.Err() == nil) {
  		service.NotifyRootUser(dto.NotifyTypeChannelTest, "通道测试完成", "所有通道测试已完成")
  	}
-@@ -1118,7 +1177,9 @@ func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*m
+@@ -1125,7 +1184,9 @@ func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*m
  			continue
  		}
  		if mode == operation_setting.ChannelTestModePassiveRecovery && channel.Status != common.ChannelStatusAutoDisabled {
@@ -163,7 +163,7 @@ index ac872360..ffe7aa5b 100644
  		selected = append(selected, channel)
  	}
 diff --git a/controller/channel_test_internal_test.go b/controller/channel_test_internal_test.go
-index 85da7f7b..9bc0655f 100644
+index 66a394aad..70a2054f0 100644
 --- a/controller/channel_test_internal_test.go
 +++ b/controller/channel_test_internal_test.go
 @@ -3,6 +3,7 @@ package controller
@@ -174,7 +174,7 @@ index 85da7f7b..9bc0655f 100644
  	"fmt"
  	"net/http"
  	"net/http/httptest"
-@@ -297,16 +298,137 @@ func TestResolveChannelTestUserIDUsesRequestUser(t *testing.T) {
+@@ -300,16 +301,137 @@ func TestResolveChannelTestUserIDUsesRequestUser(t *testing.T) {
  }
  
  func TestSelectChannelsForAutomaticTestPassiveRecoveryOnlyUsesAutoDisabled(t *testing.T) {
@@ -314,7 +314,7 @@ index 85da7f7b..9bc0655f 100644
  
  func TestSelectChannelsForAutomaticTestScheduledSkipsManualDisabled(t *testing.T) {
 diff --git a/controller/relay.go b/controller/relay.go
-index 9da14e339f303f78b684c3c87d07b97bc1579b7f..40f47bdcd41358768628283ce7a129062472eabd 100644
+index ca9b35d8b..10e69961e 100644
 --- a/controller/relay.go
 +++ b/controller/relay.go
 @@ -193,7 +193,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
@@ -453,7 +453,7 @@ index 9da14e339f303f78b684c3c87d07b97bc1579b7f..40f47bdcd41358768628283ce7a12906
  }
  
  func RelayMidjourney(c *gin.Context) {
-@@ -618,7 +697,7 @@ func executeTaskSubmissionWith(
+@@ -623,7 +702,7 @@ func executeTaskSubmissionWith(
  		Retry:       common.GetPointer(0),
  	}
  
@@ -462,7 +462,7 @@ index 9da14e339f303f78b684c3c87d07b97bc1579b7f..40f47bdcd41358768628283ce7a12906
  		stage = "select_channel"
  		if requestErr := c.Request.Context().Err(); requestErr != nil {
  			diagnostics.cancelled("before_attempt", retryParam.GetRetry()+1)
-@@ -628,8 +707,20 @@ func executeTaskSubmissionWith(
+@@ -633,8 +712,20 @@ func executeTaskSubmissionWith(
  		var channel *model.Channel
  
  		if lockedCh, ok := relayInfo.LockedChannel.(*model.Channel); ok && lockedCh != nil {
@@ -485,7 +485,7 @@ index 9da14e339f303f78b684c3c87d07b97bc1579b7f..40f47bdcd41358768628283ce7a12906
  				if setupErr := middleware.SetupContextForSelectedChannel(c, channel, relayInfo.OriginModelName); setupErr != nil {
  					taskErr = service.TaskErrorWrapperLocal(setupErr.Err, "setup_locked_channel_failed", http.StatusInternalServerError)
  					break
-@@ -671,16 +762,25 @@ func executeTaskSubmissionWith(
+@@ -676,16 +767,25 @@ func executeTaskSubmissionWith(
  			break
  		}
  
@@ -517,7 +517,7 @@ index 9da14e339f303f78b684c3c87d07b97bc1579b7f..40f47bdcd41358768628283ce7a12906
  		if !willRetry {
  			break
  		}
-@@ -848,6 +948,20 @@ func respondTaskSubmissionError(c *gin.Context, taskErr *taskdto.TaskError) {
+@@ -853,6 +953,20 @@ func respondTaskSubmissionError(c *gin.Context, taskErr *taskdto.TaskError) {
  	respondTaskError(c, taskErr)
  }
  
@@ -540,7 +540,7 @@ index 9da14e339f303f78b684c3c87d07b97bc1579b7f..40f47bdcd41358768628283ce7a12906
  	if taskErr.StatusCode == http.StatusTooManyRequests {
 diff --git a/controller/relay_sequential_test.go b/controller/relay_sequential_test.go
 new file mode 100644
-index 00000000..2de44e8f
+index 000000000..2de44e8fd
 --- /dev/null
 +++ b/controller/relay_sequential_test.go
 @@ -0,0 +1,55 @@
@@ -600,10 +600,10 @@ index 00000000..2de44e8f
 +	assert.Equal(t, 1, index)
 +}
 diff --git a/middleware/distributor.go b/middleware/distributor.go
-index e61bea44..17cd446c 100644
+index e7fa84f83..9f0a07426 100644
 --- a/middleware/distributor.go
 +++ b/middleware/distributor.go
-@@ -577,6 +577,18 @@ func getTaskOriginModelName(c *gin.Context) string {
+@@ -604,6 +604,18 @@ func getTaskOriginModelName(c *gin.Context) string {
  }
  
  func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, modelName string) *types.NewAPIError {
@@ -622,7 +622,7 @@ index e61bea44..17cd446c 100644
  	c.Set("original_model", modelName) // for retry
  	expectedPlugin := c.GetString("expected_task_plugin_key")
  	if channel == nil {
-@@ -640,9 +652,32 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
+@@ -667,9 +679,32 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
  	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
  	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
  
@@ -660,7 +660,7 @@ index e61bea44..17cd446c 100644
  		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, true)
 diff --git a/middleware/distributor_channel_test_key_test.go b/middleware/distributor_channel_test_key_test.go
 new file mode 100644
-index 00000000..0036ed27
+index 000000000..0036ed27e
 --- /dev/null
 +++ b/middleware/distributor_channel_test_key_test.go
 @@ -0,0 +1,73 @@
@@ -738,7 +738,7 @@ index 00000000..0036ed27
 +	assert.Contains(t, apiErr.Error(), "channel key index 0 is not auto-disabled")
 +}
 diff --git a/model/channel.go b/model/channel.go
-index 397e9428..9e216392 100644
+index 268f190e7..609d156cc 100644
 --- a/model/channel.go
 +++ b/model/channel.go
 @@ -6,6 +6,7 @@ import (
@@ -749,7 +749,7 @@ index 397e9428..9e216392 100644
  	"strings"
  	"sync"
  
-@@ -196,6 +197,25 @@ func (channel *Channel) GetKeys() []string {
+@@ -201,6 +202,25 @@ func (channel *Channel) GetKeys() []string {
  	return keys
  }
  
@@ -775,7 +775,7 @@ index 397e9428..9e216392 100644
  func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
  	// If not in multi-key mode, return the original key string directly.
  	if !channel.ChannelInfo.IsMultiKey {
-@@ -276,6 +296,10 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
+@@ -281,6 +301,10 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
  		}
  		// Fallback – should not happen, but return first enabled key
  		return keys[enabledIdx[0]], enabledIdx[0], nil
@@ -786,7 +786,7 @@ index 397e9428..9e216392 100644
  	default:
  		// Unknown mode, default to first enabled key (or original key string)
  		return keys[enabledIdx[0]], enabledIdx[0], nil
-@@ -663,29 +687,36 @@ func CleanupChannelPollingLocks() {
+@@ -668,29 +692,36 @@ func CleanupChannelPollingLocks() {
  	})
  }
  
@@ -831,7 +831,7 @@ index 397e9428..9e216392 100644
  		}
  		if channel.ChannelInfo.MultiKeyStatusList == nil {
  			channel.ChannelInfo.MultiKeyStatusList = make(map[int]int)
-@@ -713,6 +744,7 @@ func handlerMultiKeyUpdate(channel *Channel, usingKey string, status int, reason
+@@ -718,6 +749,7 @@ func handlerMultiKeyUpdate(channel *Channel, usingKey string, status int, reason
  			channel.Status = common.ChannelStatusEnabled
  		}
  	}
@@ -839,7 +839,7 @@ index 397e9428..9e216392 100644
  }
  
  func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
-@@ -729,6 +761,92 @@ func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
+@@ -734,6 +766,92 @@ func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
  }
  
  func UpdateChannelStatus(channelId int, usingKey string, status int, reason string) bool {
@@ -932,7 +932,7 @@ index 397e9428..9e216392 100644
  	if common.MemoryCacheEnabled {
  		channelStatusLock.Lock()
  		defer channelStatusLock.Unlock()
-@@ -749,7 +867,9 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
+@@ -754,7 +872,9 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
  		if channelCache.ChannelInfo.IsMultiKey {
  			beforeStatus := channelCache.Status
  			// 如果是多Key模式，更新缓存中的状态
@@ -943,7 +943,7 @@ index 397e9428..9e216392 100644
  			if beforeStatus != channelCache.Status {
  				CacheUpdateChannelStatus(channelId, channelCache.Status)
  			}
-@@ -783,7 +903,9 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
+@@ -788,7 +908,9 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
  
  		if channel.ChannelInfo.IsMultiKey {
  			beforeStatus := channel.Status
@@ -956,7 +956,7 @@ index 397e9428..9e216392 100644
  			}
 diff --git a/model/channel_sequential_test.go b/model/channel_sequential_test.go
 new file mode 100644
-index 00000000..d92ae6a2
+index 000000000..d92ae6a23
 --- /dev/null
 +++ b/model/channel_sequential_test.go
 @@ -0,0 +1,197 @@
@@ -1158,7 +1158,7 @@ index 00000000..d92ae6a2
 +	assert.True(t, ability.Enabled)
 +}
 diff --git a/service/channel.go b/service/channel.go
-index f348e081..10d336e4 100644
+index f348e081e..10d336e4f 100644
 --- a/service/channel.go
 +++ b/service/channel.go
 @@ -5,6 +5,7 @@ import (
@@ -1273,7 +1273,7 @@ index f348e081..10d336e4 100644
  	if !common.AutomaticEnableChannelEnabled {
  		return false
 diff --git a/service/channel_select.go b/service/channel_select.go
-index d37d4f6d..7f623ead 100644
+index d37d4f6d3..7f623eadf 100644
 --- a/service/channel_select.go
 +++ b/service/channel_select.go
 @@ -42,6 +42,10 @@ type RetryParam struct {
@@ -1316,7 +1316,7 @@ index d37d4f6d..7f623ead 100644
  //
 diff --git a/service/channel_sequential_test.go b/service/channel_sequential_test.go
 new file mode 100644
-index 00000000..cb77c9ce
+index 000000000..cb77c9ceb
 --- /dev/null
 +++ b/service/channel_sequential_test.go
 @@ -0,0 +1,76 @@
@@ -1397,7 +1397,7 @@ index 00000000..cb77c9ce
 +	require.Equal(t, 0, param.TakeSequentialChannel())
 +}
 diff --git a/web/src/features/channels/components/channels-columns.tsx b/web/src/features/channels/components/channels-columns.tsx
-index ad6fadcd..820d8404 100644
+index ad6fadcd7..820d84043 100644
 --- a/web/src/features/channels/components/channels-columns.tsx
 +++ b/web/src/features/channels/components/channels-columns.tsx
 @@ -21,6 +21,7 @@ import { useQueryClient } from '@tanstack/react-query'
@@ -1431,7 +1431,7 @@ index ad6fadcd..820d8404 100644
            const ionetMeta = parseIonetMeta(channel.other_info)
            const isIonet = ionetMeta?.source === 'ionet'
 diff --git a/web/src/features/channels/components/dialogs/multi-key-manage-dialog.tsx b/web/src/features/channels/components/dialogs/multi-key-manage-dialog.tsx
-index 22f75214..d349da9e 100644
+index 22f752149..d349da9e1 100644
 --- a/web/src/features/channels/components/dialogs/multi-key-manage-dialog.tsx
 +++ b/web/src/features/channels/components/dialogs/multi-key-manage-dialog.tsx
 @@ -149,7 +149,7 @@ export function MultiKeyManageDialog({
@@ -1509,10 +1509,10 @@ index 22f75214..d349da9e 100644
                  className='rounded-none border-0'
                  tableClassName='min-w-[800px]'
 diff --git a/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx b/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx
-index 93f6a0a1..cd906059 100644
+index 075b1e107..e7d851ef9 100644
 --- a/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx
 +++ b/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx
-@@ -728,6 +728,22 @@ export function ChannelMutateDrawer({
+@@ -699,6 +699,22 @@ export function ChannelMutateDrawer({
    // Watch form values for conditional rendering
    const multiKeyMode = form.watch('multi_key_mode')
    const multiKeyType = form.watch('multi_key_type')
@@ -1535,7 +1535,7 @@ index 93f6a0a1..cd906059 100644
    const keyMode = form.watch('key_mode')
    const currentGroups = form.watch('group')
    const currentType = form.watch('type')
-@@ -3297,6 +3313,10 @@ export function ChannelMutateDrawer({
+@@ -3207,6 +3223,10 @@ placeholder={t(
                                                value: 'polling',
                                                label: t('Polling'),
                                              },
@@ -1546,7 +1546,7 @@ index 93f6a0a1..cd906059 100644
                                            ]}
                                            onValueChange={field.onChange}
                                            value={field.value}
-@@ -3316,21 +3336,14 @@ export function ChannelMutateDrawer({
+@@ -3226,21 +3246,14 @@ placeholder={t(
                                                <SelectItem value='polling'>
                                                  {t('Polling')}
                                                </SelectItem>
@@ -1573,7 +1573,7 @@ index 93f6a0a1..cd906059 100644
                                          <FormMessage />
                                        </FormItem>
 diff --git a/web/src/features/channels/constants.ts b/web/src/features/channels/constants.ts
-index 4fd49567..cee7f4cb 100644
+index 4fd49567d..cee7f4cb0 100644
 --- a/web/src/features/channels/constants.ts
 +++ b/web/src/features/channels/constants.ts
 @@ -203,6 +203,7 @@ export const MULTI_KEY_STATUS_CONFIG = {
@@ -1585,7 +1585,7 @@ index 4fd49567..cee7f4cb 100644
  
  export const ADD_MODE_OPTIONS = [
 diff --git a/web/src/features/channels/lib/channel-form.ts b/web/src/features/channels/lib/channel-form.ts
-index f31a5c42..eebc4a35 100644
+index f31a5c424..eebc4a354 100644
 --- a/web/src/features/channels/lib/channel-form.ts
 +++ b/web/src/features/channels/lib/channel-form.ts
 @@ -251,7 +251,7 @@ export const channelFormSchema = z
@@ -1607,7 +1607,7 @@ index f31a5c42..eebc4a35 100644
    channel: Partial<Channel>
  } {
 diff --git a/web/src/features/channels/types.ts b/web/src/features/channels/types.ts
-index 6b53c336..216a63a9 100644
+index 6b53c336f..216a63a95 100644
 --- a/web/src/features/channels/types.ts
 +++ b/web/src/features/channels/types.ts
 @@ -29,7 +29,7 @@ export const channelInfoSchema = z.object({
@@ -1638,18 +1638,18 @@ index 6b53c336..216a63a9 100644
    channel: Partial<Channel>
  }
 diff --git a/web/src/i18n/locales/en.json b/web/src/i18n/locales/en.json
-index a65405c6..7c1f3064 100644
+index 7a6fdd1e9..b8fa90697 100644
 --- a/web/src/i18n/locales/en.json
 +++ b/web/src/i18n/locales/en.json
-@@ -364,6 +364,7 @@
-     "Allowed Ports": "Allowed Ports",
-     "Already have an account?": "Already have an account?",
+@@ -404,6 +404,7 @@
+     "Also remove from all channels": "Also remove from all channels",
+     "Also remove pricing": "Also remove pricing",
      "Always matches (default tier).": "Always matches (default tier).",
 +    "Always use the first enabled key; when a request failure matches the auto-disable rules, automatically try the next one": "Always use the first enabled key; when a request failure matches the auto-disable rules, automatically try the next one",
      "Amount": "Amount",
      "Amount cannot be changed when editing.": "Amount cannot be changed when editing.",
      "Amount discount": "Amount discount",
-@@ -2924,6 +2925,7 @@
+@@ -3145,6 +3146,7 @@
      "Multi-Key Strategy": "Multi-Key Strategy",
      "Multi-key: Polling rotation": "Multi-key: Polling rotation",
      "Multi-key: Random rotation": "Multi-key: Random rotation",
@@ -1657,7 +1657,7 @@ index a65405c6..7c1f3064 100644
      "Multi-protocol Compatible": "Multi-protocol Compatible",
      "Multi-region deployment for stable global access": "Multi-region deployment for stable global access",
      "Multi-step thinking before final answer": "Multi-step thinking before final answer",
-@@ -3812,6 +3814,7 @@
+@@ -4096,6 +4098,7 @@
      "Quota:": "Quota:",
      "Radius": "Radius",
      "Random": "Random",
@@ -1666,18 +1666,18 @@ index a65405c6..7c1f3064 100644
      "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.",
      "Rankings": "Rankings",
 diff --git a/web/src/i18n/locales/fr.json b/web/src/i18n/locales/fr.json
-index 901736b0..64e68f0c 100644
+index e28f968de..93bec3eda 100644
 --- a/web/src/i18n/locales/fr.json
 +++ b/web/src/i18n/locales/fr.json
-@@ -364,6 +364,7 @@
-     "Allowed Ports": "Ports autorisés",
-     "Already have an account?": "Vous avez déjà un compte ?",
+@@ -404,6 +404,7 @@
+     "Also remove from all channels": "Retirer aussi de tous les canaux",
+     "Also remove pricing": "Supprimer aussi les prix",
      "Always matches (default tier).": "Toujours appliqué (palier par défaut).",
 +    "Always use the first enabled key; when a request failure matches the auto-disable rules, automatically try the next one": "Toujours utiliser la première clé activée ; lorsqu'un échec correspond aux règles de désactivation automatique, essayer automatiquement la suivante",
      "Amount": "Montant",
      "Amount cannot be changed when editing.": "Le montant ne peut pas être modifié lors de la modification.",
      "Amount discount": "Remise sur le montant",
-@@ -2924,6 +2925,7 @@
+@@ -3145,6 +3146,7 @@
      "Multi-Key Strategy": "Stratégie multi-clés",
      "Multi-key: Polling rotation": "Multi-clé : Rotation par sondage",
      "Multi-key: Random rotation": "Multi-clé : Rotation aléatoire",
@@ -1685,7 +1685,7 @@ index 901736b0..64e68f0c 100644
      "Multi-protocol Compatible": "Compatible multi-protocole",
      "Multi-region deployment for stable global access": "Déploiement multirégional pour un accès mondial stable",
      "Multi-step thinking before final answer": "Raisonnement en plusieurs étapes avant la réponse finale",
-@@ -3812,6 +3814,7 @@
+@@ -4096,6 +4098,7 @@
      "Quota:": "Quota :",
      "Radius": "Rayon",
      "Random": "Aléatoire",
@@ -1694,18 +1694,18 @@ index 901736b0..64e68f0c 100644
      "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "Les données de classement sont actuellement simulées à des fins d'aperçu et seront remplacées par des analyses en direct une fois l'intégration backend livrée.",
      "Rankings": "Classements",
 diff --git a/web/src/i18n/locales/ja.json b/web/src/i18n/locales/ja.json
-index 3cf134da..8b46bb5b 100644
+index 6eae5ab8b..2f4f4942f 100644
 --- a/web/src/i18n/locales/ja.json
 +++ b/web/src/i18n/locales/ja.json
-@@ -364,6 +364,7 @@
-     "Allowed Ports": "許可するポート",
-     "Already have an account?": "アカウントをお持ちの方？",
+@@ -404,6 +404,7 @@
+     "Also remove from all channels": "すべてのチャネルからも削除",
+     "Also remove pricing": "料金設定も削除",
      "Always matches (default tier).": "常に一致（デフォルト ティア）。",
 +    "Always use the first enabled key; when a request failure matches the auto-disable rules, automatically try the next one": "常に最初の有効なキーを使用し、リクエスト失敗が自動無効化ルールに一致した場合は自動的に次のキーを試します",
      "Amount": "金額",
      "Amount cannot be changed when editing.": "編集時は金額を変更できません。",
      "Amount discount": "割引額",
-@@ -2924,6 +2925,7 @@
+@@ -3145,6 +3146,7 @@
      "Multi-Key Strategy": "マルチキー戦略",
      "Multi-key: Polling rotation": "マルチキー：ポーリングローテーション",
      "Multi-key: Random rotation": "マルチキー：ランダムローテーション",
@@ -1713,7 +1713,7 @@ index 3cf134da..8b46bb5b 100644
      "Multi-protocol Compatible": "マルチプロトコル互換",
      "Multi-region deployment for stable global access": "安定したグローバルアクセスを実現するマルチリージョンデプロイメント",
      "Multi-step thinking before final answer": "最終回答の前に複数ステップで思考",
-@@ -3812,6 +3814,7 @@
+@@ -4096,6 +4098,7 @@
      "Quota:": "クォータ：",
      "Radius": "角丸",
      "Random": "ランダム",
@@ -1722,18 +1722,18 @@ index 3cf134da..8b46bb5b 100644
      "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "現在のランキングデータはプレビュー用のシミュレーションです。バックエンド連携が完了次第、リアルタイム分析データに置き換わります。",
      "Rankings": "ランキング",
 diff --git a/web/src/i18n/locales/ru.json b/web/src/i18n/locales/ru.json
-index 97932b58..d1886279 100644
+index 8abaf2bd5..94fa784ae 100644
 --- a/web/src/i18n/locales/ru.json
 +++ b/web/src/i18n/locales/ru.json
-@@ -364,6 +364,7 @@
-     "Allowed Ports": "Разрешенные порты",
-     "Already have an account?": "Уже есть аккаунт?",
+@@ -404,6 +404,7 @@
+     "Also remove from all channels": "Также удалить из всех каналов",
+     "Also remove pricing": "Также удалить цены",
      "Always matches (default tier).": "Всегда совпадает (уровень по умолчанию).",
 +    "Always use the first enabled key; when a request failure matches the auto-disable rules, automatically try the next one": "Всегда использовать первый включённый ключ; если ошибка запроса соответствует правилам автоотключения, автоматически попробовать следующий",
      "Amount": "Сумма",
      "Amount cannot be changed when editing.": "Количество нельзя изменить при редактировании.",
      "Amount discount": "Скидка на сумму",
-@@ -2924,6 +2925,7 @@
+@@ -3145,6 +3146,7 @@
      "Multi-Key Strategy": "Стратегия нескольких ключей",
      "Multi-key: Polling rotation": "Мульти-ключ: Циклическая ротация",
      "Multi-key: Random rotation": "Мульти-ключ: Случайная ротация",
@@ -1741,7 +1741,7 @@ index 97932b58..d1886279 100644
      "Multi-protocol Compatible": "Совместимо с несколькими протоколами",
      "Multi-region deployment for stable global access": "Мультирегиональное развертывание для стабильного глобального доступа",
      "Multi-step thinking before final answer": "Многошаговые рассуждения перед итоговым ответом",
-@@ -3812,6 +3814,7 @@
+@@ -4096,6 +4098,7 @@
      "Quota:": "Квота:",
      "Radius": "Радиус",
      "Random": "Случайный",
@@ -1750,18 +1750,18 @@ index 97932b58..d1886279 100644
      "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "Сейчас данные рейтинга смоделированы для превью; после внедрения бэкенда они будут заменены реальной аналитикой.",
      "Rankings": "Рейтинги",
 diff --git a/web/src/i18n/locales/vi.json b/web/src/i18n/locales/vi.json
-index 7e1bc1ea..9bdf961c 100644
+index f735ea6fa..d102b6392 100644
 --- a/web/src/i18n/locales/vi.json
 +++ b/web/src/i18n/locales/vi.json
-@@ -364,6 +364,7 @@
-     "Allowed Ports": "Cổng được phép",
-     "Already have an account?": "Đã có tài khoản?",
+@@ -404,6 +404,7 @@
+     "Also remove from all channels": "Đồng thời xóa khỏi tất cả các kênh",
+     "Also remove pricing": "Đồng thời xóa giá",
      "Always matches (default tier).": "Luôn khớp (bậc mặc định).",
 +    "Always use the first enabled key; when a request failure matches the auto-disable rules, automatically try the next one": "Luôn dùng khóa đang bật đầu tiên; khi lỗi yêu cầu khớp quy tắc tự động vô hiệu hóa, tự động thử khóa tiếp theo",
      "Amount": "Số lượng",
      "Amount cannot be changed when editing.": "Số tiền không thể thay đổi khi chỉnh sửa.",
      "Amount discount": "Số tiền giảm giá",
-@@ -2924,6 +2925,7 @@
+@@ -3145,6 +3146,7 @@
      "Multi-Key Strategy": "Chiến lược đa khóa",
      "Multi-key: Polling rotation": "Đa khóa: Xoay vòng tuần tự",
      "Multi-key: Random rotation": "Đa khóa: Xoay vòng ngẫu nhiên",
@@ -1769,7 +1769,7 @@ index 7e1bc1ea..9bdf961c 100644
      "Multi-protocol Compatible": "Tương thích đa giao thức",
      "Multi-region deployment for stable global access": "Triển khai đa khu vực để truy cập toàn cầu ổn định",
      "Multi-step thinking before final answer": "Suy luận nhiều bước trước khi đưa ra câu trả lời cuối",
-@@ -3812,6 +3814,7 @@
+@@ -4096,6 +4098,7 @@
      "Quota:": "Hạn ngạch:",
      "Radius": "Bo góc",
      "Random": "Ngẫu nhiên",
@@ -1778,18 +1778,18 @@ index 7e1bc1ea..9bdf961c 100644
      "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "Dữ liệu xếp hạng hiện đang được mô phỏng để xem trước và sẽ được thay bằng dữ liệu thực sau khi tích hợp backend.",
      "Rankings": "Bảng xếp hạng",
 diff --git a/web/src/i18n/locales/zh-TW.json b/web/src/i18n/locales/zh-TW.json
-index 6cc8c1d6..64cc58fb 100644
+index af7429daf..16f2d0f72 100644
 --- a/web/src/i18n/locales/zh-TW.json
 +++ b/web/src/i18n/locales/zh-TW.json
-@@ -364,6 +364,7 @@
-     "Allowed Ports": "允許的端口",
-     "Already have an account?": "已有用戶？",
+@@ -404,6 +404,7 @@
+     "Also remove from all channels": "同時從所有渠道移除",
+     "Also remove pricing": "同時移除定價",
      "Always matches (default tier).": "始終匹配（預設檔位）。",
 +    "Always use the first enabled key; when a request failure matches the auto-disable rules, automatically try the next one": "始終使用第一個已啟用的金鑰；當請求失敗符合自動停用規則時，自動嘗試下一個",
      "Amount": "金額",
      "Amount cannot be changed when editing.": "編輯時無法更改數量。",
      "Amount discount": "金額折扣",
-@@ -2924,6 +2925,7 @@
+@@ -3145,6 +3146,7 @@
      "Multi-Key Strategy": "多金鑰策略",
      "Multi-key: Polling rotation": "多金鑰：輪詢",
      "Multi-key: Random rotation": "多金鑰：隨機",
@@ -1797,7 +1797,7 @@ index 6cc8c1d6..64cc58fb 100644
      "Multi-protocol Compatible": "兼容多協定",
      "Multi-region deployment for stable global access": "多區域部署，實現穩定的全球存取",
      "Multi-step thinking before final answer": "在給出最終答案前進行多步推理",
-@@ -3812,6 +3814,7 @@
+@@ -4096,6 +4098,7 @@
      "Quota:": "Quota:",
      "Radius": "圓角",
      "Random": "隨機",
@@ -1806,18 +1806,18 @@ index 6cc8c1d6..64cc58fb 100644
      "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "目前排行榜數據為預覽用模擬數據，後端整合完成後將替換為真實分析數據。",
      "Rankings": "排行榜",
 diff --git a/web/src/i18n/locales/zh.json b/web/src/i18n/locales/zh.json
-index 90dec7d6..d49048a5 100644
+index abce204ce..0ff94b8b8 100644
 --- a/web/src/i18n/locales/zh.json
 +++ b/web/src/i18n/locales/zh.json
-@@ -364,6 +364,7 @@
-     "Allowed Ports": "允许的端口",
-     "Already have an account?": "已有账户？",
+@@ -404,6 +404,7 @@
+     "Also remove from all channels": "同时从所有渠道移除",
+     "Also remove pricing": "同时移除定价",
      "Always matches (default tier).": "始终匹配（默认档位）。",
 +    "Always use the first enabled key; when a request failure matches the auto-disable rules, automatically try the next one": "始终使用第一个已启用的密钥；当请求失败符合自动禁用规则时，自动尝试下一个",
      "Amount": "金额",
      "Amount cannot be changed when editing.": "编辑时无法更改数量。",
      "Amount discount": "金额折扣",
-@@ -2924,6 +2925,7 @@
+@@ -3145,6 +3146,7 @@
      "Multi-Key Strategy": "多密钥策略",
      "Multi-key: Polling rotation": "多密钥：轮询",
      "Multi-key: Random rotation": "多密钥：随机",
@@ -1825,7 +1825,7 @@ index 90dec7d6..d49048a5 100644
      "Multi-protocol Compatible": "兼容多协议",
      "Multi-region deployment for stable global access": "多区域部署，实现稳定的全球访问",
      "Multi-step thinking before final answer": "在给出最终答案前进行多步推理",
-@@ -3812,6 +3814,7 @@
+@@ -4096,6 +4098,7 @@
      "Quota:": "Quota:",
      "Radius": "圆角",
      "Random": "随机",
