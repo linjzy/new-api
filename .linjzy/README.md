@@ -50,9 +50,11 @@ lifecycle, message/reasoning item and text-part placeholders (at most 16 events 
 2 MiB, bounded by the stream timeout) and
 defers SSE headers and pings until output starts. Before output, an unbilled
 capacity failure returns a retryable 503 to the existing relay loop. The loop
-respects `RetryTimes` and channel constraints, excludes attempted channels, and
-updates affinity to the channel that succeeds. Exhaustion preserves the capacity
-error instead of replacing it with a channel-selection error.
+respects `RetryTimes`, affinity retry policy and channel constraints, and excludes
+attempted channels. Affinity changes to the successful channel only when
+`switch_on_success` is enabled; otherwise it retains the initial channel.
+Exhaustion preserves the capacity error instead of replacing it with a
+channel-selection error.
 
 The byte budget covers the instructions and metadata echoed by Codex lifecycle
 events; these can exceed 64 KiB before any generated content is available.
@@ -61,7 +63,9 @@ Text, populated/encrypted reasoning, tool/unknown events, nonempty output in a
 failed response, and nonzero reported usage all prevent replay. Raw item fields
 are inspected so encrypted content and unknown extensions cannot disappear
 through DTO decoding. Committed streams preserve the upstream failure event
-without appending JSON; partial usage is settled once. Non-capacity failures,
+without appending JSON; partial usage is settled once. Failed streams without
+billable tokens or tool calls refund the precharge and create only an error log,
+without a duplicate zero-usage consume log. Non-capacity failures,
 malformed/truncated streams, and client cancellation do not use this failover.
 Error logs retain `upstream_http_status: 200` and the actual stream failure.
 

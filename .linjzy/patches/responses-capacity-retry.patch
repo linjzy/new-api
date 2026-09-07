@@ -16,7 +16,7 @@ index 994e65751..e7af897ef 100644
  	// ContextKeyAuditLogged marks that the current request has already recorded
  	// a manage/operation audit log inside the handler. When set, the admin-audit
 diff --git a/controller/relay.go b/controller/relay.go
-index 10e69961e..c39997ad0 100644
+index 10e69961e..320473bb5 100644
 --- a/controller/relay.go
 +++ b/controller/relay.go
 @@ -94,6 +94,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
@@ -57,7 +57,7 @@ index 10e69961e..c39997ad0 100644
  		if billingErr := service.PrepareTieredBillingForSelectedGroup(c, relayInfo); billingErr != nil {
  			newAPIError = billingErr
  			break
-@@ -232,11 +246,16 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+@@ -232,11 +246,15 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
  
  		if newAPIError == nil {
  			relayInfo.LastError = nil
@@ -68,13 +68,12 @@ index 10e69961e..c39997ad0 100644
  		newAPIError = service.NormalizeViolationFeeError(newAPIError)
  		relayInfo.LastError = newAPIError
 +		if relayInfo.ResponsesCapacityFailure {
-+			service.ClearCurrentChannelAffinityCache(c)
 +			common.SetContextKey(c, constant.ContextKeyResponsesCapacityRetried, true)
 +		}
  
  		// On the first attempt getChannel intentionally returns a lightweight
  		// placeholder because the distributor already selected the channel. Use
-@@ -260,7 +279,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+@@ -260,7 +278,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
  		// the next attempt to the same channel. Pinning suppresses the loop's next
  		// retry increment, so every enabled key is tried without consuming the
  		// normal channel retry budget.
@@ -83,7 +82,7 @@ index 10e69961e..c39997ad0 100644
  			service.ShouldDisableChannelForChannel(channelForError, newAPIError) &&
  			sequentialKeyDisabled && sequentialKeyAvailable(channelForError.Id) {
  			retryParam.SetSequentialChannel(channelForError.Id)
-@@ -427,6 +446,9 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
+@@ -427,6 +445,9 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
  	if openaiErr == nil {
  		return false
  	}
@@ -95,10 +94,10 @@ index 10e69961e..c39997ad0 100644
  	}
 diff --git a/controller/relay_responses_capacity_test.go b/controller/relay_responses_capacity_test.go
 new file mode 100644
-index 000000000..36240579c
+index 000000000..6ff6961a0
 --- /dev/null
 +++ b/controller/relay_responses_capacity_test.go
-@@ -0,0 +1,426 @@
+@@ -0,0 +1,445 @@
 +package controller
 +
 +import (
@@ -382,13 +381,17 @@ index 000000000..36240579c
 +	}
 +	require.Eventually(t, func() bool { return gopool.WorkerCount() == 0 }, 5*time.Second, time.Millisecond)
 +	for _, tc := range []struct {
-+		name                                          string
-+		allFail, partial, billed, cache, samePriority bool
++		name                                                           string
++		allFail, partial, billed, cache, samePriority, switchOnSuccess bool
++		zeroUsage, toolFailure                                         bool
 +	}{
 +		{name: "failover"}, {name: "all full", allFail: true},
 +		{name: "partial output", partial: true}, {name: "billed failure", billed: true},
 +		{name: "cached failover", cache: true}, {name: "same priority", allFail: true, samePriority: true},
 +		{name: "cached same priority", allFail: true, samePriority: true, cache: true},
++		{name: "switch affinity on success", switchOnSuccess: true},
++		{name: "committed zero usage failure", zeroUsage: true},
++		{name: "committed tool-only failure", toolFailure: true},
 +	} {
 +		t.Run(tc.name, func(t *testing.T) {
 +			db := capacityRelayTestDB(t)
@@ -402,13 +405,17 @@ index 000000000..36240579c
 +			})
 +			affinity := operation_setting.GetChannelAffinitySetting()
 +			savedAffinity := *affinity
-+			affinity.Enabled, affinity.SwitchOnSuccess = true, false
++			affinity.Enabled, affinity.SwitchOnSuccess = true, tc.switchOnSuccess
 +			affinity.Rules = []operation_setting.ChannelAffinityRule{{Name: t.Name(), ModelRegex: []string{".*"}, KeySources: []operation_setting.ChannelAffinityKeySource{{Type: "gjson", Path: "prompt_cache_key"}}}}
 +			t.Cleanup(func() { *affinity = savedAffinity })
 +			savedRatios, err := common.Marshal(ratio_setting.GetModelRatioCopy())
 +			require.NoError(t, err)
 +			require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"capacity-test":1}`))
 +			t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(string(savedRatios))) })
++			if tc.toolFailure {
++				operation_setting.SetToolPriceForTest("capacity_test_tool", 5)
++				t.Cleanup(func() { operation_setting.DeleteToolPriceForTest("capacity_test_tool") })
++			}
 +			service.InitHttpClient()
 +			service.InitTokenEncoders()
 +			savedTimeout := constant.StreamingTimeout
@@ -431,6 +438,10 @@ index 000000000..36240579c
 +						_, _ = io.WriteString(w, capacitySSE(capacityCreated, `{"type":"response.output_text.delta","delta":"hello"}`, capacityFailed))
 +					} else if tc.billed {
 +						_, _ = io.WriteString(w, capacitySSE(capacityCreated, strings.Replace(capacityFailed, `"status":"failed"`, `"status":"failed","usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}`, 1)))
++					} else if tc.zeroUsage {
++						_, _ = io.WriteString(w, capacitySSE(capacityCreated, `{"type":"response.output_item.added","item":{"type":"function_call","name":"capacity_test_tool","call_id":"call1","arguments":""}}`, capacityFailed))
++					} else if tc.toolFailure {
++						_, _ = io.WriteString(w, capacitySSE(capacityCreated, `{"type":"response.output_item.done","item":{"type":"function_call","name":"capacity_test_tool","call_id":"call1","arguments":"{}"}}`, capacityFailed))
 +					} else if id == 3 || tc.allFail {
 +						largeCreated := strings.Replace(capacityCreated, `"usage":null`, `"usage":null,"instructions":"`+strings.Repeat("x", 128<<10)+`"`, 1)
 +						_, _ = io.WriteString(w, capacitySSE(largeCreated, capacityInProgress, capacityEmptyReasoning, capacityFailed))
@@ -477,7 +488,7 @@ index 000000000..36240579c
 +				}
 +				assert.Equal(t, 503, recorder.Code, recorder.Body.String())
 +				assert.NotContains(t, recorder.Body.String(), "data:")
-+			} else if tc.partial || tc.billed {
++			} else if tc.partial || tc.billed || tc.zeroUsage || tc.toolFailure {
 +				assert.Equal(t, []int{3}, attempts)
 +				assert.Equal(t, 200, recorder.Code)
 +				assert.Equal(t, 1, strings.Count(recorder.Body.String(), `"type":"response.failed"`))
@@ -492,7 +503,11 @@ index 000000000..36240579c
 +				request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(requestBody))
 +				request.Header.Set("Content-Type", "application/json")
 +				router.ServeHTTP(recorder, request)
-+				assert.Equal(t, []int{3, 2, 2}, attempts, "next request stays with successful channel")
++				if tc.switchOnSuccess {
++					assert.Equal(t, []int{3, 2, 2}, attempts, "enabled switch keeps the successful channel")
++				} else {
++					assert.Equal(t, []int{3, 2, 3, 2}, attempts, "disabled switch preserves the initial channel")
++				}
 +			}
 +			var logs []model.Log
 +			require.NoError(t, db.Where("type = ?", model.LogTypeError).Find(&logs).Error)
@@ -502,14 +517,17 @@ index 000000000..36240579c
 +			var consumeLogs []model.Log
 +			waitForAsyncBilling()
 +			require.NoError(t, db.Where("type = ?", model.LogTypeConsume).Find(&consumeLogs).Error)
-+			if tc.allFail {
++			if tc.allFail || tc.zeroUsage {
 +				assert.Empty(t, consumeLogs)
++				if tc.zeroUsage {
++					assert.Len(t, logs, 1, "an unbilled failed attempt only records its error")
++				}
 +				var user model.User
 +				require.NoError(t, db.First(&user, 1).Error)
 +				assert.EqualValues(t, 1000000, user.Quota, "fully failed requests refund their precharge")
 +			} else {
 +				expected := 2
-+				if tc.partial || tc.billed {
++				if tc.partial || tc.billed || tc.toolFailure {
 +					expected = 1
 +				}
 +				assert.Len(t, consumeLogs, expected, "settle only completed or committed attempts")
@@ -546,24 +564,19 @@ index 3ed88dc1e..4e57757a0 100644
  
  type ChannelConstraints struct {
 diff --git a/middleware/distributor.go b/middleware/distributor.go
-index 9f0a07426..40f5162d4 100644
+index 9f0a07426..fa84392a6 100644
 --- a/middleware/distributor.go
 +++ b/middleware/distributor.go
-@@ -197,8 +197,12 @@ func Distribute() func(c *gin.Context) {
+@@ -197,7 +197,8 @@ func Distribute() func(c *gin.Context) {
  		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
  		SetupContextForSelectedChannel(c, channel, modelRequest.Model)
  		c.Next()
 -		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest {
--			service.RecordChannelAffinity(c, channel.Id)
 +		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest && !common.GetContextKeyBool(c, constant.ContextKeyResponsesStreamFailed) {
-+			affinityChannelID := channel.Id
-+			if common.GetContextKeyBool(c, constant.ContextKeyResponsesCapacityRetried) {
-+				affinityChannelID = c.GetInt("channel_id")
-+			}
-+			service.RecordChannelAffinity(c, affinityChannelID)
++			// RecordChannelAffinity applies the configured switch-on-success policy.
+ 			service.RecordChannelAffinity(c, channel.Id)
  		}
  	}
- }
 diff --git a/model/ability.go b/model/ability.go
 index ecfcb5c04..b86c442dc 100644
 --- a/model/ability.go
@@ -1211,3 +1224,28 @@ index aec98ce9d..4a34d686e 100644
  		if billingModel := relayInfo.GetBillingModelName(); billingModel != "" && billingModel != relayInfo.OriginModelName {
  			other.SetAdmin("billing_model", billingModel)
  		}
+diff --git a/service/text_quota.go b/service/text_quota.go
+index 83fe6ff3e..3b4194af5 100644
+--- a/service/text_quota.go
++++ b/service/text_quota.go
+@@ -400,13 +400,17 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
+ 	if usage == nil {
+ 		extraContent = append(extraContent, "上游无计费信息")
+ 	}
++	adminRejectReason := common.GetContextKeyString(ctx, constant.ContextKeyAdminRejectReason)
++	summary := calculateTextQuotaSummary(ctx, relayInfo, billingUsage)
++	if common.GetContextKeyBool(ctx, constant.ContextKeyResponsesStreamFailed) && !summary.hasBillableUsage() {
++		// The relay records the failure and refunds the precharge. Do not also
++		// log an empty consumption; real token or tool usage still settles below.
++		return
++	}
+ 	if originUsage != nil {
+ 		ObserveChannelAffinityUsageCacheByRelayFormat(ctx, billingUsage, relayInfo.GetFinalRequestRelayFormat())
+ 	}
+ 
+-	adminRejectReason := common.GetContextKeyString(ctx, constant.ContextKeyAdminRejectReason)
+-	summary := calculateTextQuotaSummary(ctx, relayInfo, billingUsage)
+-
+ 	var tieredResult *billingexpr.TieredResult
+ 	tieredBillingApplied := false
+ 	if originUsage != nil {
