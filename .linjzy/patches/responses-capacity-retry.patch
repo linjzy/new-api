@@ -95,10 +95,10 @@ index 10e69961e..c39997ad0 100644
  	}
 diff --git a/controller/relay_responses_capacity_test.go b/controller/relay_responses_capacity_test.go
 new file mode 100644
-index 000000000..d64771f05
+index 000000000..36240579c
 --- /dev/null
 +++ b/controller/relay_responses_capacity_test.go
-@@ -0,0 +1,420 @@
+@@ -0,0 +1,426 @@
 +package controller
 +
 +import (
@@ -218,8 +218,13 @@ index 000000000..d64771f05
 +		`{"type":"response.content_part.added","part":{"type":"output_text","text":"","annotations":[],"logprobs":[]}}`,
 +		`{"type":"response.reasoning_summary_part.added","part":{"type":"summary_text","text":""}}`,
 +		`{"type":"response.created","response":{"output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0,"input_tokens_details":{"cached_tokens":0}}}}`,
++		strings.Replace(capacityCreated, `"usage":null`, `"usage":null,"instructions":"`+strings.Repeat("x", 128<<10)+`"`, 1),
 +	} {
-+		t.Run(placeholder, func(t *testing.T) {
++		name := placeholder
++		if len(name) > 1024 {
++			name = "large lifecycle metadata"
++		}
++		t.Run(name, func(t *testing.T) {
 +			c, recorder, resp, info := capacityStreamContext(t, io.NopCloser(strings.NewReader(capacitySSE(capacityCreated, placeholder, capacityFailed))))
 +			_, apiErr := openai.OaiResponsesStreamHandler(c, info, resp)
 +			require.NotNil(t, apiErr)
@@ -253,7 +258,7 @@ index 000000000..d64771f05
 +		{"output in failed response", []string{`{"type":"response.failed","response":{"output":[{"type":"function_call","call_id":"call1","name":"run","arguments":"{}"}],"error":{"code":"model_at_capacity"}}}`}, true},
 +		{"encrypted output in failed response", []string{`{"type":"response.failed","response":{"output":[{"type":"reasoning","summary":[],"encrypted_content":"already-produced"}],"error":{"code":"model_at_capacity"}}}`}, true},
 +		{"bounded event count", append(strings.Split(strings.TrimSpace(strings.Repeat(capacityCreated+"\n", 17)), "\n"), capacityFailed), true},
-+		{"bounded bytes", []string{strings.Replace(capacityCreated, "failed-attempt", strings.Repeat("x", 64<<10), 1), capacityFailed}, true},
++		{"bounded bytes", []string{strings.Replace(capacityCreated, "failed-attempt", strings.Repeat("x", 2<<20), 1), capacityFailed}, true},
 +	} {
 +		t.Run(tc.name, func(t *testing.T) {
 +			c, _, resp, info := capacityStreamContext(t, io.NopCloser(strings.NewReader(capacitySSE(tc.events...))))
@@ -427,7 +432,8 @@ index 000000000..d64771f05
 +					} else if tc.billed {
 +						_, _ = io.WriteString(w, capacitySSE(capacityCreated, strings.Replace(capacityFailed, `"status":"failed"`, `"status":"failed","usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}`, 1)))
 +					} else if id == 3 || tc.allFail {
-+						_, _ = io.WriteString(w, capacitySSE(capacityCreated, capacityInProgress, capacityEmptyReasoning, capacityFailed))
++						largeCreated := strings.Replace(capacityCreated, `"usage":null`, `"usage":null,"instructions":"`+strings.Repeat("x", 128<<10)+`"`, 1)
++						_, _ = io.WriteString(w, capacitySSE(largeCreated, capacityInProgress, capacityEmptyReasoning, capacityFailed))
 +					} else {
 +						_, _ = io.WriteString(w, capacitySSE(capacityCompleted))
 +					}
@@ -615,7 +621,7 @@ index 2986cf709..23af71e26 100644
  		if filter.RequestPath == "" {
  			return true
 diff --git a/relay/channel/openai/relay_responses.go b/relay/channel/openai/relay_responses.go
-index 93b2599de..9b16711d8 100644
+index 93b2599de..f29742c4b 100644
 --- a/relay/channel/openai/relay_responses.go
 +++ b/relay/channel/openai/relay_responses.go
 @@ -7,6 +7,7 @@ import (
@@ -626,7 +632,7 @@ index 93b2599de..9b16711d8 100644
  	"github.com/QuantumNous/new-api/logger"
  	relaycommon "github.com/QuantumNous/new-api/relay/common"
  	"github.com/QuantumNous/new-api/relay/helper"
-@@ -76,19 +77,83 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
+@@ -76,19 +77,87 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
  	var responseTextBuilder strings.Builder
  	imageCounter := &relaycommon.ImageGenerationCallCounter{}
  	imageCommitted := false
@@ -636,6 +642,7 @@ index 93b2599de..9b16711d8 100644
 +	preludeBytes := 0
 +	terminalSeen := false
 +	firstOutputEvent := ""
++	firstOutputBytes := 0
 +	info.ResponsesStreamError = nil
 +	info.ResponsesCapacityFailure = false
 +	common.SetContextKey(c, constant.ContextKeyResponsesStreamFailed, false)
@@ -682,7 +689,9 @@ index 93b2599de..9b16711d8 100644
 +		// Empty message/reasoning item and text-part placeholders are also
 +		// initialization. Text, encrypted reasoning, tool and unknown events
 +		// commit immediately; only explicitly empty placeholders can be withheld.
-+		if !c.Writer.Written() && responsesPreludeEvent(streamResponse.Type, data) && len(prelude) < 16 && preludeBytes+len(data) <= 64<<10 {
++		// Codex lifecycle events echo instructions and other large metadata;
++		// created + in_progress can exceed 64 KiB before producing any output.
++		if !c.Writer.Written() && responsesPreludeEvent(streamResponse.Type, data) && len(prelude) < 16 && preludeBytes+len(data) <= 2<<20 {
 +			prelude = append(prelude, streamResponse)
 +			preludeData = append(preludeData, data)
 +			preludeBytes += len(data)
@@ -690,6 +699,7 @@ index 93b2599de..9b16711d8 100644
 +		}
 +		if !c.Writer.Written() {
 +			firstOutputEvent = streamResponse.Type
++			firstOutputBytes = len(data)
 +			helper.StartEventStream(c, resp)
 +			for i, event := range prelude {
 +				if err := helper.ResponseChunkData(c, event, preludeData[i]); err != nil {
@@ -713,7 +723,7 @@ index 93b2599de..9b16711d8 100644
  			if streamResponse.Response != nil {
  				if streamResponse.Response.Usage != nil {
  					incomingUsage := relayconvert.NormalizeResponsesUsage(streamResponse.Response.Usage)
-@@ -113,6 +178,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
+@@ -113,6 +182,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
  				imageCommitted = true
  			}
  		case "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
@@ -721,7 +731,7 @@ index 93b2599de..9b16711d8 100644
  			if !imageCommitted {
  				imageCounter.Reset()
  				imageCounter.Commit(info)
-@@ -137,7 +203,26 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
+@@ -137,7 +207,26 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
  				}
  			}
  		}
@@ -738,7 +748,7 @@ index 93b2599de..9b16711d8 100644
 +		streamErr = types.NewErrorWithStatusCode(fmt.Errorf("%s", message), types.ErrorCodeBadResponse, statusCode, types.ErrOptionWithSkipRetry())
 +	}
 +	if streamErr != nil {
-+		logger.LogWarn(c, fmt.Sprintf("Responses stream failure: committed=%t first_output_event=%q capacity=%t", c.Writer.Written(), firstOutputEvent, info.ResponsesCapacityFailure))
++		logger.LogWarn(c, fmt.Sprintf("Responses stream failure: committed=%t first_output_event=%q first_output_bytes=%d prelude_bytes=%d capacity=%t", c.Writer.Written(), firstOutputEvent, firstOutputBytes, preludeBytes, info.ResponsesCapacityFailure))
 +		info.StreamStatus.SetUpstreamError(streamErr)
 +		info.ResponsesStreamError = streamErr
 +		common.SetContextKey(c, constant.ContextKeyResponsesStreamFailed, true)
@@ -749,7 +759,7 @@ index 93b2599de..9b16711d8 100644
  
  	if usage.CompletionTokens == 0 {
  		// 计算输出文本的 token 数量
-@@ -158,5 +243,181 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
+@@ -158,5 +247,181 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
  		usage.BillingUsage = dto.CloneBillingUsageWithEstimatedCompletion(usage.BillingUsage, usage.CompletionTokens)
  	}
  
