@@ -46,15 +46,18 @@ The workflow does not contain or use production-server credentials.
 
 `responses-capacity-retry.patch` recognizes explicit transient overload/capacity
 errors inside an HTTP 200 Responses SSE stream. It withholds only empty initial
-lifecycle events (at most 16 events / 64 KiB, bounded by the stream timeout) and
+lifecycle, message/reasoning item and text-part placeholders (at most 16 events /
+64 KiB, bounded by the stream timeout) and
 defers SSE headers and pings until output starts. Before output, an unbilled
 capacity failure returns a retryable 503 to the existing relay loop. The loop
 respects `RetryTimes` and channel constraints, excludes attempted channels, and
 updates affinity to the channel that succeeds. Exhaustion preserves the capacity
 error instead of replacing it with a channel-selection error.
 
-Text, reasoning, tool/unknown events, output in a failed response, and reported
-usage all prevent replay. Committed streams preserve the upstream failure event
+Text, populated/encrypted reasoning, tool/unknown events, nonempty output in a
+failed response, and nonzero reported usage all prevent replay. Raw item fields
+are inspected so encrypted content and unknown extensions cannot disappear
+through DTO decoding. Committed streams preserve the upstream failure event
 without appending JSON; partial usage is settled once. Non-capacity failures,
 malformed/truncated streams, and client cancellation do not use this failover.
 Error logs retain `upstream_http_status: 200` and the actual stream failure.
