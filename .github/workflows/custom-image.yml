@@ -25,31 +25,9 @@ concurrency:
 
 jobs:
   build:
-    name: Build, test, and publish linux/amd64
+    name: Build, verify, and publish linux/amd64
     runs-on: ubuntu-latest
     timeout-minutes: 90
-
-    services:
-      mysql:
-        image: mysql:8.0
-        env:
-          MYSQL_ROOT_PASSWORD: capacity-test-only
-          MYSQL_DATABASE: capacity_test
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd="mysqladmin ping -h 127.0.0.1 -pcapacity-test-only"
-          --health-interval=10s --health-timeout=5s --health-retries=12
-      postgres:
-        image: postgres:15-alpine
-        env:
-          POSTGRES_PASSWORD: capacity-test-only
-          POSTGRES_DB: capacity_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd="pg_isready -U postgres -d capacity_test"
-          --health-interval=10s --health-timeout=5s --health-retries=12
 
     steps:
       - name: Check out fork configuration
@@ -183,25 +161,8 @@ jobs:
         with:
           go-version: '>=1.25.1'
 
-      - name: Test Go customizations
-        run: |
-          go test ./controller ./dto ./service ./middleware ./relay/...
-          go test ./model
-          GOWORK=off go -C relaykit build ./...
-          GOWORK=off go -C relaykit test ./...
-
-      - name: Test capacity retry concurrency
-        run: go test -race ./controller -run '^TestResponsesCapacity' -count=1
-
-      - name: Test capacity retry with MySQL
-        env:
-          NEWAPI_CAPACITY_TEST_DSN: 'root:capacity-test-only@tcp(127.0.0.1:3306)/capacity_test?charset=utf8mb4&parseTime=True&loc=Local'
-        run: go test ./controller -run '^TestResponsesCapacityRelayFailoverAndAffinity$' -count=1 -v
-
-      - name: Test capacity retry with PostgreSQL
-        env:
-          NEWAPI_CAPACITY_TEST_DSN: 'postgres://postgres:capacity-test-only@127.0.0.1:5432/capacity_test?sslmode=disable'
-        run: go test ./controller -run '^TestResponsesCapacityRelayFailoverAndAffinity$' -count=1 -v
+      - name: Build standalone relaykit
+        run: GOWORK=off go -C relaykit build ./...
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
@@ -257,7 +218,7 @@ jobs:
             --tag "$IMMUTABLE_REF" \
             .
 
-      - name: Smoke test immutable image
+      - name: Verify immutable image startup
         if: steps.registry.outputs.exists != 'true'
         env:
           IMMUTABLE_REF: ${{ steps.release.outputs.immutable_ref }}

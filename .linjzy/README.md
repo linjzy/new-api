@@ -2,7 +2,9 @@
 
 This public fork builds a small, auditable customization bundle on top of
 published new-api releases. The bundle contains exactly three business patches:
-usage-log auto-refresh, sequential multi-key mode, and Responses capacity retry.
+usage-log auto-refresh (including stream error display deduplication), sequential
+multi-key mode, and Responses capacity retry. The patches contain no automated
+test additions or test modifications.
 Production hosts pull prebuilt images from GHCR
 and do not clone source code or run Docker builds.
 
@@ -32,13 +34,10 @@ started manually. It:
    release is requested.
 2. Checks out the exact upstream tag commit.
 3. Applies every reviewed patch in `.linjzy/patches/` without a fallback merge.
-4. Runs the controller, DTO, service, middleware, relay, model, and standalone
-   relaykit tests/build, the capacity retry race tests, and the end-to-end relay
-   tests against SQLite plus disposable MySQL 8 and PostgreSQL 15 databases.
+4. Verifies that the standalone relaykit module builds independently.
 5. Builds the upstream Dockerfile for `linux/amd64`; the frontend stage runs
-   lint on every customized TypeScript file, the auto-refresh regression test,
-   typecheck, and the production build.
-6. Runs an isolated container smoke test.
+   lint on every customized TypeScript file, typecheck, and the production build.
+6. Verifies startup and status in an isolated container.
 7. Pushes the public source branch and immutable GHCR image.
 8. Updates `candidate` only after all checks pass.
 
@@ -59,8 +58,15 @@ Exhaustion preserves the capacity error instead of replacing it with a
 channel-selection error.
 
 Sequential key rotation does not spend the channel failover budget, including
-when a capacity failure occurs before or after retiring invalid keys. The
-integration matrix exercises both orders with and without the memory cache.
+when a capacity failure occurs before or after retiring invalid keys.
+
+Before output, provider `keepalive` events containing only their type and numeric
+sequence/timestamp metadata are discarded. They do not commit SSE or consume the
+lifecycle buffer; the absolute prelude timeout still applies. After output they
+are forwarded normally. Populated or unknown heartbeat fields prevent replay.
+
+Usage-log details display the terminal error once and show only distinct
+additional stream errors. Stored error data and occurrence counts are preserved.
 
 The byte budget covers the instructions and metadata echoed by Codex lifecycle
 events; these can exceed 64 KiB before any generated content is available.

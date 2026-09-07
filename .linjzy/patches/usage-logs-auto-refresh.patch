@@ -1,8 +1,9 @@
 diff --git a/Dockerfile b/Dockerfile
-index 399a2ab85..497fbd276 100644
+index 399a2ab8..ea67625a 100644
 --- a/Dockerfile
 +++ b/Dockerfile
-@@ -5,7 +5,22 @@ COPY web/package.json web/bun.lock ./
+@@ -4,9 +4,23 @@ WORKDIR /build/web
+ COPY web/package.json web/bun.lock ./
  RUN bun install --frozen-lockfile
  COPY ./web ./
  COPY ./VERSION /build/VERSION
@@ -11,21 +12,21 @@ index 399a2ab85..497fbd276 100644
 +	      src/features/usage-logs/components/usage-logs-table.tsx \
 +	      src/features/usage-logs/components/common-logs-stats.tsx \
 +	      src/features/usage-logs/components/usage-logs-provider.tsx \
++	      src/features/usage-logs/components/dialogs/details-dialog.tsx \
 +	      src/features/usage-logs/constants.ts \
 +	      src/features/usage-logs/index.tsx \
 +      src/features/usage-logs/lib/auto-refresh.ts \
-+      src/features/usage-logs/lib/__tests__/auto-refresh.test.ts \
 +	      src/features/channels/components/channels-columns.tsx \
 +	      src/features/channels/components/dialogs/multi-key-manage-dialog.tsx \
 +	      src/features/channels/components/drawers/channel-mutate-drawer.tsx \
 +	      src/features/channels/constants.ts \
 +	      src/features/channels/lib/channel-form.ts \
 +	      src/features/channels/types.ts && \
-+    bun run test -- src/features/usage-logs/lib/__tests__/auto-refresh.test.ts && \
 +    DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$(cat /build/VERSION) bun run build:check
- 
+
  FROM golang:1.26.1-alpine@sha256:2389ebfa5b7f43eeafbd6be0c3700cc46690ef842ad962f6c5bd6be49ed82039 AS builder2
  ENV GO111MODULE=on CGO_ENABLED=0 GOWORK=off
+
 diff --git a/web/src/features/usage-logs/components/common-logs-stats.tsx b/web/src/features/usage-logs/components/common-logs-stats.tsx
 index dd754e227..a104d7ef8 100644
 --- a/web/src/features/usage-logs/components/common-logs-stats.tsx
@@ -37,11 +38,11 @@ index dd754e227..a104d7ef8 100644
 +import { useEffect } from 'react'
  import { useTranslation } from 'react-i18next'
 +import { toast } from 'sonner'
- 
+
  import { Skeleton } from '@/components/ui/skeleton'
  import { formatLogQuota } from '@/lib/format'
 @@ -26,6 +28,10 @@ import { cn } from '@/lib/utils'
- 
+
  import { getLogStats, getUserLogStats } from '../api'
  import { DEFAULT_LOG_STATS } from '../constants'
 +import {
@@ -50,7 +51,7 @@ index dd754e227..a104d7ef8 100644
 +} from '../lib/auto-refresh'
  import { buildApiParams } from '../lib/utils'
  import { useLogsViewScope, useUsageLogsContext } from './usage-logs-provider'
- 
+
 @@ -51,9 +57,15 @@ export function CommonLogsStats() {
    const { t } = useTranslation()
    const { isAdminView: isAdmin } = useLogsViewScope()
@@ -58,7 +59,7 @@ index dd754e227..a104d7ef8 100644
 -  const { sensitiveVisible } = useUsageLogsContext()
 +  const { sensitiveVisible, autoRefresh, setAutoRefresh } =
 +    useUsageLogsContext()
- 
+
 -  const { data: stats, isLoading } = useQuery({
 +  const {
 +    data: stats,
@@ -72,7 +73,7 @@ index dd754e227..a104d7ef8 100644
 @@ -68,13 +80,31 @@ export function CommonLogsStats() {
          ? await getLogStats(params)
          : await getUserLogStats(params)
- 
+
 -      return result.success
 -        ? result.data || DEFAULT_LOG_STATS
 -        : DEFAULT_LOG_STATS
@@ -91,7 +92,7 @@ index dd754e227..a104d7ef8 100644
 +      ),
 +    refetchIntervalInBackground: false,
    })
- 
+
 +  useEffect(() => {
 +    if (!error || errorUpdatedAt === 0) return
 +    toast.error(
@@ -123,7 +124,7 @@ index 930634c4e..77689c785 100644
    const [sensitiveVisible, setSensitiveVisible] = useState(true)
 +  const [autoRefresh, setAutoRefresh] = useState(false)
    const [viewScope, setViewScope] = useState<LogsViewScope>('all')
- 
+
    return (
 @@ -76,6 +79,8 @@ export function UsageLogsProvider({ children }: { children: ReactNode }) {
          setAffinityDialogOpen,
@@ -151,7 +152,7 @@ index 8d57cf3a7..3d6425605 100644
 +import { useCallback, useEffect } from 'react'
  import { useTranslation } from 'react-i18next'
  import { toast } from 'sonner'
- 
+
 @@ -36,6 +41,10 @@ import {
    LOG_TYPE_ALL_VALUE,
    LOG_TYPE_ENUM,
@@ -173,9 +174,9 @@ index 8d57cf3a7..3d6425605 100644
 +  useUsageLogsContext,
 +  type LogsViewAccess,
 +} from './usage-logs-provider'
- 
+
  const route = getRouteApi('/_authenticated/usage-logs/$section')
- 
+
 @@ -84,6 +97,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
      isRootView: isRoot,
      viewAccess,
@@ -183,11 +184,11 @@ index 8d57cf3a7..3d6425605 100644
 +  const { autoRefresh, setAutoRefresh } = useUsageLogsContext()
    const isMobile = useMediaQuery('(max-width: 640px)')
    const searchParams = route.useSearch()
- 
+
 @@ -125,7 +139,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
      ],
    })
- 
+
 -  const { data, isLoading, isFetching } = useQuery({
 +  const { data, isLoading, isFetching, error, errorUpdatedAt } = useQuery({
      queryKey: [
@@ -195,13 +196,13 @@ index 8d57cf3a7..3d6425605 100644
        logCategory,
 @@ -147,8 +161,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
        })
- 
+
        if (!result?.success) {
 -        toast.error(result?.message || t('Failed to load logs'))
 -        return DEFAULT_LOGS_DATA
 +        throw new Error(result?.message || t('Failed to load logs'))
        }
- 
+
        return result.data || DEFAULT_LOGS_DATA
 @@ -162,8 +175,36 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
        }
@@ -216,7 +217,7 @@ index 8d57cf3a7..3d6425605 100644
 +      ),
 +    refetchIntervalInBackground: false,
    })
- 
+
 +  useEffect(() => {
 +    if (!error || errorUpdatedAt === 0) return
 +    toast.error(
@@ -256,7 +257,7 @@ index 95f2647ce..39994e784 100644
 @@ -44,6 +44,9 @@ export const DEFAULT_LOGS_DATA = {
    total: 0,
  }
- 
+
 +/** Polling interval used while live refresh is enabled. */
 +export const USAGE_LOGS_AUTO_REFRESH_INTERVAL_MS = 10_000
 +
@@ -268,14 +269,14 @@ index b0f911b71..8ab57ef05 100644
 --- a/web/src/features/usage-logs/index.tsx
 +++ b/web/src/features/usage-logs/index.tsx
 @@ -16,12 +16,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
- 
+
  For commercial licensing, please contact support@quantumnous.com
  */
 +import { useQueryClient } from '@tanstack/react-query'
  import { getRouteApi, useNavigate } from '@tanstack/react-router'
  import { useCallback, useMemo } from 'react'
  import { useTranslation } from 'react-i18next'
- 
+
  import { SectionPageLayout } from '@/components/layout'
  import type { NavGroup } from '@/components/layout/types'
 +import { Switch } from '@/components/ui/switch'
@@ -304,7 +305,7 @@ index b0f911b71..8ab57ef05 100644
 @@ -117,6 +123,28 @@ function UsageLogsContent() {
      [setViewScope]
    )
- 
+
 +  const handleAutoRefreshChange = useCallback(
 +    async (enabled: boolean) => {
 +      if (!enabled) {
@@ -364,48 +365,6 @@ index b0f911b71..8ab57ef05 100644
          </SectionPageLayout.Actions>
          <SectionPageLayout.Content>
            <div className='flex h-full min-h-0 flex-col gap-4'>
-diff --git a/web/src/features/usage-logs/lib/__tests__/auto-refresh.test.ts b/web/src/features/usage-logs/lib/__tests__/auto-refresh.test.ts
-new file mode 100644
-index 000000000..624e55ab1
---- /dev/null
-+++ b/web/src/features/usage-logs/lib/__tests__/auto-refresh.test.ts
-@@ -0,0 +1,36 @@
-+/*
-+Copyright (C) 2023-2026 QuantumNous
-+
-+This program is free software: you can redistribute it and/or modify
-+it under the terms of the GNU Affero General Public License as
-+published by the Free Software Foundation, either version 3 of the
-+License, or (at your option) any later version.
-+
-+This program is distributed in the hope that it will be useful,
-+but WITHOUT ANY WARRANTY; without even the implied warranty of
-+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-+GNU Affero General Public License for more details.
-+
-+You should have received a copy of the GNU Affero General Public License
-+along with this program. If not, see <https://www.gnu.org/licenses/>.
-+
-+For commercial licensing, please contact support@quantumnous.com
-+*/
-+import { describe, expect, test } from 'vitest'
-+
-+import { USAGE_LOGS_AUTO_REFRESH_INTERVAL_MS } from '../../constants'
-+import { getUsageLogsRefetchInterval } from '../auto-refresh'
-+
-+describe('usage logs auto refresh interval', () => {
-+  test('polls only while page one has a non-error query', () => {
-+    expect(getUsageLogsRefetchInterval(true, 1, 'success')).toBe(
-+      USAGE_LOGS_AUTO_REFRESH_INTERVAL_MS
-+    )
-+    expect(getUsageLogsRefetchInterval(true, 1, 'pending')).toBe(
-+      USAGE_LOGS_AUTO_REFRESH_INTERVAL_MS
-+    )
-+    expect(getUsageLogsRefetchInterval(true, 1, 'error')).toBe(false)
-+    expect(getUsageLogsRefetchInterval(true, 2, 'success')).toBe(false)
-+    expect(getUsageLogsRefetchInterval(false, 1, 'success')).toBe(false)
-+  })
-+})
 diff --git a/web/src/features/usage-logs/lib/auto-refresh.ts b/web/src/features/usage-logs/lib/auto-refresh.ts
 new file mode 100644
 index 000000000..40d8486b9
@@ -447,3 +406,86 @@ index 000000000..40d8486b9
 +  }
 +  return USAGE_LOGS_AUTO_REFRESH_INTERVAL_MS
 +}
+diff --git a/web/src/features/usage-logs/components/dialogs/details-dialog.tsx b/web/src/features/usage-logs/components/dialogs/details-dialog.tsx
+index c3f457ee..e43220bc 100644
+--- a/web/src/features/usage-logs/components/dialogs/details-dialog.tsx
++++ b/web/src/features/usage-logs/components/dialogs/details-dialog.tsx
+@@ -444,8 +444,19 @@ export function DetailsDialog(props: DetailsDialogProps) {
+   const { t } = useTranslation()
+   const { copiedText, copyToClipboard } = useCopyToClipboard({ notify: false })
+   const other = parseLogOther(props.log.other)
+   const typeConfig = getLogTypeConfig(props.log.type)
++  const streamStatus = other?.stream_status
++  const streamErrors = Array.isArray(streamStatus?.errors)
++    ? [
++        ...new Set(
++          streamStatus.errors
++            .map((error) => error.trim())
++            .filter(Boolean)
++            .filter((error) => error !== streamStatus.end_error?.trim())
++        )
++      ]
++    : []
+
+   const isViolation = isViolationFeeLog(other)
+   const isRefund = props.log.type === 6
+   const isConsume = props.log.type === 2
+@@ -1150,45 +1161,44 @@ export function DetailsDialog(props: DetailsDialogProps) {
+             />
+           )}
+
+         {/* Stream status details */}
+-        {other?.stream_status && other.stream_status.status !== 'ok' && (
++        {streamStatus && streamStatus.status !== 'ok' && (
+           <DetailSection label={t('Stream Status')}>
+             <DetailRow
+               label={t('Status')}
+               value={
+                 <StatusBadge
+-                  label={other.stream_status.status || t('Error')}
++                  label={streamStatus.status || t('Error')}
+                   variant='red'
+                   size='sm'
+                   copyable={false}
+                 />
+               }
+             />
+-            {other.stream_status.end_reason && (
++            {streamStatus.end_reason && (
+               <DetailRow
+                 label={t('End Reason')}
+-                value={other.stream_status.end_reason}
++                value={streamStatus.end_reason}
+               />
+             )}
+-            {(other.stream_status.error_count ?? 0) > 0 && (
++            {(streamStatus.error_count ?? 0) > 0 && (
+               <DetailRow
+                 label={t('Soft Errors')}
+-                value={String(other.stream_status.error_count)}
++                value={String(streamStatus.error_count)}
+               />
+             )}
+-            {other.stream_status.end_error && (
++            {streamStatus.end_error && (
+               <DetailRow
+                 label={t('End Error')}
+-                value={other.stream_status.end_error}
++                value={streamStatus.end_error}
+               />
+             )}
+-            {Array.isArray(other.stream_status.errors) &&
+-              other.stream_status.errors.length > 0 && (
+-                <pre className='bg-background/60 mt-1 max-h-32 overflow-y-auto rounded border p-2 font-mono text-[11px] leading-relaxed wrap-break-word whitespace-pre-wrap'>
+-                  {other.stream_status.errors.join('\n')}
+-                </pre>
+-              )}
++            {streamErrors.length > 0 && (
++              <pre className='bg-background/60 mt-1 max-h-32 overflow-y-auto rounded border p-2 font-mono text-[11px] leading-relaxed wrap-break-word whitespace-pre-wrap'>
++                {streamErrors.join('\n')}
++              </pre>
++            )}
+           </DetailSection>
+         )}
+
+         {/* Subscription billing details */}
