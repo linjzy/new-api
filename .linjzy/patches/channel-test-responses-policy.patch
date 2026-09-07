@@ -1,8 +1,8 @@
 diff --git a/controller/channel-test.go b/controller/channel-test.go
-index b294979d..f87c2a26 100644
+index f8fad94c..0b838214 100644
 --- a/controller/channel-test.go
 +++ b/controller/channel-test.go
-@@ -27,6 +27,7 @@ import (
+@@ -26,6 +26,7 @@ import (
  	"github.com/QuantumNous/new-api/relaykit/dto"
  	"github.com/QuantumNous/new-api/relaykit/types"
  	"github.com/QuantumNous/new-api/service"
@@ -10,7 +10,7 @@ index b294979d..f87c2a26 100644
  	"github.com/QuantumNous/new-api/setting/operation_setting"
  	hosttypes "github.com/QuantumNous/new-api/types"
  
-@@ -53,6 +54,46 @@ func normalizeChannelTestEndpoint(channel *model.Channel, endpointType string) s
+@@ -52,6 +53,46 @@ func normalizeChannelTestEndpoint(channel *model.Channel, endpointType string) s
  	return normalized
  }
  
@@ -25,16 +25,16 @@ index b294979d..f87c2a26 100644
 +	requestPath := "/v1/chat/completions"
 +	lowerModelName := strings.ToLower(modelName)
 +	if strings.Contains(lowerModelName, "rerank") {
-+		requestPath = "/v1/rerank"
++		return "/v1/rerank"
 +	}
 +	if strings.Contains(lowerModelName, "embedding") ||
-+		strings.HasPrefix(modelName, "m3e") ||
-+		strings.Contains(modelName, "bge-") ||
-+		strings.Contains(modelName, "embed") ||
++		strings.HasPrefix(lowerModelName, "m3e") ||
++		strings.Contains(lowerModelName, "bge-") ||
++		strings.Contains(lowerModelName, "embed") ||
 +		(channel != nil && channel.Type == constant.ChannelTypeMokaAI) {
 +		requestPath = "/v1/embeddings"
 +	}
-+	if channel != nil && channel.Type == constant.ChannelTypeVolcEngine && strings.Contains(modelName, "seedream") {
++	if channel != nil && channel.Type == constant.ChannelTypeVolcEngine && strings.Contains(lowerModelName, "seedream") {
 +		requestPath = "/v1/images/generations"
 +	}
 +	if strings.Contains(lowerModelName, "codex") {
@@ -102,10 +102,10 @@ index b294979d..f87c2a26 100644
  	if isStream && constant.EndpointType(endpointType) == constant.EndpointTypeGemini {
 diff --git a/controller/channel_test_endpoint_test.go b/controller/channel_test_endpoint_test.go
 new file mode 100644
-index 00000000..08955d03
+index 00000000..325b3458
 --- /dev/null
 +++ b/controller/channel_test_endpoint_test.go
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,70 @@
 +package controller
 +
 +import (
@@ -138,6 +138,8 @@ index 00000000..08955d03
 +	require.Equal(t, "/v1/responses", resolveChannelTestRequestPath(channel, "gpt-5.6-sol", ""))
 +	require.Equal(t, "/v1/embeddings", resolveChannelTestRequestPath(channel, "text-embedding-3-small", ""))
 +	require.Equal(t, "/v1/rerank", resolveChannelTestRequestPath(channel, "cohere-rerank-v3", ""))
++	require.Equal(t, "/v1/rerank", resolveChannelTestRequestPath(channel, "BAAI/bge-reranker-v2-m3", ""))
++	require.Equal(t, "/v1/embeddings", resolveChannelTestRequestPath(channel, "M3E-base", ""))
 +}
 +
 +func TestResolveChannelTestRequestPathHonorsPassThroughAndExplicitEndpoint(t *testing.T) {

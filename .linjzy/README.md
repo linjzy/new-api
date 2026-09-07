@@ -56,6 +56,10 @@ attempted channels. Affinity changes to the successful channel only when
 Exhaustion preserves the capacity error instead of replacing it with a
 channel-selection error.
 
+Sequential key rotation does not spend the channel failover budget, including
+when a capacity failure occurs before or after retiring invalid keys. The
+integration matrix exercises both orders with and without the memory cache.
+
 The byte budget covers the instructions and metadata echoed by Codex lifecycle
 events; these can exceed 64 KiB before any generated content is available.
 
@@ -69,11 +73,25 @@ without a duplicate zero-usage consume log. Non-capacity failures,
 malformed/truncated streams, and client cancellation do not use this failover.
 Error logs retain `upstream_http_status: 200` and the actual stream failure.
 
+Replay checks inspect raw usage, including detail-only counts and unknown
+provider billing fields, even when the shared DTO has no token total. Usage
+snapshots from earlier lifecycle events are retained if a final failure omits
+usage. This prevents replaying upstream work and losing previously reported
+usage.
+
 Production needs an enabled alternative channel for the same model/group and
 automatic retries enabled. No database migration or configuration change is
 required for this patch. Rollback uses the prior immutable app image digest.
 
 ## Upstream test fixes
+
+`security-sqlite-test-config.patch` aligns the account-security SQLite
+test fixture with the application's WAL, busy-timeout and immediate-transaction
+settings while preserving other audit fixtures' transaction modes. The default
+deferred transactions could intermittently fail the
+concurrent account deletion test with `SQLITE_BUSY`, leaving neither request
+successful. The workflow repeats the unchanged one-winner regression 20 times;
+the fix changes no production database configuration or authentication code.
 
 `task-plugin-model-drift-test.patch` makes the final task decoder regression
 test independent of JavaScript runtime reuse. The test uses an injected host
@@ -83,3 +101,12 @@ unreliable because the engine's `sync.Pool` may return a fresh runtime.
 The patch preserves the HTTP 400 and pinned-model rejection assertions and
 changes no production code. It is included in the patch hash so builds use a
 new immutable source branch and image instead of reusing an older test tree.
+
+## Channel test endpoint selection
+
+`channel-test-responses-policy.patch` keeps explicit endpoints and passthrough
+settings authoritative while applying the global Responses compatibility
+policy to automatically detected chat models. Rerank detection precedes the
+generic BGE embedding match, and model-family detection is case-insensitive.
+This keeps `BAAI/bge-reranker-v2-m3` on `/v1/rerank` and uppercase embedding
+families on `/v1/embeddings`.

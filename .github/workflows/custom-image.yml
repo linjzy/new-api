@@ -105,7 +105,8 @@ jobs:
               .linjzy/patches/channel-test-responses-policy.patch \
               .linjzy/patches/sequential-key-mode.patch \
               .linjzy/patches/task-plugin-model-drift-test.patch \
-              .linjzy/patches/responses-capacity-retry.patch |
+              .linjzy/patches/responses-capacity-retry.patch \
+              .linjzy/patches/security-sqlite-test-config.patch |
               awk '{print $1}' |
               sha256sum |
               awk '{print $1}'
@@ -194,6 +195,9 @@ jobs:
 
       - name: Test capacity retry concurrency
         run: go test -race ./controller -run '^TestResponsesCapacity' -count=1
+
+      - name: Verify concurrent security proof consumption with SQLite
+        run: go test ./controller -run '^TestSecurityAccountDeletionConcurrentRequestsHaveOneWinner$' -count=20
 
       - name: Test capacity retry with MySQL
         env:

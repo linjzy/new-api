@@ -1,5 +1,5 @@
 diff --git a/constant/context_key.go b/constant/context_key.go
-index 994e65751..e7af897ef 100644
+index 994e6575..e7af897e 100644
 --- a/constant/context_key.go
 +++ b/constant/context_key.go
 @@ -66,8 +66,10 @@ const (
@@ -16,7 +16,7 @@ index 994e65751..e7af897ef 100644
  	// ContextKeyAuditLogged marks that the current request has already recorded
  	// a manage/operation audit log inside the handler. When set, the admin-audit
 diff --git a/controller/relay.go b/controller/relay.go
-index 10e69961e..320473bb5 100644
+index 10e69961..68e45820 100644
 --- a/controller/relay.go
 +++ b/controller/relay.go
 @@ -94,6 +94,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
@@ -31,14 +31,15 @@ index 10e69961e..320473bb5 100644
  			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
  			switch relayFormat {
  			case types.RelayFormatOpenAIRealtime:
-@@ -192,16 +197,25 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+@@ -192,16 +197,29 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
  	}
  	relayInfo.RetryIndex = 0
  	relayInfo.LastError = nil
-+	capacityAttempts := 0
++	channelAttempts := 0
  
  	for ; retryParam.GetRetry() <= common.RetryTimes || retryParam.HasSequentialChannel(); retryParam.IncreaseRetry() {
-+		if common.GetContextKeyBool(c, constant.ContextKeyResponsesCapacityRetried) && capacityAttempts > common.RetryTimes {
++		sequentialRetry := retryParam.HasSequentialChannel()
++		if !sequentialRetry && common.GetContextKeyBool(c, constant.ContextKeyResponsesCapacityRetried) && channelAttempts > common.RetryTimes {
 +			break
 +		}
  		relayInfo.RetryIndex = retryParam.GetRetry()
@@ -53,11 +54,14 @@ index 10e69961e..320473bb5 100644
  			break
  		}
  		addUsedChannel(c, channel.Id)
-+		capacityAttempts++
++		// Same-channel key rotation does not spend the channel failover budget.
++		if !sequentialRetry {
++			channelAttempts++
++		}
  		if billingErr := service.PrepareTieredBillingForSelectedGroup(c, relayInfo); billingErr != nil {
  			newAPIError = billingErr
  			break
-@@ -232,11 +246,15 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+@@ -232,11 +250,15 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
  
  		if newAPIError == nil {
  			relayInfo.LastError = nil
@@ -73,7 +77,7 @@ index 10e69961e..320473bb5 100644
  
  		// On the first attempt getChannel intentionally returns a lightweight
  		// placeholder because the distributor already selected the channel. Use
-@@ -260,7 +278,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+@@ -260,7 +282,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
  		// the next attempt to the same channel. Pinning suppresses the loop's next
  		// retry increment, so every enabled key is tried without consuming the
  		// normal channel retry budget.
@@ -82,7 +86,7 @@ index 10e69961e..320473bb5 100644
  			service.ShouldDisableChannelForChannel(channelForError, newAPIError) &&
  			sequentialKeyDisabled && sequentialKeyAvailable(channelForError.Id) {
  			retryParam.SetSequentialChannel(channelForError.Id)
-@@ -427,6 +445,9 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
+@@ -427,6 +449,9 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
  	if openaiErr == nil {
  		return false
  	}
@@ -94,10 +98,10 @@ index 10e69961e..320473bb5 100644
  	}
 diff --git a/controller/relay_responses_capacity_test.go b/controller/relay_responses_capacity_test.go
 new file mode 100644
-index 000000000..6ff6961a0
+index 00000000..cf8f3420
 --- /dev/null
 +++ b/controller/relay_responses_capacity_test.go
-@@ -0,0 +1,445 @@
+@@ -0,0 +1,513 @@
 +package controller
 +
 +import (
@@ -245,6 +249,35 @@ index 000000000..6ff6961a0
 +	assert.Contains(t, recorder.Body.String(), event)
 +}
 +
++func TestResponsesCapacityReportedWorkPreventsReplay(t *testing.T) {
++	for _, usage := range []string{
++		`{"input_tokens_details":{"cached_tokens":5}}`,
++		`{"output_tokens_details":{"reasoning_tokens":3}}`,
++		`{"provider_billable_units":1}`,
++	} {
++		t.Run(usage, func(t *testing.T) {
++			event := strings.Replace(capacityFailed, `"status":"failed"`, `"status":"failed","usage":`+usage, 1)
++			c, recorder, resp, info := capacityStreamContext(t, io.NopCloser(strings.NewReader(capacitySSE(capacityCreated, event))))
++			_, apiErr := openai.OaiResponsesStreamHandler(c, info, resp)
++			require.NotNil(t, apiErr)
++			assert.True(t, c.Writer.Written(), "reported upstream work must prevent replay even without a token total")
++			assert.False(t, shouldRetry(c, apiErr, 2))
++			assert.Contains(t, recorder.Body.String(), event)
++		})
++	}
++}
++
++func TestResponsesCapacityPreservesEarlierUsageSnapshot(t *testing.T) {
++	progress := `{"type":"response.in_progress","response":{"usage":{"input_tokens":10,"output_tokens":0,"total_tokens":10}}}`
++	c, recorder, resp, info := capacityStreamContext(t, io.NopCloser(strings.NewReader(capacitySSE(capacityCreated, progress, capacityFailed))))
++	usage, apiErr := openai.OaiResponsesStreamHandler(c, info, resp)
++	require.NotNil(t, apiErr)
++	assert.Equal(t, 10, usage.PromptTokens)
++	assert.Equal(t, 10, usage.TotalTokens)
++	assert.False(t, shouldRetry(c, apiErr, 2))
++	assert.Contains(t, recorder.Body.String(), capacityFailed)
++}
++
 +func TestResponsesCapacityStreamBoundaries(t *testing.T) {
 +	for _, tc := range []struct {
 +		name    string
@@ -380,10 +413,18 @@ index 000000000..6ff6961a0
 +		return
 +	}
 +	require.Eventually(t, func() bool { return gopool.WorkerCount() == 0 }, 5*time.Second, time.Millisecond)
++	// Sequential key retirement initializes the notification limiter's
++	// long-lived cleanup worker. Keep that stable worker out of billing waits.
++	savedRedis := common.RedisEnabled
++	common.RedisEnabled = false
++	t.Cleanup(func() { common.RedisEnabled = savedRedis })
++	_, err := service.CheckNotificationLimit(0, "capacity-test-fixture")
++	require.NoError(t, err)
++	backgroundWorkers := gopool.WorkerCount()
 +	for _, tc := range []struct {
 +		name                                                           string
 +		allFail, partial, billed, cache, samePriority, switchOnSuccess bool
-+		zeroUsage, toolFailure                                         bool
++		zeroUsage, toolFailure, sequential, afterCapacity              bool
 +	}{
 +		{name: "failover"}, {name: "all full", allFail: true},
 +		{name: "partial output", partial: true}, {name: "billed failure", billed: true},
@@ -392,6 +433,10 @@ index 000000000..6ff6961a0
 +		{name: "switch affinity on success", switchOnSuccess: true},
 +		{name: "committed zero usage failure", zeroUsage: true},
 +		{name: "committed tool-only failure", toolFailure: true},
++		{name: "sequential keys preserve failover budget", sequential: true},
++		{name: "cached sequential keys preserve failover budget", sequential: true, cache: true},
++		{name: "sequential keys after capacity failure", sequential: true, afterCapacity: true},
++		{name: "cached sequential keys after capacity failure", sequential: true, afterCapacity: true, cache: true},
 +	} {
 +		t.Run(tc.name, func(t *testing.T) {
 +			db := capacityRelayTestDB(t)
@@ -423,6 +468,10 @@ index 000000000..6ff6961a0
 +			t.Cleanup(func() { constant.StreamingTimeout = savedTimeout })
 +			var attempts []int
 +			var attemptsMu sync.Mutex
++			sequentialChannelID := 3
++			if tc.afterCapacity {
++				sequentialChannelID = 2
++			}
 +			for id := 1; id <= 3; id++ {
 +				id := id
 +				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -432,6 +481,12 @@ index 000000000..6ff6961a0
 +					body, err := io.ReadAll(r.Body)
 +					require.NoError(t, err)
 +					assert.Contains(t, string(body), `"model":"capacity-test"`)
++					if tc.sequential && id == sequentialChannelID && r.Header.Get("Authorization") != "Bearer test-only" {
++						w.Header().Set("Content-Type", "application/json")
++						w.WriteHeader(http.StatusUnauthorized)
++						_, _ = io.WriteString(w, `{"error":{"code":"invalid_api_key","message":"invalid test key"}}`)
++						return
++					}
 +					w.Header().Set("Content-Type", "text/event-stream")
 +					w.Header().Set("X-Codex-Turn-State", fmt.Sprint("state-", id))
 +					if tc.partial {
@@ -456,6 +511,11 @@ index 000000000..6ff6961a0
 +				}
 +				autoBan := 0
 +				channel := model.Channel{Id: id, Type: constant.ChannelTypeNewAPI, Name: fmt.Sprint("capacity-", id), Key: "test-only", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, Models: "capacity-test", Group: "default", Priority: &priority, AutoBan: &autoBan}
++				if tc.sequential && id == sequentialChannelID {
++					autoBan = 1
++					channel.Key = "invalid-first\ninvalid-second\ntest-only"
++					channel.ChannelInfo = model.ChannelInfo{IsMultiKey: true, MultiKeySize: 3, MultiKeyMode: constant.MultiKeyModeSequential}
++				}
 +				require.NoError(t, channel.Insert())
 +			}
 +			model.InitChannelCache()
@@ -471,7 +531,7 @@ index 000000000..6ff6961a0
 +			}, middleware.Distribute())
 +			router.POST("/v1/responses", func(c *gin.Context) { Relay(c, types.RelayFormatOpenAIResponses) })
 +			waitForAsyncBilling := func() {
-+				require.Eventually(t, func() bool { return gopool.WorkerCount() == 0 }, 5*time.Second, time.Millisecond,
++				require.Eventually(t, func() bool { return gopool.WorkerCount() == backgroundWorkers }, 5*time.Second, time.Millisecond,
 +					"finish asynchronous refunds and metrics before replacing shared test state")
 +			}
 +			t.Cleanup(waitForAsyncBilling)
@@ -494,7 +554,14 @@ index 000000000..6ff6961a0
 +				assert.Equal(t, 1, strings.Count(recorder.Body.String(), `"type":"response.failed"`))
 +				assert.True(t, strings.HasSuffix(recorder.Body.String(), "\n\n"), "do not append JSON after SSE")
 +			} else {
-+				assert.Equal(t, []int{3, 2}, attempts)
++				expectedAttempts := []int{3, 2}
++				if tc.sequential {
++					expectedAttempts = []int{3, 3, 3, 2}
++					if tc.afterCapacity {
++						expectedAttempts = []int{3, 2, 2, 2}
++					}
++				}
++				assert.Equal(t, expectedAttempts, attempts)
 +				assert.Equal(t, 200, recorder.Code, recorder.Body.String())
 +				assert.Contains(t, recorder.Body.String(), "successful-attempt")
 +				assert.NotContains(t, recorder.Body.String(), "failed-attempt")
@@ -506,14 +573,19 @@ index 000000000..6ff6961a0
 +				if tc.switchOnSuccess {
 +					assert.Equal(t, []int{3, 2, 2}, attempts, "enabled switch keeps the successful channel")
 +				} else {
-+					assert.Equal(t, []int{3, 2, 3, 2}, attempts, "disabled switch preserves the initial channel")
++					assert.Equal(t, append(expectedAttempts, 3, 2), attempts, "disabled switch preserves the initial channel")
 +				}
 +			}
 +			var logs []model.Log
 +			require.NoError(t, db.Where("type = ?", model.LogTypeError).Find(&logs).Error)
 +			require.NotEmpty(t, logs)
-+			assert.Contains(t, logs[0].Other, `"upstream_http_status":200`)
-+			assert.Contains(t, logs[0].Other, `"status":"error"`)
++			capacityLogIndex := 0
++			if tc.sequential && !tc.afterCapacity {
++				capacityLogIndex = 2
++			}
++			require.Greater(t, len(logs), capacityLogIndex)
++			assert.Contains(t, logs[capacityLogIndex].Other, `"upstream_http_status":200`)
++			assert.Contains(t, logs[capacityLogIndex].Other, `"status":"error"`)
 +			var consumeLogs []model.Log
 +			waitForAsyncBilling()
 +			require.NoError(t, db.Where("type = ?", model.LogTypeConsume).Find(&consumeLogs).Error)
@@ -544,7 +616,7 @@ index 000000000..6ff6961a0
 +	}
 +}
 diff --git a/dto/channel_constraints.go b/dto/channel_constraints.go
-index 3ed88dc1e..4e57757a0 100644
+index 3ed88dc1..4e57757a 100644
 --- a/dto/channel_constraints.go
 +++ b/dto/channel_constraints.go
 @@ -38,6 +38,7 @@ type ChannelFilterKind string
@@ -564,7 +636,7 @@ index 3ed88dc1e..4e57757a0 100644
  
  type ChannelConstraints struct {
 diff --git a/middleware/distributor.go b/middleware/distributor.go
-index 9f0a07426..fa84392a6 100644
+index 9f0a0742..fa84392a 100644
 --- a/middleware/distributor.go
 +++ b/middleware/distributor.go
 @@ -197,7 +197,8 @@ func Distribute() func(c *gin.Context) {
@@ -578,7 +650,7 @@ index 9f0a07426..fa84392a6 100644
  		}
  	}
 diff --git a/model/ability.go b/model/ability.go
-index ecfcb5c04..b86c442dc 100644
+index ecfcb5c0..b86c442d 100644
 --- a/model/ability.go
 +++ b/model/ability.go
 @@ -165,7 +165,8 @@ func GetChannel(
@@ -604,7 +676,7 @@ index ecfcb5c04..b86c442dc 100644
  			return nil
  		}
 diff --git a/model/channel_constraint.go b/model/channel_constraint.go
-index 2986cf709..23af71e26 100644
+index 2986cf70..23af71e2 100644
 --- a/model/channel_constraint.go
 +++ b/model/channel_constraint.go
 @@ -8,13 +8,14 @@ import (
@@ -634,7 +706,7 @@ index 2986cf709..23af71e26 100644
  		if filter.RequestPath == "" {
  			return true
 diff --git a/relay/channel/openai/relay_responses.go b/relay/channel/openai/relay_responses.go
-index 93b2599de..f29742c4b 100644
+index 93b2599d..db6fc31f 100644
 --- a/relay/channel/openai/relay_responses.go
 +++ b/relay/channel/openai/relay_responses.go
 @@ -7,6 +7,7 @@ import (
@@ -645,7 +717,7 @@ index 93b2599de..f29742c4b 100644
  	"github.com/QuantumNous/new-api/logger"
  	relaycommon "github.com/QuantumNous/new-api/relay/common"
  	"github.com/QuantumNous/new-api/relay/helper"
-@@ -76,19 +77,87 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
+@@ -76,24 +77,89 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
  	var responseTextBuilder strings.Builder
  	imageCounter := &relaycommon.ImageGenerationCallCounter{}
  	imageCommitted := false
@@ -672,18 +744,19 @@ index 93b2599de..f29742c4b 100644
 +			sr.Stop(streamErr)
 +			return
 +		}
++		// Preserve cumulative usage even when the terminal failure omits it.
++		if streamResponse.Response != nil && streamResponse.Response.Usage != nil {
++			usage = dto.MergeUsageNonZero(usage, relayconvert.NormalizeResponsesUsage(streamResponse.Response.Usage))
++		}
 +		failure, capacityFailure := responsesStreamFailure(streamResponse)
 +		if failure != nil {
 +			terminalSeen = true
 +			streamErr = failure
 +			info.ResponsesCapacityFailure = capacityFailure
-+			if streamResponse.Response != nil && streamResponse.Response.Usage != nil {
-+				usage = dto.MergeUsageNonZero(usage, relayconvert.NormalizeResponsesUsage(streamResponse.Response.Usage))
-+			}
 +			// A billed response may have executed upstream work, even if no delta
 +			// reached us. Commit it and preserve its usage instead of replaying it.
-+			hasOutput := responsesFailureHasOutput(streamResponse, data)
-+			if c.Writer.Written() || usage.TotalTokens > 0 || hasOutput {
++			hasWork := responsesFailureHasWork(data)
++			if c.Writer.Written() || usage.TotalTokens > 0 || hasWork {
 +				if !c.Writer.Written() {
 +					helper.StartEventStream(c, resp)
 +					for i, event := range prelude {
@@ -734,9 +807,14 @@ index 93b2599de..f29742c4b 100644
  		case "response.completed", "response.done":
 +			terminalSeen = true
  			if streamResponse.Response != nil {
- 				if streamResponse.Response.Usage != nil {
- 					incomingUsage := relayconvert.NormalizeResponsesUsage(streamResponse.Response.Usage)
-@@ -113,6 +182,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
+-				if streamResponse.Response.Usage != nil {
+-					incomingUsage := relayconvert.NormalizeResponsesUsage(streamResponse.Response.Usage)
+-					usage = dto.MergeUsageNonZero(usage, incomingUsage)
+-				}
+ 				if !imageCommitted {
+ 					if relaycommon.IsNonBillableResponsesStatus(streamResponse.Response.Status) {
+ 						imageCounter.Reset()
+@@ -113,6 +179,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
  				imageCommitted = true
  			}
  		case "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
@@ -744,7 +822,7 @@ index 93b2599de..f29742c4b 100644
  			if !imageCommitted {
  				imageCounter.Reset()
  				imageCounter.Commit(info)
-@@ -137,7 +207,26 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
+@@ -137,7 +204,26 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
  				}
  			}
  		}
@@ -772,7 +850,7 @@ index 93b2599de..f29742c4b 100644
  
  	if usage.CompletionTokens == 0 {
  		// 计算输出文本的 token 数量
-@@ -158,5 +247,181 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
+@@ -158,5 +244,183 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
  		usage.BillingUsage = dto.CloneBillingUsageWithEstimatedCompletion(usage.BillingUsage, usage.CompletionTokens)
  	}
  
@@ -804,16 +882,18 @@ index 93b2599de..f29742c4b 100644
 +	}
 +}
 +
-+func responsesFailureHasOutput(event dto.ResponsesStreamResponse, data string) bool {
-+	if event.Response == nil || len(event.Response.Output) == 0 {
-+		return false
-+	}
++func responsesFailureHasWork(data string) bool {
 +	var raw map[string]any
 +	if common.UnmarshalJsonStr(data, &raw) != nil {
 +		return true
 +	}
++	if raw["response"] == nil {
++		return false
++	}
 +	response, ok := raw["response"].(map[string]any)
-+	return !ok || !responsesEmptyOutput(response["output"])
++	// A provider may report detail-only usage or new billable fields that the
++	// shared DTO does not retain. Only an explicitly empty usage is replayable.
++	return !ok || !responsesZeroValue(response["usage"]) || !responsesEmptyOutput(response["output"])
 +}
 +
 +func responsesEmptyOutput(value any) bool {
@@ -956,7 +1036,7 @@ index 93b2599de..f29742c4b 100644
 +	return types.WithOpenAIError(*upstreamError, http.StatusBadGateway, types.ErrOptionWithSkipRetry()), false
  }
 diff --git a/relay/common/relay_info.go b/relay/common/relay_info.go
-index e02559754..3e664ed4d 100644
+index e0255975..3e664ed4 100644
 --- a/relay/common/relay_info.go
 +++ b/relay/common/relay_info.go
 @@ -187,6 +187,9 @@ type RelayInfo struct {
@@ -970,7 +1050,7 @@ index e02559754..3e664ed4d 100644
  	// convOptions caches the converter settings snapshot (see ConvOptions).
  	convOptions *convmeta.Options
 diff --git a/relay/common/stream_status.go b/relay/common/stream_status.go
-index 4734b2640..f10cd901d 100644
+index 4734b264..f10cd901 100644
 --- a/relay/common/stream_status.go
 +++ b/relay/common/stream_status.go
 @@ -10,15 +10,16 @@ import (
@@ -1022,7 +1102,7 @@ index 4734b2640..f10cd901d 100644
  	if s == nil {
  		return false
 diff --git a/relay/helper/stream_scanner.go b/relay/helper/stream_scanner.go
-index f88bef520..bb072d4fb 100644
+index f88bef52..bb072d4f 100644
 --- a/relay/helper/stream_scanner.go
 +++ b/relay/helper/stream_scanner.go
 @@ -74,7 +74,17 @@ func ExtendWriteDeadline(c *gin.Context) {
@@ -1122,7 +1202,7 @@ index f88bef520..bb072d4fb 100644
  
  	cleanup()
 diff --git a/relay/responses_handler.go b/relay/responses_handler.go
-index 698f6eef6..f1bf25245 100644
+index 698f6eef..f1bf2524 100644
 --- a/relay/responses_handler.go
 +++ b/relay/responses_handler.go
 @@ -20,6 +20,8 @@ import (
@@ -1147,7 +1227,7 @@ index 698f6eef6..f1bf25245 100644
  		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
  		return newAPIError
 diff --git a/relaykit/dto/openai_response.go b/relaykit/dto/openai_response.go
-index 6ab5c6fcf..1d37c6ac5 100644
+index 6ab5c6fc..1d37c6ac 100644
 --- a/relaykit/dto/openai_response.go
 +++ b/relaykit/dto/openai_response.go
 @@ -517,6 +517,7 @@ const (
@@ -1159,7 +1239,7 @@ index 6ab5c6fcf..1d37c6ac5 100644
  	Message         string                   `json:"message,omitempty"`
  	Param           string                   `json:"param,omitempty"`
 diff --git a/service/channel_select.go b/service/channel_select.go
-index 7f623eadf..b14e751b8 100644
+index 7f623ead..b14e751b 100644
 --- a/service/channel_select.go
 +++ b/service/channel_select.go
 @@ -2,6 +2,7 @@ package service
@@ -1210,7 +1290,7 @@ index 7f623eadf..b14e751b8 100644
  		)
  		if err != nil {
 diff --git a/service/log_info_generate.go b/service/log_info_generate.go
-index aec98ce9d..4a34d686e 100644
+index aec98ce9..4a34d686 100644
 --- a/service/log_info_generate.go
 +++ b/service/log_info_generate.go
 @@ -73,6 +73,10 @@ func AppendRelayLogAdminInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo,
@@ -1225,7 +1305,7 @@ index aec98ce9d..4a34d686e 100644
  			other.SetAdmin("billing_model", billingModel)
  		}
 diff --git a/service/text_quota.go b/service/text_quota.go
-index 83fe6ff3e..3b4194af5 100644
+index 83fe6ff3..3b4194af 100644
 --- a/service/text_quota.go
 +++ b/service/text_quota.go
 @@ -400,13 +400,17 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us

@@ -1,0 +1,39 @@
+diff --git a/controller/access_token_audit_test.go b/controller/access_token_audit_test.go
+index f5057820..7e7cf423 100644
+--- a/controller/access_token_audit_test.go
++++ b/controller/access_token_audit_test.go
+@@ -433,11 +433,15 @@ func (releasedAuditLog) TableName() string { return "logs" }
+ 
+ // External tests create a new database per case on a loopback-only disposable
+ // instance. They never drop databases or tables supplied through an environment variable.
+-func newAuditTestDatabase(t *testing.T, kind, dsn string) (*gorm.DB, string) {
++func newAuditTestDatabase(t *testing.T, kind, dsn string, sqliteOptions ...string) (*gorm.DB, string) {
+ 	t.Helper()
+ 	if kind == "sqlite" {
+ 		path := t.TempDir() + "/audit.db"
+-		db, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
++		sqliteDSN := path
++		if len(sqliteOptions) > 0 {
++			sqliteDSN += "?" + strings.Join(sqliteOptions, "&")
++		}
++		db, err := gorm.Open(sqlite.Open(sqliteDSN), &gorm.Config{})
+ 		require.NoError(t, err)
+ 		return db, path
+ 	}
+diff --git a/controller/security_enrollment_test.go b/controller/security_enrollment_test.go
+index 8437834a..7bc15c41 100644
+--- a/controller/security_enrollment_test.go
++++ b/controller/security_enrollment_test.go
+@@ -53,7 +53,11 @@ func setupSecurityEnrollmentTest(t *testing.T) (*model.User, service.AuthIdentit
+ 		dialect = "sqlite"
+ 	}
+ 	dsn := os.Getenv("TEST_" + strings.ToUpper(dialect) + "_DSN")
+-	db, _ := newAuditTestDatabase(t, dialect, dsn)
++	// Security proof consumption and account deletion need the same SQLite
++	// transaction settings as production, without changing other audit fixtures
++	// that deliberately coordinate concurrent deferred snapshots.
++	db, _ := newAuditTestDatabase(t, dialect, dsn,
++		"_pragma=busy_timeout(30000)", "_pragma=journal_mode(WAL)", "_txlock=immediate")
+ 	logDB, _ := newAuditTestDatabase(t, dialect, dsn)
+ 	db.Logger = logger.Default.LogMode(logger.Silent)
+ 	logDB.Logger = logger.Default.LogMode(logger.Silent)
