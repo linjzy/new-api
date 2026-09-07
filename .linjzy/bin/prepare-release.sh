@@ -6,11 +6,8 @@ RELEASE_TAG="${2:?release tag is required}"
 UPSTREAM_COMMIT="${3:?upstream commit is required}"
 SOURCE_REF="${4:?source ref is required}"
 USAGE_PATCH_FILE="${5:-$SOURCE_DIR/.linjzy/patches/usage-logs-auto-refresh.patch}"
-CHANNEL_TEST_PATCH_FILE="${6:-$SOURCE_DIR/.linjzy/patches/channel-test-responses-policy.patch}"
-SEQUENTIAL_PATCH_FILE="${7:-$SOURCE_DIR/.linjzy/patches/sequential-key-mode.patch}"
-TASK_PLUGIN_TEST_PATCH_FILE="${8:-$SOURCE_DIR/.linjzy/patches/task-plugin-model-drift-test.patch}"
-RESPONSES_CAPACITY_PATCH_FILE="${9:-$SOURCE_DIR/.linjzy/patches/responses-capacity-retry.patch}"
-SECURITY_SQLITE_TEST_PATCH_FILE="${10:-$SOURCE_DIR/.linjzy/patches/security-sqlite-test-config.patch}"
+SEQUENTIAL_PATCH_FILE="${6:-$SOURCE_DIR/.linjzy/patches/sequential-key-mode.patch}"
+RESPONSES_CAPACITY_PATCH_FILE="${7:-$SOURCE_DIR/.linjzy/patches/responses-capacity-retry.patch}"
 
 log() {
   printf '[prepare-release] %s\n' "$*"
@@ -33,14 +30,6 @@ usage_customization_present() {
       "$SOURCE_DIR/web/src/features/usage-logs/components/usage-logs-table.tsx" &&
     grep -q 'USAGE_LOGS_AUTO_REFRESH_ERROR_TOAST_ID' \
       "$SOURCE_DIR/web/src/features/usage-logs/components/common-logs-stats.tsx"
-}
-
-channel_test_customization_present() {
-  grep -q 'ShouldChatCompletionsUseResponsesGlobal' \
-    "$SOURCE_DIR/controller/channel-test.go" &&
-    [[ -f "$SOURCE_DIR/controller/channel_test_endpoint_test.go" ]] &&
-    grep -q 'TestResolveChannelTestRequestPathUsesResponsesCompatibilityPolicyForChat' \
-      "$SOURCE_DIR/controller/channel_test_endpoint_test.go"
 }
 
 sequential_customization_present() {
@@ -74,18 +63,8 @@ sequential_customization_present() {
       "$SOURCE_DIR/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx"
 }
 
-task_plugin_test_customization_present() {
-  git -C "$SOURCE_DIR" apply --reverse --check "$TASK_PLUGIN_TEST_PATCH_FILE" \
-    >/dev/null 2>&1
-}
-
 responses_capacity_customization_present() {
   git -C "$SOURCE_DIR" apply --reverse --check "$RESPONSES_CAPACITY_PATCH_FILE" \
-    >/dev/null 2>&1
-}
-
-security_sqlite_test_customization_present() {
-  git -C "$SOURCE_DIR" apply --reverse --check "$SECURITY_SQLITE_TEST_PATCH_FILE" \
     >/dev/null 2>&1
 }
 
@@ -109,11 +88,8 @@ apply_customization() {
 git -C "$SOURCE_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
   die "source directory is not a Git checkout"
 [[ -f "$USAGE_PATCH_FILE" ]] || die "customization patch not found: $USAGE_PATCH_FILE"
-[[ -f "$CHANNEL_TEST_PATCH_FILE" ]] || die "customization patch not found: $CHANNEL_TEST_PATCH_FILE"
 [[ -f "$SEQUENTIAL_PATCH_FILE" ]] || die "customization patch not found: $SEQUENTIAL_PATCH_FILE"
-[[ -f "$TASK_PLUGIN_TEST_PATCH_FILE" ]] || die "customization patch not found: $TASK_PLUGIN_TEST_PATCH_FILE"
 [[ -f "$RESPONSES_CAPACITY_PATCH_FILE" ]] || die "customization patch not found: $RESPONSES_CAPACITY_PATCH_FILE"
-[[ -f "$SECURITY_SQLITE_TEST_PATCH_FILE" ]] || die "customization patch not found: $SECURITY_SQLITE_TEST_PATCH_FILE"
 [[ "$RELEASE_TAG" != *[[:space:]]* ]] || die "invalid release tag"
 [[ "$SOURCE_REF" != *[[:space:]]* ]] || die "invalid source ref"
 
@@ -128,30 +104,17 @@ apply_customization \
   "$USAGE_PATCH_FILE" \
   usage_customization_present
 apply_customization \
-  'channel-test Responses policy' \
-  "$CHANNEL_TEST_PATCH_FILE" \
-  channel_test_customization_present
-apply_customization \
   'sequential multi-key mode' \
   "$SEQUENTIAL_PATCH_FILE" \
   sequential_customization_present
 apply_customization \
-  'deterministic task-plugin model-drift test' \
-  "$TASK_PLUGIN_TEST_PATCH_FILE" \
-  task_plugin_test_customization_present
-apply_customization \
   'Responses capacity retry before output' \
   "$RESPONSES_CAPACITY_PATCH_FILE" \
   responses_capacity_customization_present
-apply_customization \
-  'production SQLite settings in security tests' \
-  "$SECURITY_SQLITE_TEST_PATCH_FILE" \
-  security_sqlite_test_customization_present
 git -C "$SOURCE_DIR" diff --check
 
 PATCH_SHA256="$(
-  sha256sum "$USAGE_PATCH_FILE" "$CHANNEL_TEST_PATCH_FILE" "$SEQUENTIAL_PATCH_FILE" \
-    "$TASK_PLUGIN_TEST_PATCH_FILE" "$RESPONSES_CAPACITY_PATCH_FILE" "$SECURITY_SQLITE_TEST_PATCH_FILE" |
+  sha256sum "$USAGE_PATCH_FILE" "$SEQUENTIAL_PATCH_FILE" "$RESPONSES_CAPACITY_PATCH_FILE" |
     awk '{print $1}' |
     sha256sum |
     awk '{print $1}'
