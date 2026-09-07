@@ -9,6 +9,7 @@ USAGE_PATCH_FILE="${5:-$SOURCE_DIR/.linjzy/patches/usage-logs-auto-refresh.patch
 CHANNEL_TEST_PATCH_FILE="${6:-$SOURCE_DIR/.linjzy/patches/channel-test-responses-policy.patch}"
 SEQUENTIAL_PATCH_FILE="${7:-$SOURCE_DIR/.linjzy/patches/sequential-key-mode.patch}"
 TASK_PLUGIN_TEST_PATCH_FILE="${8:-$SOURCE_DIR/.linjzy/patches/task-plugin-model-drift-test.patch}"
+RESPONSES_CAPACITY_PATCH_FILE="${9:-$SOURCE_DIR/.linjzy/patches/responses-capacity-retry.patch}"
 
 log() {
   printf '[prepare-release] %s\n' "$*"
@@ -77,6 +78,11 @@ task_plugin_test_customization_present() {
     >/dev/null 2>&1
 }
 
+responses_capacity_customization_present() {
+  git -C "$SOURCE_DIR" apply --reverse --check "$RESPONSES_CAPACITY_PATCH_FILE" \
+    >/dev/null 2>&1
+}
+
 apply_customization() {
   local name="$1"
   local patch_file="$2"
@@ -100,6 +106,7 @@ git -C "$SOURCE_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
 [[ -f "$CHANNEL_TEST_PATCH_FILE" ]] || die "customization patch not found: $CHANNEL_TEST_PATCH_FILE"
 [[ -f "$SEQUENTIAL_PATCH_FILE" ]] || die "customization patch not found: $SEQUENTIAL_PATCH_FILE"
 [[ -f "$TASK_PLUGIN_TEST_PATCH_FILE" ]] || die "customization patch not found: $TASK_PLUGIN_TEST_PATCH_FILE"
+[[ -f "$RESPONSES_CAPACITY_PATCH_FILE" ]] || die "customization patch not found: $RESPONSES_CAPACITY_PATCH_FILE"
 [[ "$RELEASE_TAG" != *[[:space:]]* ]] || die "invalid release tag"
 [[ "$SOURCE_REF" != *[[:space:]]* ]] || die "invalid source ref"
 
@@ -125,11 +132,15 @@ apply_customization \
   'deterministic task-plugin model-drift test' \
   "$TASK_PLUGIN_TEST_PATCH_FILE" \
   task_plugin_test_customization_present
+apply_customization \
+  'Responses capacity retry before output' \
+  "$RESPONSES_CAPACITY_PATCH_FILE" \
+  responses_capacity_customization_present
 git -C "$SOURCE_DIR" diff --check
 
 PATCH_SHA256="$(
   sha256sum "$USAGE_PATCH_FILE" "$CHANNEL_TEST_PATCH_FILE" "$SEQUENTIAL_PATCH_FILE" \
-    "$TASK_PLUGIN_TEST_PATCH_FILE" |
+    "$TASK_PLUGIN_TEST_PATCH_FILE" "$RESPONSES_CAPACITY_PATCH_FILE" |
     awk '{print $1}' |
     sha256sum |
     awk '{print $1}'

@@ -30,7 +30,9 @@ started manually. It:
    release is requested.
 2. Checks out the exact upstream tag commit.
 3. Applies every reviewed patch in `.linjzy/patches/` without a fallback merge.
-4. Runs the controller, DTO, service, middleware, relay, model, and standalone relaykit tests.
+4. Runs the controller, DTO, service, middleware, relay, model, and standalone
+   relaykit tests/build, the capacity retry race tests, and the end-to-end relay
+   tests against SQLite plus disposable MySQL 8 and PostgreSQL 15 databases.
 5. Builds the upstream Dockerfile for `linux/amd64`; the frontend stage runs
    lint on every customized TypeScript file, the auto-refresh regression test,
    typecheck, and the production build.
@@ -39,6 +41,27 @@ started manually. It:
 8. Updates `candidate` only after all checks pass.
 
 The workflow does not contain or use production-server credentials.
+
+## Responses capacity failures
+
+`responses-capacity-retry.patch` recognizes explicit transient overload/capacity
+errors inside an HTTP 200 Responses SSE stream. It withholds only empty initial
+lifecycle events (at most 16 events / 64 KiB, bounded by the stream timeout) and
+defers SSE headers and pings until output starts. Before output, an unbilled
+capacity failure returns a retryable 503 to the existing relay loop. The loop
+respects `RetryTimes` and channel constraints, excludes attempted channels, and
+updates affinity to the channel that succeeds. Exhaustion preserves the capacity
+error instead of replacing it with a channel-selection error.
+
+Text, reasoning, tool/unknown events, output in a failed response, and reported
+usage all prevent replay. Committed streams preserve the upstream failure event
+without appending JSON; partial usage is settled once. Non-capacity failures,
+malformed/truncated streams, and client cancellation do not use this failover.
+Error logs retain `upstream_http_status: 200` and the actual stream failure.
+
+Production needs an enabled alternative channel for the same model/group and
+automatic retries enabled. No database migration or configuration change is
+required for this patch. Rollback uses the prior immutable app image digest.
 
 ## Upstream test fixes
 

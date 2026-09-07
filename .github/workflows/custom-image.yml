@@ -29,6 +29,28 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: capacity-test-only
+          MYSQL_DATABASE: capacity_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -pcapacity-test-only"
+          --health-interval=10s --health-timeout=5s --health-retries=12
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_PASSWORD: capacity-test-only
+          POSTGRES_DB: capacity_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d capacity_test"
+          --health-interval=10s --health-timeout=5s --health-retries=12
+
     steps:
       - name: Check out fork configuration
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -82,7 +104,8 @@ jobs:
               .linjzy/patches/usage-logs-auto-refresh.patch \
               .linjzy/patches/channel-test-responses-policy.patch \
               .linjzy/patches/sequential-key-mode.patch \
-              .linjzy/patches/task-plugin-model-drift-test.patch |
+              .linjzy/patches/task-plugin-model-drift-test.patch \
+              .linjzy/patches/responses-capacity-retry.patch |
               awk '{print $1}' |
               sha256sum |
               awk '{print $1}'
@@ -166,7 +189,21 @@ jobs:
         run: |
           go test ./controller ./dto ./service ./middleware ./relay/...
           go test ./model
+          GOWORK=off go -C relaykit build ./...
           GOWORK=off go -C relaykit test ./...
+
+      - name: Test capacity retry concurrency
+        run: go test -race ./controller -run '^TestResponsesCapacity' -count=1
+
+      - name: Test capacity retry with MySQL
+        env:
+          NEWAPI_CAPACITY_TEST_DSN: 'root:capacity-test-only@tcp(127.0.0.1:3306)/capacity_test?charset=utf8mb4&parseTime=True&loc=Local'
+        run: go test ./controller -run '^TestResponsesCapacityRelayFailoverAndAffinity$' -count=1 -v
+
+      - name: Test capacity retry with PostgreSQL
+        env:
+          NEWAPI_CAPACITY_TEST_DSN: 'postgres://postgres:capacity-test-only@127.0.0.1:5432/capacity_test?sslmode=disable'
+        run: go test ./controller -run '^TestResponsesCapacityRelayFailoverAndAffinity$' -count=1 -v
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
