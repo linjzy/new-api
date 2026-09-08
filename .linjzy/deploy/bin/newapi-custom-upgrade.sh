@@ -19,7 +19,6 @@ CANDIDATE_TAG="${NEWAPI_CANDIDATE_TAG:-candidate}"
 BASE_DIR="${NEWAPI_CUSTOM_BASE_DIR:-$PACKAGE_DIR}"
 STATE_DIR="${NEWAPI_CUSTOM_STATE_DIR:-$BASE_DIR/state}"
 LOG_DIR="${NEWAPI_CUSTOM_LOG_DIR:-$BASE_DIR/logs}"
-BACKUP_DIR="${NEWAPI_CUSTOM_BACKUP_DIR:-$BASE_DIR/backups}"
 
 DEPLOY_DIR="${NEWAPI_DEPLOY_DIR:-/opt/new-api/deploy}"
 OVERRIDE_FILE="${NEWAPI_OVERRIDE_FILE:-$DEPLOY_DIR/docker-compose.override.yml}"
@@ -30,8 +29,9 @@ PUBLIC_URL="${NEWAPI_PUBLIC_URL:-https://ai.linjzy.com}"
 MAINTENANCE_FLAG="${NEWAPI_MAINTENANCE_FLAG:-/run/newapi-maintenance}"
 
 ROLLBACK_REPO="${NEWAPI_ROLLBACK_IMAGE_REPO:-new-api-rollback}"
-LEGACY_CUSTOM_REPO="${NEWAPI_LEGACY_CUSTOM_IMAGE_REPO:-new-api-custom}"
-LEGACY_UPSTREAM_REPO="${NEWAPI_LEGACY_UPSTREAM_IMAGE_REPO:-calciumion/new-api}"
+ROLLBACK_REF="${ROLLBACK_REPO}:previous"
+DB_CONTAINER="${NEWAPI_DB_CONTAINER:-new-api-postgres}"
+DB_BACKUP_FILE="${NEWAPI_DB_BACKUP_FILE:-/opt/new-api/backups/new-api-before-upgrade.dump}"
 DRAIN_WAIT_SECONDS="${NEWAPI_DRAIN_WAIT_SECONDS:-600}"
 HEALTH_TIMEOUT_SECONDS="${NEWAPI_HEALTH_TIMEOUT_SECONDS:-180}"
 LOG_RETENTION_DAYS="${NEWAPI_LOG_RETENTION_DAYS:-14}"
@@ -74,6 +74,7 @@ Usage:
   newapi-custom-upgrade.sh pull [release-tag|latest|image-reference]
   newapi-custom-upgrade.sh deploy
   newapi-custom-upgrade.sh upgrade [release-tag|latest|image-reference]
+  newapi-custom-upgrade.sh rollback
   newapi-custom-upgrade.sh cleanup
 
 Commands:
@@ -83,6 +84,7 @@ Commands:
   pull      Pull and validate a prebuilt GHCR image without changing service.
   deploy    Deploy the last pulled and validated candidate in a detached job.
   upgrade   Pull, drain connections, and deploy in a detached systemd job.
+  rollback  Deploy the retained previous image in a detached systemd job.
   cleanup   Remove unused New API managed resources and expired task logs.
             Other projects and shared Docker build caches are untouched.
 
@@ -287,10 +289,16 @@ pull_candidate() {
     die "unable to resolve immutable registry digest for $requested_ref"
   validate_image_ref "$repo_digest"
 
-  validate_candidate_image "$repo_digest"
+  record_candidate_state "$requested_ref" "$repo_digest"
+}
 
-  PULLED_IMAGE="$repo_digest"
-  PULLED_IMAGE_ID="$(docker image inspect "$repo_digest" --format '{{.Id}}')"
+record_candidate_state() {
+  local requested_ref="$1"
+  local image_ref="$2"
+
+  validate_candidate_image "$image_ref"
+  PULLED_IMAGE="$image_ref"
+  PULLED_IMAGE_ID="$(docker image inspect "$image_ref" --format '{{.Id}}')"
   write_env_file "$CANDIDATE_STATE_FILE" \
     "CANDIDATE_REQUESTED_IMAGE=$requested_ref" \
     "CANDIDATE_IMAGE=$PULLED_IMAGE" \
@@ -304,6 +312,35 @@ pull_candidate() {
 
   log "candidate ready: $PULLED_IMAGE"
   log "public source: https://github.com/$SOURCE_REPOSITORY/tree/$PULLED_SOURCE_REF"
+}
+
+retained_previous_ref() {
+  docker image inspect "$ROLLBACK_REF" \
+    --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null |
+    awk -v prefix="${IMAGE_REPOSITORY}@" 'index($0, prefix) == 1 {print; exit}'
+}
+
+backup_database() {
+  local upstream_commit="$1"
+  local tmp
+  if [[ -f "$DB_BACKUP_FILE" &&
+    "$(state_value "$CURRENT_STATE_FILE" CURRENT_UPSTREAM_COMMIT)" == "$upstream_commit" ]]
+  then
+    log "upstream version unchanged; keeping $DB_BACKUP_FILE"
+    return 0
+  fi
+  mkdir -p "$(dirname "$DB_BACKUP_FILE")"
+  tmp="$(mktemp "$DB_BACKUP_FILE.tmp.XXXXXX")"
+  if ! docker exec "$DB_CONTAINER" \
+    sh -c 'pg_dump -U "$POSTGRES_USER" -Fc "${POSTGRES_DB:-$POSTGRES_USER}"' >"$tmp" ||
+    [[ ! -s "$tmp" ]]
+  then
+    rm -f "$tmp"
+    die "database backup failed; service was not changed"
+  fi
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$DB_BACKUP_FILE"
+  log "database backup written to $DB_BACKUP_FILE"
 }
 
 active_app_connections() {
@@ -480,79 +517,30 @@ rollback_to_image() {
 }
 
 cleanup_managed_images() {
-  local image_id candidate_id ref running_id
+  local image_id running_id candidate_id previous_id
 
   running_id="$(docker inspect "$APP_CONTAINER" \
     --format '{{.Image}}' 2>/dev/null || true)"
   candidate_id="$(state_value "$CANDIDATE_STATE_FILE" CANDIDATE_IMAGE_ID)"
+  previous_id="$(docker image inspect "$ROLLBACK_REF" \
+    --format '{{.Id}}' 2>/dev/null || true)"
 
-  while read -r ref; do
-    [[ -n "$ref" && "$ref" != '<none>:<none>' ]] || continue
-    image_id="$(docker image inspect "$ref" \
-      --format '{{.Id}}' 2>/dev/null || true)"
+  # Keep the running image, a pulled candidate and one previous image.
+  while read -r image_id; do
     [[ -n "$image_id" ]] || continue
-    if [[ -n "$running_id" && "$image_id" == "$running_id" ]]; then
-      continue
-    fi
-    if [[ -n "$candidate_id" && "$image_id" == "$candidate_id" ]]; then
-      continue
-    fi
-    log "removing old managed image tag $ref"
-    docker image rm "$ref" >/dev/null 2>&1 || true
-  done < <(
-    {
-      if [[ -n "$IMAGE_REPOSITORY" ]]; then
-        docker image ls --filter "reference=${IMAGE_REPOSITORY}:*" \
-          --format '{{.Repository}}:{{.Tag}}'
-      fi
-      docker image ls --filter "reference=${ROLLBACK_REPO}:*" \
-        --format '{{.Repository}}:{{.Tag}}'
-      docker image ls --filter "reference=${LEGACY_CUSTOM_REPO}:*" \
-        --format '{{.Repository}}:{{.Tag}}'
-      docker image ls --filter "reference=${LEGACY_UPSTREAM_REPO}:*" \
-        --format '{{.Repository}}:{{.Tag}}'
-    } | awk '!seen[$0]++'
-  )
+    case "$image_id" in
+      "$running_id" | "$candidate_id" | "$previous_id") continue ;;
+    esac
+    log "removing unused managed image $image_id"
+    docker image rm --force "$image_id" >/dev/null 2>&1 || true
+  done < <(docker image ls --no-trunc --format '{{.ID}}\t{{.Repository}}' |
+    awk -F '\t' -v app="$IMAGE_REPOSITORY" -v rollback="$ROLLBACK_REPO" \
+      '$2 == app || $2 == rollback {print $1}' | sort -u)
 }
 
 rotate_managed_files() {
-  find "$LOG_DIR" -maxdepth 1 -type f -name 'build-*.log' \
-    -delete 2>/dev/null || true
   find "$LOG_DIR" -maxdepth 1 -type f -name '*.log' \
     -mtime "+$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
-  if [[ -d "$BACKUP_DIR" ]]; then
-    log "removing obsolete override and script backups"
-    find "$BACKUP_DIR" -xdev -depth -delete 2>/dev/null || true
-  fi
-}
-
-cleanup_legacy_state() {
-  if [[ -f "$CURRENT_STATE_FILE" ]]; then
-    sed -i \
-      -e '/^PREVIOUS_IMAGE=/d' \
-      -e '/^PREVIOUS_IMAGE_ID=/d' \
-      "$CURRENT_STATE_FILE"
-  fi
-  if ! existing_background_job; then
-    rm -f "$SCHEDULED_STATE_FILE"
-  fi
-}
-
-cleanup_legacy_build_files() {
-  local source_dir="$BASE_DIR/source"
-  local patches_dir="$BASE_DIR/patches"
-
-  if [[ -f "$source_dir/.git/newapi-custom-managed" ]]; then
-    log "removing legacy source checkout"
-    find "$source_dir" -xdev -depth -delete
-  elif [[ -d "$source_dir" ]]; then
-    log "legacy source directory is unmarked; leaving it untouched"
-  fi
-
-  if [[ -d "$patches_dir" ]]; then
-    log "removing server-side build patches"
-    find "$patches_dir" -xdev -depth -delete
-  fi
 }
 
 cleanup_unused_docker_objects() {
@@ -565,10 +553,9 @@ cleanup_unused_docker_objects() {
 
 safe_cleanup() {
   disable_request_gate
-  cleanup_legacy_state
+  existing_background_job || rm -f "$SCHEDULED_STATE_FILE"
   cleanup_managed_images
   cleanup_unused_docker_objects
-  cleanup_legacy_build_files
   rotate_managed_files
   log "disk usage after cleanup"
   docker system df || true
@@ -582,7 +569,7 @@ activate_image() {
   local patch_sha="$4"
   local source_ref="$5"
   local source_commit="$6"
-  local candidate_id previous_id rollback_ref timestamp
+  local candidate_id previous_id rollback_ref
 
   validate_image_ref "$image_ref"
   docker image inspect "$image_ref" >/dev/null 2>&1 ||
@@ -606,12 +593,14 @@ activate_image() {
   enable_request_gate
   set_phase drain
   wait_for_connection_drain 'replacing the live container'
+  set_phase backup
+  backup_database "$upstream_commit"
   set_phase activate
   ensure_override_manageable
-  timestamp="$(date +%Y%m%d%H%M%S)"
-  rollback_ref="${ROLLBACK_REPO}:${timestamp}"
-  docker tag "$previous_id" "$rollback_ref"
-  log "activating $image_ref; exact local rollback image is $rollback_ref"
+  docker tag "$previous_id" "$ROLLBACK_REF"
+  rollback_ref="$(retained_previous_ref || true)"
+  rollback_ref="${rollback_ref:-$ROLLBACK_REF}"
+  log "activating $image_ref; previous image retained as $rollback_ref"
   if ! deploy_local_and_verify "$image_ref" "$candidate_id"; then
     log "candidate local verification failed"
     if rollback_to_image "$rollback_ref"; then
@@ -650,8 +639,7 @@ activate_image() {
 
   set_phase complete
   log "deployment succeeded"
-  # No retained rollback image or previous-version state after success.
-  # Broader maintenance is an explicit, scoped command.
+  # Only the running image and the retained previous image stay local.
   cleanup_managed_images
 }
 
@@ -743,6 +731,10 @@ show_status() {
   if [[ -f "$JOB_STATE_FILE" ]]; then
     printf '%s\n' 'Last job result:'
     sed 's/^/  /' "$JOB_STATE_FILE"
+  fi
+  printf 'Retained previous image: %s\n' "$(retained_previous_ref || true)"
+  if [[ -f "$DB_BACKUP_FILE" ]]; then
+    printf 'Database backup: %s (%s)\n' "$DB_BACKUP_FILE" "$(date -r "$DB_BACKUP_FILE" -Is)"
   fi
   printf 'Deployment script: %s\n' "$SCRIPT_SHA256"
   printf '%s\n' 'Background jobs:'
@@ -849,6 +841,20 @@ main() {
       [[ $# -le 1 ]] || die "upgrade accepts at most one image selector"
       local requested="${1:-latest}"
       schedule_internal_job upgrade "$requested"
+      ;;
+    rollback)
+      require_root
+      require_runtime_commands
+      ensure_registry_config
+      ensure_runtime_dirs
+      acquire_lock
+      [[ $# -eq 0 ]] || die "rollback does not accept arguments"
+      local previous_ref
+      previous_ref="$(retained_previous_ref || true)"
+      [[ -n "$previous_ref" ]] ||
+        die "no retained previous image; use upgrade <image-reference> instead"
+      record_candidate_state "$ROLLBACK_REF" "$previous_ref"
+      schedule_internal_job activate "$previous_ref"
       ;;
     cleanup)
       require_root

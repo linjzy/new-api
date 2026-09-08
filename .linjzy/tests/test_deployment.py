@@ -44,6 +44,7 @@ disable_request_gate() { record ungate; }
 wait_for_connection_drain() { record drain; }
 preflight_deployment() { record preflight; }
 ensure_override_manageable() { :; }
+backup_database() { record backup; }
 deploy_local_and_verify() { record deploy; }
 """
             p = subprocess.run(["bash", "-c", prelude + body], env=env, text=True, capture_output=True)
@@ -63,8 +64,25 @@ deploy_local_and_verify() { record deploy; }
     def test_upgrade_preflights_before_gate_and_cleans_only_after_success(self):
         p,calls=self.run_script('activate_image ghcr.io/linjzy/new-api@sha256:123 v1 upstream patch source commit\n')
         self.assertEqual(p.returncode,0,p.stderr)
-        order=[x for x in calls if x in ("preflight","gate","drain","deploy","public","cleanup")]
-        self.assertEqual(order,["preflight","gate","drain","deploy","public","cleanup"])
+        order=[x for x in calls if x in ("preflight","gate","drain","backup","deploy","public","cleanup")]
+        self.assertEqual(order,["preflight","gate","drain","backup","deploy","public","cleanup"])
+
+    def test_database_backup_refreshes_only_when_upstream_changes_and_never_replaces_on_failure(self):
+        body=SCRIPT.read_text();start=body.index('backup_database() {');end=body.index('active_app_connections()',start)
+        p,calls=self.run_script(body[start:end]+r"""
+DB_BACKUP_FILE="$TEST_DIR/db.dump"
+docker() { [[ "$1" == exec ]] && printf 'PGDMP'; }
+printf 'CURRENT_UPSTREAM_COMMIT=aaa\n' > "$CURRENT_STATE_FILE"
+backup_database aaa && [[ "$(cat "$DB_BACKUP_FILE")" == PGDMP ]] && record created
+printf 'old' > "$DB_BACKUP_FILE"
+backup_database aaa && [[ "$(cat "$DB_BACKUP_FILE")" == old ]] && record kept
+backup_database bbb && [[ "$(cat "$DB_BACKUP_FILE")" == PGDMP ]] && record refreshed
+docker() { return 1; }
+( backup_database ccc ) 2>/dev/null || record failed
+[[ "$(cat "$DB_BACKUP_FILE")" == PGDMP && -z "$(ls "$TEST_DIR"/db.dump.tmp.* 2>/dev/null)" ]] && record preserved
+""")
+        self.assertEqual(p.returncode,0,p.stderr)
+        self.assertEqual(calls,["created","kept","refreshed","failed","preserved"])
 
     def test_cleanup_is_scoped_and_does_not_prune_images_or_build_cache(self):
         p,calls=self.run_script('cleanup_unused_docker_objects\n')

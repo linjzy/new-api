@@ -1,37 +1,38 @@
 # New API 部署
 
-将本目录的脚本和说明安装到 `/opt/new-api/custom/`，脚本权限设为 `700`。
+将本目录的脚本和说明安装到 `/opt/new-api/custom/`，脚本权限 `700`。
 配置使用现有 `registry.env`（权限 `600`）；首次配置参考 [配置示例](registry.env.example)。
-更新文件使用原子替换，不生成备份。服务器只拉取预构建镜像，GitHub Actions 不持有服务器凭据。
-分支由 Actions 构建前清理，服务器无需 GitHub 令牌。
+服务器只拉取预构建镜像，不持有 GitHub 令牌。
 
 ## 使用
 
 ```bash
 /opt/new-api/custom/bin/newapi-custom-upgrade.sh status
-/opt/new-api/custom/bin/newapi-custom-upgrade.sh pull latest
-/opt/new-api/custom/bin/newapi-custom-upgrade.sh deploy
-/opt/new-api/custom/bin/newapi-custom-upgrade.sh upgrade latest
+/opt/new-api/custom/bin/newapi-custom-upgrade.sh upgrade latest   # 拉取 candidate 并部署
+/opt/new-api/custom/bin/newapi-custom-upgrade.sh rollback         # 切回保留的上一版镜像
 /opt/new-api/custom/bin/newapi-custom-upgrade.sh cleanup
 ```
 
-`pull` 拉取并锁定镜像 digest；`deploy` 部署候选；`upgrade` 完成两步。
-部署通过 systemd 后台执行，并使用 flock 防止重叠。
+`pull` 与 `deploy` 可拆成两步。部署通过 systemd 后台执行，flock 防止重叠：
 
-1. 核对镜像标签；相同镜像且本机、公网健康时直接结束。
-2. Compose 预检通过后建立 nginx 维护门闩，等待已有连接结束；空载立即继续。
-3. 更新受管理的 Compose override，仅重建 `new-api`。
-4. 核对镜像和本机健康，解除维护后验证公网状态与前端入口。
-5. 成功后立即删除旧应用镜像和临时回退标签。
+1. 核对镜像；相同镜像且本机、公网健康时直接结束。
+2. Compose 预检通过后建立 nginx 维护门闩，等待已有连接结束。
+3. 上游版本变化或尚无备份时，`pg_dump` 覆盖写入 `/opt/new-api/backups/new-api-before-upgrade.dump`，只保留这一份。
+4. 上一版镜像标记为 `new-api-rollback:previous`，仅重建 `new-api`，健康后解除门闩并验证公网入口。
+5. 失败自动切回上一版；成功后删除其余本地应用镜像。
 
-沿用当次失败自动恢复；不保留历史镜像、上一版本状态或配置、数据库备份。
-`cleanup` 仅处理 New API 管理标签和仓库范围内的资源，不清理其他项目、数据库卷或共享构建缓存。
+恢复数据库时先停止应用：
+
+```bash
+cd /opt/new-api/deploy && docker compose stop new-api
+docker exec -i new-api-postgres sh -c 'pg_restore -U "$POSTGRES_USER" -d "${POSTGRES_DB:-$POSTGRES_USER}" --clean --if-exists' < /opt/new-api/backups/new-api-before-upgrade.dump
+docker compose start new-api
+```
 
 ## 配置与排查
 
 [nginx 配置](nginx-maintenance.conf)通过 `/run/newapi-maintenance` 拒绝新请求。
 排空检测适用于 `127.0.0.1:8899 -> docker-proxy -> new-api:3000`；调整端口或取消 docker-proxy 时需同步修改。
 
-`status` 显示运行镜像、候选和任务结果；日志位于 `logs/`，当前版本与任务阶段位于 `state/`。
-主 Compose 文件保持静态，日常使用普通 `docker compose` 命令以包含 override。
-容量重试、计费、Key 恢复和自动刷新由发布前回归验证；部署健康检查不发送计费请求。
+`status` 显示运行镜像、保留的上一版、备份文件和任务结果；日志在 `logs/`，状态在 `state/`。
+主 Compose 文件保持静态，`image` 指向 `candidate`；实际运行镜像由受管理的 override 钉到 digest，日常使用普通 `docker compose` 命令即可。

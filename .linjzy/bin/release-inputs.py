@@ -15,19 +15,14 @@ def digest_files(root, files):
 
 def identities(bundle):
     patch_digest = hashlib.sha256("".join(hashlib.sha256((bundle / "patches" / name).read_bytes()).hexdigest() + "\n" for name in PATCHES).encode()).hexdigest()
-    build_files = ["bin/release-inputs.py", "bin/prepare-release.sh", "bin/prepare-release.py", "bin/registry-digest.sh"] + ["patches/" + name for name in PATCHES]
     # The upstream commit also participates in the image tag: it identifies the
     # exact Dockerfile, dependency locks, base-image digests and application tree.
-    validation_files = [str(f.relative_to(bundle)) for f in (bundle / "tests").rglob("*") if f.is_file() and "__pycache__" not in f.parts]
-    validation_files += [str(f.relative_to(bundle)) for f in (bundle / "deploy").rglob("*") if f.is_file()]
-    validation_files += ["bin/verify-release.sh", "bin/smoke-test-image.sh"]
-    # Release refs carry the default branch's workflows so GITHUB_TOKEN can
-    # publish them. Any workflow change must invalidate their source identity.
-    workflow_files = [str(f.relative_to(bundle.parent)) for f in (bundle.parent / ".github/workflows").rglob("*") if f.is_file()]
-    workflow = digest_files(bundle.parent, workflow_files).encode()
-    build = hashlib.sha256((digest_files(bundle, build_files) + "\n").encode() + workflow).hexdigest()
-    validation = hashlib.sha256((digest_files(bundle, validation_files) + "\n").encode() + workflow).hexdigest()
-    return {"patch_sha": patch_digest, "build_sha": build, "validation_sha": validation}
+    build_files = ["bin/release-inputs.py", "bin/prepare-release.sh", "bin/prepare-release.py"] + ["patches/" + name for name in PATCHES]
+    validation_files = ["bin/verify-release.sh", "bin/smoke-test-image.sh"]
+    for folder in ("tests", "deploy"):
+        validation_files += [str(f.relative_to(bundle)) for f in (bundle / folder).rglob("*")
+                             if f.is_file() and "__pycache__" not in f.parts and f.suffix != ".md"]
+    return {"patch_sha": patch_digest, "build_sha": digest_files(bundle, build_files), "validation_sha": digest_files(bundle, validation_files)}
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

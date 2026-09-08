@@ -5,7 +5,10 @@ on:
     - cron: '23 */6 * * *'
   push:
     branches: [main]
-    paths: ['.linjzy/**', '.github/workflows/custom-image.yml']
+    paths:
+      - '.linjzy/**'
+      - '!.linjzy/**/*.md'
+      - '.github/workflows/custom-image.yml'
   workflow_dispatch:
     inputs:
       release:
@@ -39,11 +42,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Delete all branches except main before building
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 .linjzy/bin/cleanup-branches.py --repository "$GITHUB_REPOSITORY"
-
       - name: Resolve exact upstream and content identities
         id: plan
         env:
@@ -74,6 +72,7 @@ jobs:
             echo "release=$release"
             echo "upstream=$upstream"
             cat "$RUNNER_TEMP/identities.env"
+            echo "tag=$tag"
             echo "source_ref=custom/$tag"
             echo "image=$repository:$tag"
             echo "proof=$repository:verified-${validation_sha:0:12}-${extended}-$tag"
@@ -112,7 +111,6 @@ jobs:
         run: |
           set -Eeuo pipefail
           cp -R .linjzy "$RUNNER_TEMP/current-custom"
-          cp .github/workflows/custom-image.yml "$RUNNER_TEMP/custom-image.yml"
           if [[ "$IMAGE_EXISTS" == true ]]; then
             commit="$(docker buildx imagetools inspect "$IMAGE" --format '{{json .Image}}' |
               jq -er --arg source "$SOURCE_REF" --arg repository "https://github.com/$GITHUB_REPOSITORY" '
@@ -121,19 +119,17 @@ jobs:
                   and .["org.opencontainers.image.source"] == $repository)
                 | .["org.opencontainers.image.revision"]')"
             [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
-            if ! git cat-file -e "$commit^{commit}"; then
-              git fetch --no-tags --depth=1 origin "$commit"
-            fi
+            git cat-file -e "$commit^{commit}" || git fetch --no-tags --depth=1 origin "$commit"
             git checkout --detach "$commit"
           else
             git checkout --detach "$UPSTREAM"
             cp -R "$RUNNER_TEMP/current-custom" .linjzy
             bash .linjzy/bin/prepare-release.sh . "$RELEASE" "$UPSTREAM" "$SOURCE_REF"
             printf 'build_sha256=%s\n' "$BUILD_SHA" >> .linjzy/BUILD-METADATA
-            # GITHUB_TOKEN can publish refs using the default branch's workflows.
-            git restore --source="$GITHUB_SHA" --staged --worktree -- .github/workflows
+            # Release refs carry no workflows, so GITHUB_TOKEN can publish them.
+            git rm -rq .github/workflows
             git add -A
-            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m "custom: $RELEASE production customizations"
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -qm "custom: $RELEASE production customizations"
           fi
           echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
@@ -150,7 +146,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           bash "$RUNNER_TEMP/current-custom/bin/verify-release.sh" "$PWD" go
-          CUSTOM_WORKFLOW_FILE="$RUNNER_TEMP/custom-image.yml" python3 -m unittest discover -s "$RUNNER_TEMP/current-custom/tests" -p 'test_*.py'
+          python3 -m unittest discover -s "$RUNNER_TEMP/current-custom/tests" -p 'test_*.py'
 
       - name: Verify PostgreSQL key recovery
         if: steps.registry.outputs.verified != 'true'
@@ -183,16 +179,16 @@ jobs:
         run: npm install --global bun@1.4.0
 
       - name: Verify frontend errors, lint and types
+        if: steps.registry.outputs.verified != 'true'
         env:
           BUILD_FRONTEND: false
-        if: steps.registry.outputs.verified != 'true'
         run: bash "$RUNNER_TEMP/current-custom/bin/verify-release.sh" "$PWD" frontend
 
-      - name: Build or fetch immutable image and verify startup
-        if: steps.registry.outputs.verified != 'true'
+      - name: Build or fetch immutable image, verify startup and publish its source ref
         env:
           IMAGE: ${{ steps.plan.outputs.image }}
           IMAGE_EXISTS: ${{ steps.registry.outputs.exists }}
+          VERIFIED: ${{ steps.registry.outputs.verified }}
           RELEASE: ${{ steps.plan.outputs.release }}
           UPSTREAM: ${{ steps.plan.outputs.upstream }}
           PATCH_SHA: ${{ steps.plan.outputs.patch_sha }}
@@ -201,32 +197,31 @@ jobs:
           COMMIT: ${{ steps.source.outputs.commit }}
         run: |
           set -Eeuo pipefail
-          if [[ "$IMAGE_EXISTS" == true ]]; then
-            docker pull "$IMAGE"
-          else
-            docker buildx build --load --platform linux/amd64 --pull \
-              --cache-from type=gha,scope=new-api-custom-amd64 \
-              --cache-to type=gha,mode=max,scope=new-api-custom-amd64 \
-              --label 'com.linjzy.new-api.managed=true' \
-              --label "com.linjzy.new-api.upstream-tag=$RELEASE" \
-              --label "com.linjzy.new-api.upstream-commit=$UPSTREAM" \
-              --label "com.linjzy.new-api.patch-sha256=$PATCH_SHA" \
-              --label "com.linjzy.new-api.build-sha256=$BUILD_SHA" \
-              --label "com.linjzy.new-api.source-ref=$SOURCE_REF" \
-              --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
-              --label "org.opencontainers.image.revision=$COMMIT" \
-              --label "org.opencontainers.image.version=$RELEASE" \
-              --label 'org.opencontainers.image.licenses=AGPL-3.0-only' --tag "$IMAGE" .
+          if [[ "$VERIFIED" != true ]]; then
+            if [[ "$IMAGE_EXISTS" == true ]]; then
+              docker pull "$IMAGE"
+            else
+              git clean -fdq
+              docker buildx build --load --platform linux/amd64 --pull \
+                --cache-from type=gha,scope=new-api-custom-amd64 \
+                --cache-to type=gha,mode=max,scope=new-api-custom-amd64 \
+                --label 'com.linjzy.new-api.managed=true' \
+                --label "com.linjzy.new-api.upstream-tag=$RELEASE" \
+                --label "com.linjzy.new-api.upstream-commit=$UPSTREAM" \
+                --label "com.linjzy.new-api.patch-sha256=$PATCH_SHA" \
+                --label "com.linjzy.new-api.build-sha256=$BUILD_SHA" \
+                --label "com.linjzy.new-api.source-ref=$SOURCE_REF" \
+                --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+                --label "org.opencontainers.image.revision=$COMMIT" \
+                --label "org.opencontainers.image.version=$RELEASE" \
+                --label 'org.opencontainers.image.licenses=AGPL-3.0-only' --tag "$IMAGE" .
+            fi
+            bash "$RUNNER_TEMP/current-custom/bin/smoke-test-image.sh" "$IMAGE" "$RELEASE"
           fi
-          bash "$RUNNER_TEMP/current-custom/bin/smoke-test-image.sh" "$IMAGE" "$RELEASE"
-          git push --force-with-lease="refs/heads/$SOURCE_REF:" origin "HEAD:refs/heads/$SOURCE_REF"
-          docker push "$IMAGE"
-
-      - name: Restore source branch for the reused image
-        if: steps.registry.outputs.verified == 'true'
-        env:
-          SOURCE_REF: ${{ steps.plan.outputs.source_ref }}
-        run: git push --force-with-lease="refs/heads/$SOURCE_REF:" origin "HEAD:refs/heads/$SOURCE_REF"
+          if [[ "$(git ls-remote --heads origin "$SOURCE_REF" | cut -f1)" != "$COMMIT" ]]; then
+            git push --force origin "HEAD:refs/heads/$SOURCE_REF"
+          fi
+          [[ "$VERIFIED" == true || "$IMAGE_EXISTS" == true ]] || docker push "$IMAGE"
 
       - name: Record validation and promote candidate
         env:
@@ -235,6 +230,7 @@ jobs:
           CANDIDATE: ${{ steps.plan.outputs.candidate }}
           VERIFIED: ${{ steps.registry.outputs.verified }}
           PROMOTE: ${{ github.event_name == 'schedule' || inputs.promote_candidate || false }}
+          RELEASE: ${{ steps.plan.outputs.release }}
           BUILD_SHA: ${{ steps.plan.outputs.build_sha }}
           VALIDATION_SHA: ${{ steps.plan.outputs.validation_sha }}
           SOURCE_REF: ${{ steps.plan.outputs.source_ref }}
@@ -246,12 +242,18 @@ jobs:
           if [[ "$PROMOTE" == true ]]; then
             docker buildx imagetools create --prefer-index=false --tag "$CANDIDATE" "$IMAGE"
           fi
-          # shellcheck disable=SC2016
           digest="$(docker buildx imagetools inspect "$IMAGE" | awk '/^Digest:/ {print $2; exit}')"
           # shellcheck disable=SC2016
           {
             printf 'Image: `%s`\n\nDigest: `%s`\n\n' "$IMAGE" "$digest"
+            printf 'Upstream release: https://github.com/QuantumNous/new-api/releases/tag/%s\n\n' "$RELEASE"
             printf 'Build inputs: `%s`\n\nValidation: `%s`\n\n' "$BUILD_SHA" "$VALIDATION_SHA"
             printf 'Source: https://github.com/%s/tree/%s\n\n' "$GITHUB_REPOSITORY" "$SOURCE_REF"
             printf 'Validation reused: %s; candidate promoted: %s\n' "$VERIFIED" "$PROMOTE"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep candidate, current and one previous image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: python3 "$RUNNER_TEMP/current-custom/bin/retention.py" --owner "${GITHUB_REPOSITORY_OWNER,,}" --package new-api --current "$TAG"

@@ -29,8 +29,11 @@ def prepare(source, release, upstream, source_ref):
             # Only translate diff paths; never rewrite source text or retry an
             # incompatible patch using a different application strategy.
             text = "".join(line.replace("a/web/src/", "a/web/default/src/").replace("b/web/src/", "b/web/default/src/") if line.startswith(("diff --git ", "--- ", "+++ ")) else line for line in text.splitlines(keepends=True))
-        subprocess.run(["git", "apply", "--check", "-"], cwd=source, input=text, text=True, check=True)
-        subprocess.run(["git", "apply", "-"], cwd=source, input=text, text=True, check=True)
+        # Hunks still apply without fuzz; rejected ones stay in *.rej files for porting.
+        if subprocess.run(["git", "apply", "--reject", "-"], cwd=source, input=text, text=True).returncode:
+            for rej in sorted(source.rglob("*.rej")):
+                print(f"[prepare-release] rejected hunks in {rej.relative_to(source)}:\n{rej.read_text()}")
+            raise ValueError(f"{name} does not apply to {release}; port the rejected hunks above")
         print(f"[prepare-release] applied {name} ({frontend})")
     (source / "VERSION").write_text(release + "\n")
     patch_sha = hashlib.sha256("".join(hashlib.sha256((source / ".linjzy/patches" / name).read_bytes()).hexdigest()+"\n" for name in PATCHES).encode()).hexdigest()

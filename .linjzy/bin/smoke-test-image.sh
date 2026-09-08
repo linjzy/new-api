@@ -43,10 +43,10 @@ for _ in $(seq 1 90); do
   PORT="$(docker port "$CONTAINER_NAME" 3000/tcp 2>/dev/null |
     sed -n 's/.*://p' | head -n 1)"
   if [[ -n "$PORT" ]] &&
-    curl -fsS --connect-timeout 2 --max-time 5 \
-      "http://127.0.0.1:${PORT}/api/status" | json_success &&
-    curl -fsS --connect-timeout 2 --max-time 5 \
-      "http://127.0.0.1:${PORT}/" | grep -q '/static/js/'
+    curl -fs --connect-timeout 2 --max-time 5 \
+      "http://127.0.0.1:${PORT}/api/status" 2>/dev/null | json_success &&
+    curl -fs --connect-timeout 2 --max-time 5 \
+      "http://127.0.0.1:${PORT}/" 2>/dev/null | grep -q '/static/js/'
   then
     printf 'smoke test passed for %s\n' "$IMAGE_REF"
     exit 0
