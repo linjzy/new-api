@@ -718,7 +718,7 @@ show_status() {
     sed 's/^/  /' "$JOB_STATE_FILE"
   fi
   printf 'Retained previous image: %s\n' \
-    "$(docker image inspect "$ROLLBACK_REF" --format '{{join .RepoDigests " "}}' 2>/dev/null || echo none)"
+    "$(docker image inspect "$ROLLBACK_REF" --format '{{join .RepoDigests " "}}' 2>/dev/null | grep . || echo none)"
   if [[ -f "$DB_BACKUP_FILE" ]]; then
     printf 'Database backup: %s (%s)\n' "$DB_BACKUP_FILE" "$(date -r "$DB_BACKUP_FILE" -Is)"
   fi
