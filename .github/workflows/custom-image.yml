@@ -3,15 +3,21 @@ name: Build custom new-api image
 on:
   schedule:
     - cron: '23 */6 * * *'
+  push:
+    branches: [main]
+    paths: ['.linjzy/**', '.github/workflows/custom-image.yml']
   workflow_dispatch:
     inputs:
       release:
-        description: 'Published upstream release tag; empty selects the newest non-draft release'
+        description: Published upstream release tag; empty selects the newest non-draft release
         required: false
         type: string
       promote_candidate:
-        description: 'Move the candidate tag after the immutable image passes'
-        required: true
+        description: Move candidate after all checks pass
+        default: false
+        type: boolean
+      extended_checks:
+        description: Also verify MySQL compatibility and the concurrency race detector
         default: false
         type: boolean
 
@@ -24,253 +30,210 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build, verify, and publish linux/amd64
+  release:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-
+    timeout-minutes: 35
     steps:
-      - name: Check out fork configuration
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
 
-      - name: Resolve upstream release
-        id: release
+      - name: Resolve exact upstream and content identities
+        id: plan
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REQUESTED_RELEASE: ${{ inputs.release || '' }}
+          EXTENDED: ${{ inputs.extended_checks || false }}
+          BEFORE: ${{ github.event.before || '' }}
         run: |
           set -Eeuo pipefail
-
-          release_tag="$REQUESTED_RELEASE"
-          if [[ -z "$release_tag" ]]; then
-            release_tag="$(
-              curl -fsSL --retry 3 --retry-delay 2 \
-                -H 'Accept: application/vnd.github+json' \
-                -H "Authorization: Bearer $GH_TOKEN" \
-                -H 'X-GitHub-Api-Version: 2022-11-28' \
-                'https://api.github.com/repos/QuantumNous/new-api/releases?per_page=30' |
-                python3 -c '
-          import json
-          import sys
-
-          releases = [item for item in json.load(sys.stdin) if not item.get("draft")]
-          releases.sort(
-              key=lambda item: item.get("published_at") or item.get("created_at") or "",
-              reverse=True,
-          )
-          if not releases or not releases[0].get("tag_name"):
-              raise SystemExit("no published release found")
-          print(releases[0]["tag_name"])
-          '
-            )"
+          release="$REQUESTED_RELEASE"
+          if [[ -z "$release" ]]; then
+            release="$(gh api 'repos/QuantumNous/new-api/releases?per_page=30' --jq '[.[] | select(.draft == false)] | sort_by(.published_at) | last | .tag_name')"
           fi
-
-          [[ "$release_tag" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
-            echo "::error::Invalid release tag: $release_tag"
-            exit 1
-          }
-
-          git remote remove upstream 2>/dev/null || true
-          git remote add upstream https://github.com/QuantumNous/new-api.git
-          git fetch --force --no-tags upstream "refs/tags/${release_tag}"
-          upstream_commit="$(git rev-parse 'FETCH_HEAD^{commit}')"
-
-          patch_sha="$(
-            sha256sum \
-              .linjzy/patches/usage-logs-auto-refresh.patch \
-              .linjzy/patches/sequential-key-mode.patch \
-              .linjzy/patches/responses-capacity-retry.patch |
-              awk '{print $1}' |
-              sha256sum |
-              awk '{print $1}'
-          )"
-          patch_short="${patch_sha:0:12}"
-          upstream_short="${upstream_commit:0:12}"
-          release_slug="$(
-            printf '%s' "${release_tag#v}" |
-              sed -E 's/[^A-Za-z0-9_.-]+/-/g; s/^[.-]+//; s/[.-]+$//' |
-              cut -c1-80
-          )"
-          [[ -n "$release_slug" ]] || {
-            echo "::error::Release tag cannot be converted to an image tag"
-            exit 1
-          }
-
-          image_tag="${release_slug}-autorefresh-${patch_short}-${upstream_short}"
-          source_ref="custom/${image_tag}"
-          registry_owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" |
-            tr '[:upper:]' '[:lower:]')"
-          immutable_ref="ghcr.io/${registry_owner}/new-api:${image_tag}"
-          candidate_ref="ghcr.io/${registry_owner}/new-api:candidate"
-
-          {
-            echo "release_tag=$release_tag"
-            echo "upstream_commit=$upstream_commit"
-            echo "patch_sha=$patch_sha"
-            echo "image_tag=$image_tag"
-            echo "source_ref=$source_ref"
-            echo "immutable_ref=$immutable_ref"
-            echo "candidate_ref=$candidate_ref"
-          } >>"$GITHUB_OUTPUT"
-
-      - name: Prepare exact public source tree
-        id: source
-        env:
-          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
-          UPSTREAM_COMMIT: ${{ steps.release.outputs.upstream_commit }}
-          SOURCE_REF: ${{ steps.release.outputs.source_ref }}
-        run: |
-          set -Eeuo pipefail
-
-          custom_bundle="$RUNNER_TEMP/linjzy-custom"
-          cp -R .linjzy "$custom_bundle"
-
-          if git ls-remote --exit-code --heads origin \
-            "refs/heads/${SOURCE_REF}" >/dev/null 2>&1
-          then
-            git fetch --force origin \
-              "refs/heads/${SOURCE_REF}:refs/remotes/origin/${SOURCE_REF}"
-            git checkout --detach "refs/remotes/origin/${SOURCE_REF}"
-            source_ref_exists=true
-          else
-            git checkout --detach "$UPSTREAM_COMMIT"
-            git reset --hard "$UPSTREAM_COMMIT"
-            git clean -ffdx
-            cp -R "$custom_bundle" .linjzy
-
-            bash .linjzy/bin/prepare-release.sh \
-              . "$RELEASE_TAG" "$UPSTREAM_COMMIT" "$SOURCE_REF"
-
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git add -A
-            git commit -m "custom: ${RELEASE_TAG} production customizations"
-            source_ref_exists=false
+          [[ "$release" =~ ^v?[0-9][A-Za-z0-9._-]*$ ]]
+          git fetch --no-tags --depth=1 https://github.com/QuantumNous/new-api.git "refs/tags/$release"
+          upstream="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          python3 .linjzy/bin/release-inputs.py .linjzy > "$RUNNER_TEMP/identities.env"
+          source "$RUNNER_TEMP/identities.env"
+          tag="${release#v}-custom-${build_sha:0:12}-${upstream:0:12}"
+          repository="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/new-api"
+          extended="$EXTENDED"
+          if [[ "$GITHUB_EVENT_NAME" == schedule ]] ||
+             { [[ -n "$BEFORE" && "$BEFORE" != 0000000000000000000000000000000000000000 ]] &&
+               ! git diff --quiet "$BEFORE" HEAD -- .linjzy/patches/sequential-key-mode.patch .linjzy/patches/responses-capacity-retry.patch .linjzy/tests/go .linjzy/bin/prepare-release.py; }; then
+            extended=true
           fi
-
-          patched_commit="$(git rev-parse HEAD)"
           {
-            echo "source_ref_exists=$source_ref_exists"
-            echo "patched_commit=$patched_commit"
-          } >>"$GITHUB_OUTPUT"
+            echo "release=$release"
+            echo "upstream=$upstream"
+            cat "$RUNNER_TEMP/identities.env"
+            echo "source_ref=custom/$tag"
+            echo "image=$repository:$tag"
+            echo "proof=$repository:verified-${validation_sha:0:12}-${extended}-$tag"
+            echo "candidate=$repository:candidate"
+            echo "extended=$extended"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Set up Go
-        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
-        with:
-          go-version: '>=1.25.1'
-
-      - name: Build standalone relaykit
-        run: GOWORK=off go -C relaykit build ./...
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-
-      - name: Log in to GHCR
-        uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4 # v4.3.0
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Check immutable image
+      - name: Check immutable image and matching validation before preparing source
         id: registry
         env:
-          IMMUTABLE_REF: ${{ steps.release.outputs.immutable_ref }}
-          SOURCE_REF_EXISTS: ${{ steps.source.outputs.source_ref_exists }}
+          IMAGE: ${{ steps.plan.outputs.image }}
+          PROOF: ${{ steps.plan.outputs.proof }}
+          SOURCE_REF: ${{ steps.plan.outputs.source_ref }}
         run: |
           set -Eeuo pipefail
-          if [[ "$SOURCE_REF_EXISTS" == 'true' ]] &&
-            docker buildx imagetools inspect "$IMMUTABLE_REF" >/dev/null 2>&1
-          then
-            echo 'exists=true' >>"$GITHUB_OUTPUT"
-          else
-            echo 'exists=false' >>"$GITHUB_OUTPUT"
+          digest=''
+          source_refs="$(git ls-remote --heads origin "refs/heads/$SOURCE_REF")"
+          if [[ -n "$source_refs" ]]; then
+            digest="$(bash .linjzy/bin/registry-digest.sh "$IMAGE")"
           fi
+          proof="$(bash .linjzy/bin/registry-digest.sh "$PROOF")"
+          echo "exists=$([[ -n "$digest" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "verified=$([[ -n "$digest" && "$digest" == "$proof" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
-      - name: Build immutable image
-        if: steps.registry.outputs.exists != 'true'
+      - name: Prepare exact source and current verification bundle
+        if: steps.registry.outputs.verified != 'true'
+        id: source
         env:
-          IMMUTABLE_REF: ${{ steps.release.outputs.immutable_ref }}
-          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
-          UPSTREAM_COMMIT: ${{ steps.release.outputs.upstream_commit }}
-          PATCH_SHA: ${{ steps.release.outputs.patch_sha }}
-          SOURCE_REF: ${{ steps.release.outputs.source_ref }}
-          PATCHED_COMMIT: ${{ steps.source.outputs.patched_commit }}
+          SOURCE_REF: ${{ steps.plan.outputs.source_ref }}
+          UPSTREAM: ${{ steps.plan.outputs.upstream }}
+          RELEASE: ${{ steps.plan.outputs.release }}
+          BUILD_SHA: ${{ steps.plan.outputs.build_sha }}
         run: |
           set -Eeuo pipefail
-          docker buildx build \
-            --load \
-            --platform linux/amd64 \
-            --pull \
-            --cache-from type=gha,scope=new-api-custom-amd64 \
-            --cache-to type=gha,mode=max,scope=new-api-custom-amd64 \
-            --label 'com.linjzy.new-api.managed=true' \
-            --label "com.linjzy.new-api.upstream-tag=$RELEASE_TAG" \
-            --label "com.linjzy.new-api.upstream-commit=$UPSTREAM_COMMIT" \
-            --label "com.linjzy.new-api.patch-sha256=$PATCH_SHA" \
-            --label "com.linjzy.new-api.source-ref=$SOURCE_REF" \
-            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
-            --label "org.opencontainers.image.revision=$PATCHED_COMMIT" \
-            --label "org.opencontainers.image.version=$RELEASE_TAG" \
-            --label 'org.opencontainers.image.licenses=AGPL-3.0-only' \
-            --tag "$IMMUTABLE_REF" \
-            .
+          cp -R .linjzy "$RUNNER_TEMP/current-custom"
+          cp .github/workflows/custom-image.yml "$RUNNER_TEMP/custom-image.yml"
+          source_refs="$(git ls-remote --heads origin "refs/heads/$SOURCE_REF")"
+          if [[ -n "$source_refs" ]]; then
+            git fetch --depth=1 origin "refs/heads/$SOURCE_REF"
+            git checkout --detach FETCH_HEAD
+          else
+            git checkout --detach "$UPSTREAM"
+            cp -R "$RUNNER_TEMP/current-custom" .linjzy
+            bash .linjzy/bin/prepare-release.sh . "$RELEASE" "$UPSTREAM" "$SOURCE_REF"
+            printf 'build_sha256=%s\n' "$BUILD_SHA" >> .linjzy/BUILD-METADATA
+            git add -A
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m "custom: $RELEASE production customizations"
+          fi
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Verify immutable image startup
-        if: steps.registry.outputs.exists != 'true'
-        env:
-          IMMUTABLE_REF: ${{ steps.release.outputs.immutable_ref }}
-          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        if: steps.registry.outputs.verified != 'true'
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            relaykit/go.sum
+
+      - name: Verify relay, settlement, sequential keys and deployment contract
+        if: steps.registry.outputs.verified != 'true'
         run: |
-          bash .linjzy/bin/smoke-test-image.sh \
-            "$IMMUTABLE_REF" "$RELEASE_TAG"
+          set -Eeuo pipefail
+          bash "$RUNNER_TEMP/current-custom/bin/verify-release.sh" "$PWD" go
+          CUSTOM_WORKFLOW_FILE="$RUNNER_TEMP/custom-image.yml" python3 -m unittest discover -s "$RUNNER_TEMP/current-custom/tests" -p 'test_*.py'
 
-      - name: Publish exact source branch
-        if: >-
-          steps.registry.outputs.exists != 'true' &&
-          steps.source.outputs.source_ref_exists != 'true'
+      - name: Verify PostgreSQL key recovery
+        if: steps.registry.outputs.verified != 'true'
         env:
-          SOURCE_REF: ${{ steps.release.outputs.source_ref }}
-        run: git push origin "HEAD:refs/heads/${SOURCE_REF}"
+          CUSTOM_TEST_SQL_DRIVER: postgres
+          CUSTOM_TEST_SQL_DSN: host=127.0.0.1 port=55432 user=newapi password=ci-only dbname=newapi_test sslmode=disable
+        run: |
+          set -Eeuo pipefail
+          docker run -d --name custom-postgres -p 127.0.0.1:55432:5432 -e POSTGRES_USER=newapi -e POSTGRES_PASSWORD=ci-only -e POSTGRES_DB=newapi_test --health-cmd='pg_isready -U newapi -d newapi_test' --health-interval=1s --health-retries=30 postgres:15-alpine
+          # shellcheck disable=SC2016
+          timeout 45 bash -c 'until [[ "$(docker inspect --format "{{.State.Health.Status}}" custom-postgres)" == healthy ]]; do sleep 1; done'
+          bash "$RUNNER_TEMP/current-custom/bin/verify-release.sh" "$PWD" database
 
-      - name: Publish immutable image
-        if: steps.registry.outputs.exists != 'true'
+      - name: Verify changed backend concurrency and MySQL compatibility
+        if: steps.registry.outputs.verified != 'true' && steps.plan.outputs.extended == 'true'
         env:
-          IMMUTABLE_REF: ${{ steps.release.outputs.immutable_ref }}
-        run: docker push "$IMMUTABLE_REF"
+          CUSTOM_TEST_SQL_DRIVER: mysql
+          CUSTOM_TEST_SQL_DSN: newapi:ci-only@tcp(127.0.0.1:53306)/newapi_test?charset=utf8mb4&parseTime=True&loc=UTC
+        run: |
+          set -Eeuo pipefail
+          docker run -d --name custom-mysql -p 127.0.0.1:53306:3306 -e MYSQL_ROOT_PASSWORD=ci-only -e MYSQL_USER=newapi -e MYSQL_PASSWORD=ci-only -e MYSQL_DATABASE=newapi_test --health-cmd='mysqladmin ping -h 127.0.0.1 -pci-only --silent' --health-interval=1s --health-retries=60 mysql:8.4
+          # shellcheck disable=SC2016
+          timeout 90 bash -c 'until [[ "$(docker inspect --format "{{.State.Health.Status}}" custom-mysql)" == healthy ]]; do sleep 1; done'
+          bash "$RUNNER_TEMP/current-custom/bin/verify-release.sh" "$PWD" database
+          unset CUSTOM_TEST_SQL_DSN CUSTOM_TEST_SQL_DRIVER
+          bash "$RUNNER_TEMP/current-custom/bin/verify-release.sh" "$PWD" race
 
-      - name: Promote candidate
-        if: github.event_name == 'schedule' || inputs.promote_candidate
+      - name: Install pinned frontend runner
+        if: steps.registry.outputs.verified != 'true'
+        run: npm install --global bun@1.4.0
+
+      - name: Verify frontend errors, lint and types
         env:
-          IMMUTABLE_REF: ${{ steps.release.outputs.immutable_ref }}
-          CANDIDATE_REF: ${{ steps.release.outputs.candidate_ref }}
+          BUILD_FRONTEND: false
+        if: steps.registry.outputs.verified != 'true'
+        run: bash "$RUNNER_TEMP/current-custom/bin/verify-release.sh" "$PWD" frontend
+
+      - name: Build or fetch immutable image and verify startup
+        if: steps.registry.outputs.verified != 'true'
+        env:
+          IMAGE: ${{ steps.plan.outputs.image }}
           IMAGE_EXISTS: ${{ steps.registry.outputs.exists }}
+          RELEASE: ${{ steps.plan.outputs.release }}
+          UPSTREAM: ${{ steps.plan.outputs.upstream }}
+          PATCH_SHA: ${{ steps.plan.outputs.patch_sha }}
+          BUILD_SHA: ${{ steps.plan.outputs.build_sha }}
+          SOURCE_REF: ${{ steps.plan.outputs.source_ref }}
+          COMMIT: ${{ steps.source.outputs.commit }}
         run: |
           set -Eeuo pipefail
-          if [[ "$IMAGE_EXISTS" == 'true' ]]; then
-            docker buildx imagetools create \
-              --tag "$CANDIDATE_REF" "$IMMUTABLE_REF"
+          if [[ "$IMAGE_EXISTS" == true ]]; then
+            docker pull "$IMAGE"
           else
-            docker tag "$IMMUTABLE_REF" "$CANDIDATE_REF"
-            docker push "$CANDIDATE_REF"
+            docker buildx build --load --platform linux/amd64 --pull \
+              --cache-from type=gha,scope=new-api-custom-amd64 \
+              --cache-to type=gha,mode=max,scope=new-api-custom-amd64 \
+              --label 'com.linjzy.new-api.managed=true' \
+              --label "com.linjzy.new-api.upstream-tag=$RELEASE" \
+              --label "com.linjzy.new-api.upstream-commit=$UPSTREAM" \
+              --label "com.linjzy.new-api.patch-sha256=$PATCH_SHA" \
+              --label "com.linjzy.new-api.build-sha256=$BUILD_SHA" \
+              --label "com.linjzy.new-api.source-ref=$SOURCE_REF" \
+              --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+              --label "org.opencontainers.image.revision=$COMMIT" \
+              --label "org.opencontainers.image.version=$RELEASE" \
+              --label 'org.opencontainers.image.licenses=AGPL-3.0-only' --tag "$IMAGE" .
           fi
+          bash "$RUNNER_TEMP/current-custom/bin/smoke-test-image.sh" "$IMAGE" "$RELEASE"
+          git push origin "HEAD:refs/heads/$SOURCE_REF"
+          docker push "$IMAGE"
 
-      - name: Publish summary
+      - name: Record validation and promote candidate
         env:
-          IMMUTABLE_REF: ${{ steps.release.outputs.immutable_ref }}
-          SOURCE_REF: ${{ steps.release.outputs.source_ref }}
+          IMAGE: ${{ steps.plan.outputs.image }}
+          PROOF: ${{ steps.plan.outputs.proof }}
+          CANDIDATE: ${{ steps.plan.outputs.candidate }}
+          VERIFIED: ${{ steps.registry.outputs.verified }}
+          PROMOTE: ${{ github.event_name == 'schedule' || inputs.promote_candidate || false }}
+          BUILD_SHA: ${{ steps.plan.outputs.build_sha }}
+          VALIDATION_SHA: ${{ steps.plan.outputs.validation_sha }}
+          SOURCE_REF: ${{ steps.plan.outputs.source_ref }}
         run: |
           set -Eeuo pipefail
-          digest="$(
-            docker buildx imagetools inspect "$IMMUTABLE_REF" |
-              awk '/^Digest:/ {print $2; exit}'
-          )"
+          if [[ "$VERIFIED" != true ]]; then
+            docker buildx imagetools create --prefer-index=false --tag "$PROOF" "$IMAGE"
+          fi
+          if [[ "$PROMOTE" == true ]]; then
+            docker buildx imagetools create --prefer-index=false --tag "$CANDIDATE" "$IMAGE"
+          fi
+          # shellcheck disable=SC2016
+          digest="$(docker buildx imagetools inspect "$IMAGE" | awk '/^Digest:/ {print $2; exit}')"
+          # shellcheck disable=SC2016
           {
-            echo '### Custom new-api image'
-            echo
-            printf -- "- Image: \`%s\`\n" "$IMMUTABLE_REF"
-            printf -- "- Digest: \`%s\`\n" "$digest"
-            echo "- Source: https://github.com/${GITHUB_REPOSITORY}/tree/${SOURCE_REF}"
-          } >>"$GITHUB_STEP_SUMMARY"
+            printf 'Image: `%s`\n\nDigest: `%s`\n\n' "$IMAGE" "$digest"
+            printf 'Build inputs: `%s`\n\nValidation: `%s`\n\n' "$BUILD_SHA" "$VALIDATION_SHA"
+            printf 'Source: https://github.com/%s/tree/%s\n\n' "$GITHUB_REPOSITORY" "$SOURCE_REF"
+            printf 'Validation reused: %s; candidate promoted: %s\n' "$VERIFIED" "$PROMOTE"
+          } >> "$GITHUB_STEP_SUMMARY"

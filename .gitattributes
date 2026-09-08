@@ -22,6 +22,9 @@
 # Shell scripts
 *.sh text eol=lf
 
+# Empty diff context lines contain one space; validate the applied source too.
+.linjzy/patches/*.patch whitespace=-blank-at-eol,-space-before-tab
+
 # Binary files
 *.png binary
 *.jpg binary

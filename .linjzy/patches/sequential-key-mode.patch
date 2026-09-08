@@ -1,10 +1,10 @@
 diff --git a/constant/multi_key_mode.go b/constant/multi_key_mode.go
-index cd0cdbff5..2a5e00d86 100644
+index cd0cdbf..2a5e00d 100644
 --- a/constant/multi_key_mode.go
 +++ b/constant/multi_key_mode.go
 @@ -3,6 +3,7 @@ package constant
  type MultiKeyMode string
-
+ 
  const (
 -	MultiKeyModeRandom  MultiKeyMode = "random"  // 随机
 -	MultiKeyModePolling MultiKeyMode = "polling" // 轮询
@@ -13,14 +13,13 @@ index cd0cdbff5..2a5e00d86 100644
 +	MultiKeyModeSequential MultiKeyMode = "sequential" // 顺序优先
  )
 diff --git a/controller/channel-test.go b/controller/channel-test.go
-index f8fad94c..abf65bce 100644
+index f8fad94..abf65bc 100644
 --- a/controller/channel-test.go
 +++ b/controller/channel-test.go
-@@ -68,9 +68,13 @@ func resolveChannelTestUserID(c *gin.Context) (int, error) {
- 	}
+@@ -69,7 +69,11 @@ func resolveChannelTestUserID(c *gin.Context) (int, error) {
  	return rootUser.Id, nil
  }
-
+ 
 -func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool) testResult {
 +func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool, keyIndexes ...*int) testResult {
 +	var keyIndex *int
@@ -30,12 +29,10 @@ index f8fad94c..abf65bce 100644
  	if ctx == nil {
  		ctx = context.Background()
  	}
- 	tik := time.Now()
-@@ -167,9 +171,14 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
- 	c.Set("base_url", channel.GetBaseURL())
+@@ -168,7 +172,12 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
  	group, _ := model.GetUserGroup(testUserID, false)
  	c.Set("group", group)
-
+ 
 -	newAPIError := middleware.SetupContextForSelectedChannel(c, channel, testModel)
 +	var newAPIError *types.NewAPIError
 +	if keyIndex == nil {
@@ -46,9 +43,7 @@ index f8fad94c..abf65bce 100644
  	if newAPIError != nil {
  		return testResult{
  			context:     c,
- 			localErr:    newAPIError,
-@@ -873,9 +882,9 @@ func TestChannel(c *gin.Context) {
- 	requestCtx := context.Background()
+@@ -874,7 +883,7 @@ func TestChannel(c *gin.Context) {
  	if c.Request != nil {
  		requestCtx = c.Request.Context()
  	}
@@ -57,12 +52,10 @@ index f8fad94c..abf65bce 100644
  	if result.localErr != nil {
  		resp := gin.H{
  			"success": false,
- 			"message": result.localErr.Error(),
-@@ -916,13 +925,60 @@ type channelTestSummary struct {
- 	Disabled  int `json:"disabled"`
+@@ -917,11 +926,58 @@ type channelTestSummary struct {
  	Enabled   int `json:"enabled"`
  }
-
+ 
 -func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, testUserID int, allowDisable bool, disableThreshold int64) channelTestSummary {
 +type channelKeyTestFunc func(context.Context, *model.Channel, int) testResult
 +
@@ -120,11 +113,9 @@ index f8fad94c..abf65bce 100644
  	milliseconds := time.Since(tik).Milliseconds()
  	if ctx.Err() != nil {
  		return summary
+@@ -960,6 +1016,13 @@ func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, test
  	}
-@@ -959,8 +1015,15 @@ func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, test
- 		summary.Enabled++
- 	}
-
+ 
  	channel.UpdateResponseTime(milliseconds)
 +	if common.AutomaticEnableChannelEnabled && hasAutoDisabledKeys {
 +		recoverySummary := testAutoDisabledChannelKeys(ctx, channel, testKey)
@@ -135,10 +126,8 @@ index f8fad94c..abf65bce 100644
 +	}
  	return summary
  }
-
- // runChannelTestWorkers executes independent channel tests with bounded
-@@ -1058,9 +1121,10 @@ func runChannelTestWorkers(
-
+ 
+@@ -1059,7 +1122,8 @@ func runChannelTestWorkers(
  // performChannelTests runs channel health checks with the configured bounded
  // concurrency and honors cancellation when a system-task runner loses its
  // lease.
@@ -148,9 +137,7 @@ index f8fad94c..abf65bce 100644
  	if ctx == nil {
  		ctx = context.Background()
  	}
- 	disableThreshold := int64(common.ChannelDisableThreshold * 1000)
-@@ -1071,9 +1135,9 @@ func performChannelTests(ctx context.Context, channels []*model.Channel, testUse
- 		ctx,
+@@ -1072,7 +1136,7 @@ func performChannelTests(ctx context.Context, channels []*model.Channel, testUse
  		channels,
  		concurrency,
  		func(ctx context.Context, channel *model.Channel) channelTestSummary {
@@ -159,9 +146,7 @@ index f8fad94c..abf65bce 100644
  		},
  		report,
  	)
- }
-@@ -1099,10 +1163,11 @@ func runChannelTestTask(ctx context.Context, mode string, notify bool, report fu
- 		mode = operation_setting.GetMonitorSetting().ChannelTestMode
+@@ -1100,8 +1164,9 @@ func runChannelTestTask(ctx context.Context, mode string, notify bool, report fu
  	}
  	selected := selectChannelsForAutomaticTest(channels, mode)
  	allowDisable := mode != operation_setting.ChannelTestModePassiveRecovery
@@ -172,9 +157,7 @@ index f8fad94c..abf65bce 100644
  	if notify && (ctx == nil || ctx.Err() == nil) {
  		service.NotifyRootUser(dto.NotifyTypeChannelTest, "通道测试完成", "所有通道测试已完成")
  	}
- 	return summary, nil
-@@ -1117,9 +1182,11 @@ func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*m
- 		if mode == operation_setting.ChannelTestModeAutoBanOnly && !channel.GetAutoBan() {
+@@ -1118,7 +1183,9 @@ func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*m
  			continue
  		}
  		if mode == operation_setting.ChannelTestModePassiveRecovery && channel.Status != common.ChannelStatusAutoDisabled {
@@ -185,15 +168,14 @@ index f8fad94c..abf65bce 100644
  		}
  		selected = append(selected, channel)
  	}
- 	return selected
 diff --git a/controller/relay.go b/controller/relay.go
-index ca9b35d8b..10e69961e 100644
+index ca9b35d..10e6996 100644
 --- a/controller/relay.go
 +++ b/controller/relay.go
 @@ -193,7 +193,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
  	relayInfo.RetryIndex = 0
  	relayInfo.LastError = nil
-
+ 
 -	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
 +	for ; retryParam.GetRetry() <= common.RetryTimes || retryParam.HasSequentialChannel(); retryParam.IncreaseRetry() {
  		relayInfo.RetryIndex = retryParam.GetRetry()
@@ -202,7 +184,7 @@ index ca9b35d8b..10e69961e 100644
 @@ -238,7 +238,34 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
  		newAPIError = service.NormalizeViolationFeeError(newAPIError)
  		relayInfo.LastError = newAPIError
-
+ 
 -		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError, relayInfo)
 +		// On the first attempt getChannel intentionally returns a lightweight
 +		// placeholder because the distributor already selected the channel. Use
@@ -232,12 +214,12 @@ index ca9b35d8b..10e69961e 100644
 +			retryParam.SetSequentialChannel(channelForError.Id)
 +			continue
 +		}
-
+ 
  		if !shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry()) {
  			break
 @@ -332,6 +359,21 @@ func fastTokenCountMetaForPricing(request dto.Request) *types.TokenCountMeta {
  }
-
+ 
  func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service.RetryParam) (*model.Channel, *types.NewAPIError) {
 +	if pinnedChannelID := retryParam.TakeSequentialChannel(); pinnedChannelID > 0 {
 +		channel, err := model.CacheGetChannel(pinnedChannelID)
@@ -260,7 +242,7 @@ index ca9b35d8b..10e69961e 100644
 @@ -362,6 +404,25 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
  	return channel, nil
  }
-
+ 
 +func resolveRelayChannel(channel *model.Channel) *model.Channel {
 +	if channel == nil || channel.Id <= 0 {
 +		return channel
@@ -285,7 +267,7 @@ index ca9b35d8b..10e69961e 100644
  		return false
 @@ -395,13 +456,30 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
  }
-
+ 
  func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError, relayInfo *relaycommon.RelayInfo) {
 +	channel, _ := model.CacheGetChannel(channelError.ChannelId)
 +	processChannelErrorForChannel(c, channelError, err, channel, relayInfo)
@@ -316,20 +298,20 @@ index ca9b35d8b..10e69961e 100644
 +			})
 +		}
  	}
-
+ 
  	if constant.ErrorLogEnabled && types.IsRecordErrorLog(err) {
 @@ -428,6 +506,7 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
  		model.RecordErrorLog(c, userId, channelError.ChannelId, modelName, tokenName, err.MaskSensitiveErrorWithStatusCode(), tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other)
  	}
-
+ 
 +	return sequentialKeyDisabled
  }
-
+ 
  func RelayMidjourney(c *gin.Context) {
 @@ -623,7 +702,7 @@ func executeTaskSubmissionWith(
  		Retry:       common.GetPointer(0),
  	}
-
+ 
 -	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
 +	for ; retryParam.GetRetry() <= common.RetryTimes || retryParam.HasSequentialChannel(); retryParam.IncreaseRetry() {
  		stage = "select_channel"
@@ -337,7 +319,7 @@ index ca9b35d8b..10e69961e 100644
  			diagnostics.cancelled("before_attempt", retryParam.GetRetry()+1)
 @@ -633,8 +712,20 @@ func executeTaskSubmissionWith(
  		var channel *model.Channel
-
+ 
  		if lockedCh, ok := relayInfo.LockedChannel.(*model.Channel); ok && lockedCh != nil {
 -			channel = lockedCh
 -			if retryParam.GetRetry() > 0 {
@@ -361,7 +343,7 @@ index ca9b35d8b..10e69961e 100644
 @@ -676,16 +767,25 @@ func executeTaskSubmissionWith(
  			break
  		}
-
+ 
 +		retrySequentialKey := false
  		if !taskErr.LocalError {
 -			processChannelError(c,
@@ -380,7 +362,7 @@ index ca9b35d8b..10e69961e 100644
 +				retrySequentialKey = true
 +			}
  		}
-
+ 
 -		willRetry := shouldRetryTaskRelay(c, channel.Id, taskErr, common.RetryTimes-retryParam.GetRetry())
 +		willRetry := retrySequentialKey || shouldRetryTaskRelay(c, channel.Id, taskErr, common.RetryTimes-retryParam.GetRetry())
  		diagnostics.attemptFailed(retryParam.GetRetry()+1, channel, taskErr, willRetry)
@@ -393,7 +375,7 @@ index ca9b35d8b..10e69961e 100644
 @@ -853,6 +953,20 @@ func respondTaskSubmissionError(c *gin.Context, taskErr *taskdto.TaskError) {
  	respondTaskError(c, taskErr)
  }
-
+ 
 +func resolveLockedTaskRetryChannel(lockedChannel *model.Channel, sequentialKeyFallback bool) (*model.Channel, error) {
 +	if !sequentialKeyFallback {
 +		return lockedChannel, nil
@@ -412,12 +394,12 @@ index ca9b35d8b..10e69961e 100644
  func respondTaskError(c *gin.Context, taskErr *taskdto.TaskError) {
  	if taskErr.StatusCode == http.StatusTooManyRequests {
 diff --git a/middleware/distributor.go b/middleware/distributor.go
-index e7fa84f83..9f0a07426 100644
+index e7fa84f..9f0a074 100644
 --- a/middleware/distributor.go
 +++ b/middleware/distributor.go
 @@ -604,6 +604,18 @@ func getTaskOriginModelName(c *gin.Context) string {
  }
-
+ 
  func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, modelName string) *types.NewAPIError {
 +	return setupContextForSelectedChannel(c, channel, modelName, nil)
 +}
@@ -437,7 +419,7 @@ index e7fa84f83..9f0a07426 100644
 @@ -667,9 +679,32 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
  	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
  	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
-
+ 
 -	key, index, newAPIError := channel.GetNextEnabledKey()
 -	if newAPIError != nil {
 -		return newAPIError
@@ -471,7 +453,7 @@ index e7fa84f83..9f0a07426 100644
  	if channel.ChannelInfo.IsMultiKey {
  		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, true)
 diff --git a/model/channel.go b/model/channel.go
-index 268f190e7..609d156cc 100644
+index 268f190..84291d0 100644
 --- a/model/channel.go
 +++ b/model/channel.go
 @@ -6,6 +6,7 @@ import (
@@ -481,11 +463,11 @@ index 268f190e7..609d156cc 100644
 +	"sort"
  	"strings"
  	"sync"
-
+ 
 @@ -201,6 +202,25 @@ func (channel *Channel) GetKeys() []string {
  	return keys
  }
-
+ 
 +// AutoDisabledKeyIndexes returns valid multi-key indexes that were disabled
 +// automatically. Manually disabled keys are deliberately excluded from
 +// automatic recovery.
@@ -522,7 +504,7 @@ index 268f190e7..609d156cc 100644
 @@ -668,29 +692,36 @@ func CleanupChannelPollingLocks() {
  	})
  }
-
+ 
 -func handlerMultiKeyUpdate(channel *Channel, usingKey string, status int, reason string) {
 +func handlerMultiKeyUpdate(channel *Channel, usingKey string, usingKeyIndex int, status int, reason string) bool {
  	keys := channel.GetKeys()
@@ -570,11 +552,11 @@ index 268f190e7..609d156cc 100644
  	}
 +	return true
  }
-
+ 
  func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
-@@ -734,6 +766,92 @@ func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
+@@ -734,6 +766,99 @@ func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
  }
-
+ 
  func UpdateChannelStatus(channelId int, usingKey string, status int, reason string) bool {
 +	return updateChannelStatus(channelId, usingKey, -1, status, reason)
 +}
@@ -590,16 +572,21 @@ index 268f190e7..609d156cc 100644
 +// prevent a stale check result from enabling a credential that an operator
 +// replaced or whose status changed while the upstream request was in flight.
 +func EnableAutoDisabledChannelKey(channelId int, keyIndex int, expectedKey string, expectedDisabledTime int64) bool {
-+	if common.MemoryCacheEnabled {
-+		channelStatusLock.Lock()
-+		defer channelStatusLock.Unlock()
-+	}
++	var recovered *Channel
++	statusChanged := false
++	defer func() {
++		// Run after the per-channel lock is released. A credential-only update
++		// does not change pricing or task routing availability.
++		if recovered != nil && statusChanged {
++			InvalidatePricingCache()
++			rebuildTaskAliasView()
++		}
++	}()
 +
 +	pollingLock := GetChannelPollingLock(channelId)
 +	pollingLock.Lock()
 +	defer pollingLock.Unlock()
 +
-+	updated := false
 +	err := DB.Transaction(func(tx *gorm.DB) error {
 +		channel := &Channel{}
 +		if err := lockForUpdate(tx).First(channel, "id = ?", channelId).Error; err != nil {
@@ -628,6 +615,7 @@ index 268f190e7..609d156cc 100644
 +			"channel_info": channel.ChannelInfo,
 +		}
 +		if channel.Status == common.ChannelStatusAutoDisabled {
++			statusChanged = true
 +			channel.Status = common.ChannelStatusEnabled
 +			info := channel.GetOtherInfo()
 +			delete(info, "status_reason")
@@ -646,18 +634,19 @@ index 268f190e7..609d156cc 100644
 +		if err := tx.Model(&Channel{}).Where("id = ?", channelId).Updates(updates).Error; err != nil {
 +			return err
 +		}
-+		updated = true
++		recovered = channel
 +		return nil
 +	})
 +	if err != nil {
++		recovered = nil
 +		common.SysLog(fmt.Sprintf("failed to auto-enable channel key: channel_id=%d, key_index=%d, error=%v", channelId, keyIndex, err))
 +		return false
 +	}
-+	if !updated {
++	if recovered == nil {
 +		return false
 +	}
 +
-+	InitChannelCache()
++	cacheRecoveredChannelKey(recovered)
 +	return true
 +}
 +
@@ -665,7 +654,7 @@ index 268f190e7..609d156cc 100644
  	if common.MemoryCacheEnabled {
  		channelStatusLock.Lock()
  		defer channelStatusLock.Unlock()
-@@ -754,7 +872,9 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
+@@ -754,7 +879,9 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
  		if channelCache.ChannelInfo.IsMultiKey {
  			beforeStatus := channelCache.Status
  			// 如果是多Key模式，更新缓存中的状态
@@ -676,8 +665,8 @@ index 268f190e7..609d156cc 100644
  			if beforeStatus != channelCache.Status {
  				CacheUpdateChannelStatus(channelId, channelCache.Status)
  			}
-@@ -788,7 +908,9 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
-
+@@ -788,7 +915,9 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
+ 
  		if channel.ChannelInfo.IsMultiKey {
  			beforeStatus := channel.Status
 -			handlerMultiKeyUpdate(channel, usingKey, status, reason)
@@ -687,20 +676,78 @@ index 268f190e7..609d156cc 100644
  			if beforeStatus != channel.Status {
  				shouldUpdateAbilities = true
  			}
+diff --git a/model/channel_cache.go b/model/channel_cache.go
+index 1fcfe61..e8d964c 100644
+--- a/model/channel_cache.go
++++ b/model/channel_cache.go
+@@ -307,3 +307,50 @@ func CacheUpdateChannel(channel *Channel) {
+ 	channelSyncLock.Unlock()
+ 	InvalidatePricingCache()
+ }
++
++// cacheRecoveredChannelKey publishes a committed recovery while the caller owns
++// the channel's polling lock. It preserves the live cursor and restores routing
++// membership without reloading every channel and ability from the database.
++func cacheRecoveredChannelKey(channel *Channel) {
++	if !common.MemoryCacheEnabled {
++		return
++	}
++	channelSyncLock.Lock()
++	defer channelSyncLock.Unlock()
++	if channelsIDM == nil {
++		channelsIDM = make(map[int]*Channel)
++	}
++	if previous := channelsIDM[channel.Id]; previous != nil &&
++		previous.ChannelInfo.MultiKeyMode == constant.MultiKeyModePolling &&
++		channel.ChannelInfo.MultiKeyMode == constant.MultiKeyModePolling {
++		channel.ChannelInfo.MultiKeyPollingIndex = previous.ChannelInfo.MultiKeyPollingIndex
++	}
++	channel.Keys = channel.GetKeys()
++	channelsIDM[channel.Id] = channel
++	if group2model2channels == nil {
++		group2model2channels = make(map[string]map[string][]int)
++	}
++	for _, group := range strings.Split(channel.Group, ",") {
++		if group2model2channels[group] == nil {
++			group2model2channels[group] = make(map[string][]int)
++		}
++		for _, model := range channel.GetModels() {
++			ids := group2model2channels[group][model]
++			present := false
++			for _, id := range ids {
++				if id == channel.Id {
++					present = true
++					break
++				}
++			}
++			if present {
++				continue
++			}
++			ids = append(ids, channel.Id)
++			sort.SliceStable(ids, func(i, j int) bool {
++				return channelsIDM[ids[i]].GetPriority() > channelsIDM[ids[j]].GetPriority()
++			})
++			group2model2channels[group][model] = ids
++		}
++	}
++}
 diff --git a/service/channel.go b/service/channel.go
-index f348e081e..10d336e4f 100644
+index f348e08..6cc6900 100644
 --- a/service/channel.go
 +++ b/service/channel.go
-@@ -5,6 +5,7 @@ import (
+@@ -4,7 +4,10 @@ import (
+ 	"fmt"
  	"strings"
-
+ 
++	"github.com/bytedance/gopkg/util/gopool"
++
  	"github.com/QuantumNous/new-api/common"
 +	"github.com/QuantumNous/new-api/constant"
  	"github.com/QuantumNous/new-api/model"
  	"github.com/QuantumNous/new-api/relaykit/dto"
  	"github.com/QuantumNous/new-api/relaykit/types"
-@@ -17,20 +18,40 @@ func formatNotifyType(channelId int, status int) string {
-
+@@ -17,20 +20,47 @@ func formatNotifyType(channelId int, status int) string {
+ 
  // disable & notify
  func DisableChannel(channelError types.ChannelError, reason string) {
 +	disableChannel(channelError, reason)
@@ -712,14 +759,14 @@ index f348e081e..10d336e4f 100644
 +
 +func disableChannelKey(channelError types.ChannelError, usingKeyIndex int, reason string) bool {
  	common.SysLog(fmt.Sprintf("通道「%s」（#%d）发生错误，准备禁用，原因：%s", channelError.ChannelName, channelError.ChannelId, common.LocalLogPreview(reason)))
-
+ 
  	// 检查是否启用自动禁用功能
  	if !channelError.AutoBan {
  		common.SysLog(fmt.Sprintf("通道「%s」（#%d）未启用自动禁用功能，跳过禁用操作", channelError.ChannelName, channelError.ChannelId))
 -		return
 +		return false
  	}
-
+ 
 -	success := model.UpdateChannelStatus(channelError.ChannelId, channelError.UsingKey, common.ChannelStatusAutoDisabled, reason)
 +	var success bool
 +	if usingKeyIndex >= 0 {
@@ -736,16 +783,24 @@ index f348e081e..10d336e4f 100644
  	if success {
  		subject := fmt.Sprintf("通道「%s」（#%d）已被禁用", channelError.ChannelName, channelError.ChannelId)
  		content := fmt.Sprintf("通道「%s」（#%d）已被禁用，原因：%s", channelError.ChannelName, channelError.ChannelId, reason)
- 		NotifyRootUser(formatNotifyType(channelError.ChannelId, common.ChannelStatusAutoDisabled), subject, content)
+-		NotifyRootUser(formatNotifyType(channelError.ChannelId, common.ChannelStatusAutoDisabled), subject, content)
++		notifyType := formatNotifyType(channelError.ChannelId, common.ChannelStatusAutoDisabled)
++		if usingKeyIndex >= 0 {
++			// Persist the retired key before retrying, but do not wait for an
++			// email or webhook to finish before selecting the next credential.
++			gopool.Go(func() { NotifyRootUser(notifyType, subject, content) })
++		} else {
++			NotifyRootUser(notifyType, subject, content)
++		}
  	}
 +	return success
  }
-
+ 
  func EnableChannel(channelId int, usingKey string, channelName string) {
-@@ -42,10 +63,7 @@ func EnableChannel(channelId int, usingKey string, channelName string) {
+@@ -42,10 +72,7 @@ func EnableChannel(channelId int, usingKey string, channelName string) {
  	}
  }
-
+ 
 -func ShouldDisableChannel(err *types.NewAPIError) bool {
 -	if !common.AutomaticDisableChannelEnabled {
 -		return false
@@ -754,10 +809,10 @@ index f348e081e..10d336e4f 100644
  	if err == nil {
  		return false
  	}
-@@ -64,6 +82,47 @@ func ShouldDisableChannel(err *types.NewAPIError) bool {
+@@ -64,6 +91,47 @@ func ShouldDisableChannel(err *types.NewAPIError) bool {
  	return search
  }
-
+ 
 +func ShouldDisableChannel(err *types.NewAPIError) bool {
 +	if !common.AutomaticDisableChannelEnabled {
 +		return false
@@ -803,7 +858,7 @@ index f348e081e..10d336e4f 100644
  	if !common.AutomaticEnableChannelEnabled {
  		return false
 diff --git a/service/channel_select.go b/service/channel_select.go
-index d37d4f6d3..7f623eadf 100644
+index d37d4f6..7f623ea 100644
 --- a/service/channel_select.go
 +++ b/service/channel_select.go
 @@ -42,6 +42,10 @@ type RetryParam struct {
@@ -815,12 +870,12 @@ index d37d4f6d3..7f623eadf 100644
 +	// key priority is not accidentally replaced by channel priority/weight.
 +	sequentialChannelID int
  }
-
+ 
  func (p *RetryParam) GetRetry() int {
 @@ -70,6 +74,26 @@ func (p *RetryParam) ResetRetryNextTry() {
  	p.resetNextTry = true
  }
-
+ 
 +// SetSequentialChannel pins one same-channel key fallback and suppresses the
 +// loop's next channel retry increment. Rotating keys must not consume RetryTimes.
 +func (p *RetryParam) SetSequentialChannel(channelID int) {
@@ -845,7 +900,7 @@ index d37d4f6d3..7f623eadf 100644
  // 尝试获取一个满足要求的随机渠道。
  //
 diff --git a/web/src/features/channels/components/channels-columns.tsx b/web/src/features/channels/components/channels-columns.tsx
-index ad6fadcd7..820d84043 100644
+index ad6fadc..820d840 100644
 --- a/web/src/features/channels/components/channels-columns.tsx
 +++ b/web/src/features/channels/components/channels-columns.tsx
 @@ -21,6 +21,7 @@ import { useQueryClient } from '@tanstack/react-query'
@@ -875,16 +930,16 @@ index ad6fadcd7..820d84043 100644
 +            MultiKeyModeIcon = ArrowDownWideNarrow
 +            multiKeyTooltip = t('Multi-key: Sequential priority')
 +          }
-
+ 
            const ionetMeta = parseIonetMeta(channel.other_info)
            const isIonet = ionetMeta?.source === 'ionet'
 diff --git a/web/src/features/channels/components/dialogs/multi-key-manage-dialog.tsx b/web/src/features/channels/components/dialogs/multi-key-manage-dialog.tsx
-index 22f752149..d349da9e1 100644
+index 22f7521..d349da9 100644
 --- a/web/src/features/channels/components/dialogs/multi-key-manage-dialog.tsx
 +++ b/web/src/features/channels/components/dialogs/multi-key-manage-dialog.tsx
 @@ -149,7 +149,7 @@ export function MultiKeyManageDialog({
    }
-
+ 
    const handleStatusFilterChange = (value: string) => {
 -    const newFilter = value === 'all' ? null : parseInt(value)
 +    const newFilter = value === 'all' ? null : Number.parseInt(value)
@@ -892,9 +947,9 @@ index 22f752149..d349da9e1 100644
      setCurrentPage(1)
      loadKeyStatus(1, pageSize, newFilter)
 @@ -235,6 +235,13 @@ export function MultiKeyManageDialog({
-
+ 
    if (!currentRow) return null
-
+ 
 +  let multiKeyModeLabel = t('Polling')
 +  if (currentRow.channel_info?.multi_key_mode === 'random') {
 +    multiKeyModeLabel = t('Random')
@@ -936,7 +991,7 @@ index 22f752149..d349da9e1 100644
                onValueChange={(v) => v !== null && handleStatusFilterChange(v)}
              >
 @@ -378,15 +379,17 @@ export function MultiKeyManageDialog({
-
+ 
            {/* Table */}
            <div className='min-h-0 flex-1 overflow-auto rounded-md border'>
 -            {isLoading ? (
@@ -957,7 +1012,7 @@ index 22f752149..d349da9e1 100644
                  className='rounded-none border-0'
                  tableClassName='min-w-[800px]'
 diff --git a/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx b/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx
-index 075b1e107..e7d851ef9 100644
+index 075b1e1..e7d851e 100644
 --- a/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx
 +++ b/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx
 @@ -699,6 +699,22 @@ export function ChannelMutateDrawer({
@@ -1021,7 +1076,7 @@ index 075b1e107..e7d851ef9 100644
                                          <FormMessage />
                                        </FormItem>
 diff --git a/web/src/features/channels/constants.ts b/web/src/features/channels/constants.ts
-index 4fd49567d..cee7f4cb0 100644
+index 4fd4956..cee7f4c 100644
 --- a/web/src/features/channels/constants.ts
 +++ b/web/src/features/channels/constants.ts
 @@ -203,6 +203,7 @@ export const MULTI_KEY_STATUS_CONFIG = {
@@ -1030,10 +1085,10 @@ index 4fd49567d..cee7f4cb0 100644
    { value: 'polling', label: 'Polling' },
 +  { value: 'sequential', label: 'Sequential' },
  ] as const
-
+ 
  export const ADD_MODE_OPTIONS = [
 diff --git a/web/src/features/channels/lib/channel-form.ts b/web/src/features/channels/lib/channel-form.ts
-index f31a5c424..eebc4a354 100644
+index f31a5c4..eebc4a3 100644
 --- a/web/src/features/channels/lib/channel-form.ts
 +++ b/web/src/features/channels/lib/channel-form.ts
 @@ -251,7 +251,7 @@ export const channelFormSchema = z
@@ -1055,7 +1110,7 @@ index f31a5c424..eebc4a354 100644
    channel: Partial<Channel>
  } {
 diff --git a/web/src/features/channels/types.ts b/web/src/features/channels/types.ts
-index 6b53c336f..216a63a95 100644
+index 6b53c33..216a63a 100644
 --- a/web/src/features/channels/types.ts
 +++ b/web/src/features/channels/types.ts
 @@ -29,7 +29,7 @@ export const channelInfoSchema = z.object({
@@ -1065,7 +1120,7 @@ index 6b53c336f..216a63a95 100644
 -  multi_key_mode: z.enum(['random', 'polling']).default('random'),
 +  multi_key_mode: z.enum(['random', 'polling', 'sequential']).default('random'),
  })
-
+ 
  export type ChannelInfo = z.infer<typeof channelInfoSchema>
 @@ -364,7 +364,7 @@ export interface ChannelFormData {
    other?: string
@@ -1075,9 +1130,9 @@ index 6b53c336f..216a63a95 100644
 +  multi_key_type?: 'random' | 'polling' | 'sequential'
    batch_add_set_key_prefix_2_name?: boolean
  }
-
+ 
 @@ -374,7 +374,7 @@ export interface ChannelFormData {
-
+ 
  export interface AddChannelRequest {
    mode: 'single' | 'batch' | 'multi_to_single'
 -  multi_key_mode?: 'random' | 'polling'
@@ -1086,7 +1141,7 @@ index 6b53c336f..216a63a95 100644
    channel: Partial<Channel>
  }
 diff --git a/web/src/i18n/locales/en.json b/web/src/i18n/locales/en.json
-index 7a6fdd1e9..b8fa90697 100644
+index 7a6fdd1..b8fa906 100644
 --- a/web/src/i18n/locales/en.json
 +++ b/web/src/i18n/locales/en.json
 @@ -404,6 +404,7 @@
@@ -1114,7 +1169,7 @@ index 7a6fdd1e9..b8fa90697 100644
      "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.",
      "Rankings": "Rankings",
 diff --git a/web/src/i18n/locales/fr.json b/web/src/i18n/locales/fr.json
-index e28f968de..93bec3eda 100644
+index e28f968..93bec3e 100644
 --- a/web/src/i18n/locales/fr.json
 +++ b/web/src/i18n/locales/fr.json
 @@ -404,6 +404,7 @@
@@ -1142,7 +1197,7 @@ index e28f968de..93bec3eda 100644
      "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "Les données de classement sont actuellement simulées à des fins d'aperçu et seront remplacées par des analyses en direct une fois l'intégration backend livrée.",
      "Rankings": "Classements",
 diff --git a/web/src/i18n/locales/ja.json b/web/src/i18n/locales/ja.json
-index 6eae5ab8b..2f4f4942f 100644
+index 6eae5ab..2f4f494 100644
 --- a/web/src/i18n/locales/ja.json
 +++ b/web/src/i18n/locales/ja.json
 @@ -404,6 +404,7 @@
@@ -1170,7 +1225,7 @@ index 6eae5ab8b..2f4f4942f 100644
      "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "現在のランキングデータはプレビュー用のシミュレーションです。バックエンド連携が完了次第、リアルタイム分析データに置き換わります。",
      "Rankings": "ランキング",
 diff --git a/web/src/i18n/locales/ru.json b/web/src/i18n/locales/ru.json
-index 8abaf2bd5..94fa784ae 100644
+index 8abaf2b..94fa784 100644
 --- a/web/src/i18n/locales/ru.json
 +++ b/web/src/i18n/locales/ru.json
 @@ -404,6 +404,7 @@
@@ -1198,7 +1253,7 @@ index 8abaf2bd5..94fa784ae 100644
      "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "Сейчас данные рейтинга смоделированы для превью; после внедрения бэкенда они будут заменены реальной аналитикой.",
      "Rankings": "Рейтинги",
 diff --git a/web/src/i18n/locales/vi.json b/web/src/i18n/locales/vi.json
-index f735ea6fa..d102b6392 100644
+index f735ea6..d102b63 100644
 --- a/web/src/i18n/locales/vi.json
 +++ b/web/src/i18n/locales/vi.json
 @@ -404,6 +404,7 @@
@@ -1226,7 +1281,7 @@ index f735ea6fa..d102b6392 100644
      "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "Dữ liệu xếp hạng hiện đang được mô phỏng để xem trước và sẽ được thay bằng dữ liệu thực sau khi tích hợp backend.",
      "Rankings": "Bảng xếp hạng",
 diff --git a/web/src/i18n/locales/zh-TW.json b/web/src/i18n/locales/zh-TW.json
-index af7429daf..16f2d0f72 100644
+index af7429d..16f2d0f 100644
 --- a/web/src/i18n/locales/zh-TW.json
 +++ b/web/src/i18n/locales/zh-TW.json
 @@ -404,6 +404,7 @@
@@ -1254,7 +1309,7 @@ index af7429daf..16f2d0f72 100644
      "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "目前排行榜數據為預覽用模擬數據，後端整合完成後將替換為真實分析數據。",
      "Rankings": "排行榜",
 diff --git a/web/src/i18n/locales/zh.json b/web/src/i18n/locales/zh.json
-index abce204ce..0ff94b8b8 100644
+index abce204..0ff94b8 100644
 --- a/web/src/i18n/locales/zh.json
 +++ b/web/src/i18n/locales/zh.json
 @@ -404,6 +404,7 @@
