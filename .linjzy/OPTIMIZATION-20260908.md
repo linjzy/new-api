@@ -21,7 +21,7 @@
 - 恢复计费、Key、通知阻塞、自动刷新回归门禁；PostgreSQL 为常规门禁，相关变更增加 MySQL 与 race 检查。
 - 前端 lint、类型检查和测试在发布前执行，Dockerfile 负责生产构建。
 
-## 已验证
+## 发布前已验证
 
 - 三份最终补丁逐个直接应用 rc.34、rc.35；rc.35 的 42 个补丁目标文件与测试源码一致。
 - Go 针对性门禁：relay、relay/channel、openai、model、service 通过。
@@ -36,11 +36,22 @@
 生产脚本 SHA-256：
 `8ff44477e6c5bfdd8096b37811949f5a9f08e53f21eb716ba2749f9b7876c94a`
 
-## 发布前状态
+## 发布与部署结果
 
-以上为本地优化完成时的验证记录。完整 Docker 镜像构建、MySQL 门禁及容器启动检查由
-GitHub Actions 发布流程执行，通过后部署不可变镜像。生产部署脚本优化已先行安装验证。
-发布及生产验证结果见后续执行记录。
+2026-09-08 11:29:27（Asia/Shanghai）完成生产部署，应用由 rc.34 升级至带本次优化补丁的 rc.35。
+
+- 优化提交：[`1a3fa18`](https://github.com/linjzy/new-api/commit/1a3fa18c07906330a06f5386f0464e1bd4fa0606)。
+- [完整发布流水线](https://github.com/linjzy/new-api/actions/runs/34182780328)成功：Go、SQLite、PostgreSQL、MySQL、race、8 个 Python 契约测试、前端 lint/类型检查/3 个回归、Docker 生产构建及容器启动检查全部通过。
+- [候选更新流水线](https://github.com/linjzy/new-api/actions/runs/34183269808)成功：命中同镜像与完整验证记录，跳过源码准备、依赖安装、测试和构建，更新 candidate。
+- 公开源码：[`6657a420`](https://github.com/linjzy/new-api/tree/6657a420507e310b661830df485e083ef9e6eefe)，上游提交 `bee45b58a3c0b77e8dc81e6b5aeb4474aa9058d1`。
+- 部署镜像：`ghcr.io/linjzy/new-api@sha256:2b599a8afa8a5772af6f2bfc5a58de2b5d836c10224150773452882b4cd8f998`；线上标签中的补丁 SHA 与本地三份最终补丁一致。
+- systemd 部署任务 `newapi-custom-activate-20260908032851.service` 返回 0，阶段 complete，总耗时 36 秒，其中已有连接排空 27 秒，激活与健康验证 8 秒。
+- 本机和公网 `/api/status` 均为 HTTP 200、success=true、版本 v1.0.0-rc.35；公网首页与引用的 JavaScript 资源为 HTTP 200。
+- 新应用容器 healthy，启动日志确认 PostgreSQL、Redis 及 rc.35；PostgreSQL/Redis 容器 ID、镜像和启动时间保持不变。
+- candidate、验证记录与生产镜像 digest 一致；维护门闩已解除，临时候选和调度状态已清理。
+- 旧 rc.34 镜像和当次临时回退 tag 已删除；服务器只剩运行中的 New API、PostgreSQL、Redis 三个镜像，备份文件数量为 0。
+
+## 未来版本兼容范围
 
 当前未发布的 fork main 与 rc.34/rc.35 的中继结构不同；已验证预检会在修改应用源码前拒绝不兼容的结构。
 新旧前端路径可显式识别，但该新中继结构仍需针对未来发布单独移植，不能自动强套补丁。
