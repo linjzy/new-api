@@ -31,12 +31,18 @@ concurrency:
 
 jobs:
   release:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
+
+      - name: Delete all branches except main before building
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .linjzy/bin/cleanup-branches.py --repository "$GITHUB_REPOSITORY"
 
       - name: Resolve exact upstream and content identities
         id: plan
@@ -87,34 +93,38 @@ jobs:
         env:
           IMAGE: ${{ steps.plan.outputs.image }}
           PROOF: ${{ steps.plan.outputs.proof }}
-          SOURCE_REF: ${{ steps.plan.outputs.source_ref }}
         run: |
           set -Eeuo pipefail
-          digest=''
-          source_refs="$(git ls-remote --heads origin "refs/heads/$SOURCE_REF")"
-          if [[ -n "$source_refs" ]]; then
-            digest="$(bash .linjzy/bin/registry-digest.sh "$IMAGE")"
-          fi
+          digest="$(bash .linjzy/bin/registry-digest.sh "$IMAGE")"
           proof="$(bash .linjzy/bin/registry-digest.sh "$PROOF")"
           echo "exists=$([[ -n "$digest" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
           echo "verified=$([[ -n "$digest" && "$digest" == "$proof" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
       - name: Prepare exact source and current verification bundle
-        if: steps.registry.outputs.verified != 'true'
         id: source
         env:
           SOURCE_REF: ${{ steps.plan.outputs.source_ref }}
           UPSTREAM: ${{ steps.plan.outputs.upstream }}
           RELEASE: ${{ steps.plan.outputs.release }}
           BUILD_SHA: ${{ steps.plan.outputs.build_sha }}
+          IMAGE: ${{ steps.plan.outputs.image }}
+          IMAGE_EXISTS: ${{ steps.registry.outputs.exists }}
         run: |
           set -Eeuo pipefail
           cp -R .linjzy "$RUNNER_TEMP/current-custom"
           cp .github/workflows/custom-image.yml "$RUNNER_TEMP/custom-image.yml"
-          source_refs="$(git ls-remote --heads origin "refs/heads/$SOURCE_REF")"
-          if [[ -n "$source_refs" ]]; then
-            git fetch --depth=1 origin "refs/heads/$SOURCE_REF"
-            git checkout --detach FETCH_HEAD
+          if [[ "$IMAGE_EXISTS" == true ]]; then
+            commit="$(docker buildx imagetools inspect "$IMAGE" --format '{{json .Image}}' |
+              jq -er --arg source "$SOURCE_REF" --arg repository "https://github.com/$GITHUB_REPOSITORY" '
+                .config.Labels | select(.["com.linjzy.new-api.managed"] == "true"
+                  and .["com.linjzy.new-api.source-ref"] == $source
+                  and .["org.opencontainers.image.source"] == $repository)
+                | .["org.opencontainers.image.revision"]')"
+            [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+            if ! git cat-file -e "$commit^{commit}"; then
+              git fetch --no-tags --depth=1 origin "$commit"
+            fi
+            git checkout --detach "$commit"
           else
             git checkout --detach "$UPSTREAM"
             cp -R "$RUNNER_TEMP/current-custom" .linjzy
@@ -207,8 +217,14 @@ jobs:
               --label 'org.opencontainers.image.licenses=AGPL-3.0-only' --tag "$IMAGE" .
           fi
           bash "$RUNNER_TEMP/current-custom/bin/smoke-test-image.sh" "$IMAGE" "$RELEASE"
-          git push origin "HEAD:refs/heads/$SOURCE_REF"
+          git push --force-with-lease="refs/heads/$SOURCE_REF:" origin "HEAD:refs/heads/$SOURCE_REF"
           docker push "$IMAGE"
+
+      - name: Restore source branch for the reused image
+        if: steps.registry.outputs.verified == 'true'
+        env:
+          SOURCE_REF: ${{ steps.plan.outputs.source_ref }}
+        run: git push --force-with-lease="refs/heads/$SOURCE_REF:" origin "HEAD:refs/heads/$SOURCE_REF"
 
       - name: Record validation and promote candidate
         env:

@@ -22,7 +22,7 @@
 - 镜像标签：`ghcr.io/linjzy/new-api:<release>-custom-<build-sha>-<upstream-sha>`。
 - 构建与验证分别计算摘要；已有镜像和匹配验证记录时复用结果。
 - 定时发布或手动设置 `promote_candidate=true` 才更新 `candidate`；部署使用不可变 digest。
-- 部署成功后由 [清理任务](../.github/workflows/custom-cleanup.yml)保留生产和候选源码，删除旧 `custom/*` 发布分支；与构建串行执行。普通 PR 合并后由 GitHub 自动删分支。
+- 每次 Actions 构建前删除 `main` 以外的所有分支，构建后保留当前源码分支；复用镜像时按镜像记录的提交恢复分支。普通 PR 合并后由 GitHub 自动删分支。
 
 补丁已验证适用于 rc.34、rc.35；中继结构改变时需重新移植，不自动合并不兼容代码。
 服务器只拉取预构建镜像，操作见 [部署说明](deploy/README.md)。
