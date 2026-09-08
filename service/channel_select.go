@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"strconv"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -42,6 +43,10 @@ type RetryParam struct {
 	RequestPath  string
 	Retry        *int
 	resetNextTry bool
+	// sequentialChannelID is set only after a sequential multi-key failure
+	// retires the current key. The next attempt must stay on that channel so
+	// key priority is not accidentally replaced by channel priority/weight.
+	sequentialChannelID int
 }
 
 func (p *RetryParam) GetRetry() int {
@@ -68,6 +73,26 @@ func (p *RetryParam) IncreaseRetry() {
 
 func (p *RetryParam) ResetRetryNextTry() {
 	p.resetNextTry = true
+}
+
+// SetSequentialChannel pins one same-channel key fallback and suppresses the
+// loop's next channel retry increment. Rotating keys must not consume RetryTimes.
+func (p *RetryParam) SetSequentialChannel(channelID int) {
+	p.sequentialChannelID = channelID
+	p.ResetRetryNextTry()
+}
+
+// TakeSequentialChannel returns the channel pinned for one key fallback and
+// clears the pin before the request is sent. A subsequent key failure must opt
+// in again; after the keys are exhausted, the normal channel retry advances.
+func (p *RetryParam) TakeSequentialChannel() int {
+	channelID := p.sequentialChannelID
+	p.sequentialChannelID = 0
+	return channelID
+}
+
+func (p *RetryParam) HasSequentialChannel() bool {
+	return p.sequentialChannelID > 0
 }
 
 // CacheGetRandomSatisfiedChannel tries to get a random channel that satisfies the requirements.
@@ -111,6 +136,20 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 	selectGroup := param.TokenGroup
 	userGroup := common.GetContextKeyString(param.Ctx, constant.ContextKeyUserGroup)
 	filters := GetChannelConstraints(param.Ctx).Filters
+	capacityRetry := common.GetContextKeyBool(param.Ctx, constant.ContextKeyResponsesCapacityRetried)
+	selectionRetry := param.GetRetry()
+	if capacityRetry {
+		var excluded []int
+		for _, value := range param.Ctx.GetStringSlice("use_channel") {
+			if id, err := strconv.Atoi(value); err == nil {
+				excluded = append(excluded, id)
+			}
+		}
+		filters = append(append([]dto.ChannelFilter(nil), filters...), dto.ChannelFilter{Kind: dto.FilterExcludeChannels, ExcludedChannelIDs: excluded})
+		// Exclusion already advances the candidate set. Incrementing its priority
+		// index as well would skip the next available tier.
+		selectionRetry = 0
+	}
 
 	if param.TokenGroup == "auto" {
 		autoGroups := GetRequestAutoGroups(param.Ctx, userGroup)
@@ -133,7 +172,7 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 			autoGroup := autoGroups[i]
 			// Calculate priorityRetry for current group
 			// 计算当前分组的 priorityRetry
-			priorityRetry := param.GetRetry()
+			priorityRetry := selectionRetry
 			// If moved to a new group, reset priorityRetry and update startRetryIndex
 			// 如果切换到新分组，重置 priorityRetry 并更新 startRetryIndex
 			if i > startGroupIndex {
@@ -187,7 +226,7 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 		channel, err = model.GetRandomSatisfiedChannel(
 			param.TokenGroup,
 			param.ModelName,
-			param.GetRetry(),
+			selectionRetry,
 			filters,
 		)
 		if err != nil {

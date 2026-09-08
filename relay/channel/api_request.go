@@ -511,7 +511,9 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 
 	var stopPinger context.CancelFunc
 	var pingerDone <-chan struct{}
-	if info.IsStream {
+	// Responses decides whether a failed stream can be retried before sending
+	// headers or pings. Its response scanner owns the first downstream write.
+	if info.IsStream && info.RelayMode != constant.RelayModeResponses {
 		helper.SetEventStreamHeaders(c)
 		// 处理流式请求的 ping 保活
 		generalSettings := operation_setting.GetGeneralSetting()

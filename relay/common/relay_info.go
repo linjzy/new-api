@@ -187,6 +187,9 @@ type RelayInfo struct {
 	FinalRequestRelayFormat types.RelayFormat
 
 	StreamStatus *StreamStatus
+	// Distinguishes a protocol failure from a successful HTTP 200 for affinity.
+	ResponsesStreamError     *types.NewAPIError
+	ResponsesCapacityFailure bool
 
 	// convOptions caches the converter settings snapshot (see ConvOptions).
 	convOptions *convmeta.Options

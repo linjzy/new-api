@@ -74,7 +74,17 @@ func ExtendWriteDeadline(c *gin.Context) {
 	_ = http.NewResponseController(c.Writer).SetWriteDeadline(time.Now().Add(streamWriteTimeout))
 }
 
-func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, dataHandler func(data string, sr *StreamResult)) {
+type StreamScannerOptions struct {
+	// Responses may inspect an initial failure before committing HTTP 200.
+	DeferHeaders bool
+}
+
+func StartEventStream(c *gin.Context, resp *http.Response) {
+	copyCodexSSEHeaders(c, resp)
+	SetEventStreamHeaders(c)
+}
+
+func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, dataHandler func(data string, sr *StreamResult), options ...StreamScannerOptions) {
 
 	if resp == nil || dataHandler == nil {
 		return
@@ -82,6 +92,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 
 	// 无条件新建 StreamStatus
 	info.StreamStatus = relaycommon.NewStreamStatus()
+	deferHeaders := len(options) > 0 && options[0].DeferHeaders
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -141,8 +152,16 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	defer cleanup()
 
 	scanner.Split(bufio.ScanLines)
-	copyCodexSSEHeaders(c, resp)
-	SetEventStreamHeaders(c)
+	if !deferHeaders {
+		StartEventStream(c, resp)
+	}
+	// Repeated lifecycle events must not keep an uncommitted response alive forever.
+	var preludeDeadline <-chan time.Time
+	if deferHeaders {
+		preludeTimer := time.NewTimer(streamingTimeout)
+		defer preludeTimer.Stop()
+		preludeDeadline = preludeTimer.C
+	}
 
 	ctx = context.WithValue(ctx, "stop_chan", stopChan)
 
@@ -172,6 +191,9 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 					func() {
 						writeMutex.Lock()
 						defer writeMutex.Unlock()
+						if deferHeaders && !c.Writer.Written() {
+							return
+						}
 						ExtendWriteDeadline(c)
 						err = PingData(c)
 					}()
@@ -290,15 +312,30 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	})
 
 	// 主循环等待完成或超时
-	select {
-	case <-ticker.C:
-		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, nil)
-	case <-stopChan:
-		// EndReason already set by the goroutine that triggered stopChan
-	case <-c.Request.Context().Done():
-		// 客户端断开：立即 cleanup 关闭上游 resp.Body，解除 scanner 阻塞并让上游停止生成，
-		// 避免为已放弃的请求继续消费上游 token。
-		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Request.Context().Err())
+waitForStream:
+	for {
+		select {
+		case <-ticker.C:
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, nil)
+			break waitForStream
+		case <-preludeDeadline:
+			preludeDeadline = nil
+			writeMutex.Lock()
+			committed := c.Writer.Written()
+			writeMutex.Unlock()
+			if !committed {
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, nil)
+				break waitForStream
+			}
+		case <-stopChan:
+			// EndReason already set by the goroutine that triggered stopChan
+			break waitForStream
+		case <-c.Request.Context().Done():
+			// 客户端断开：立即 cleanup 关闭上游 resp.Body，解除 scanner 阻塞并让上游停止生成，
+			// 避免为已放弃的请求继续消费上游 token。
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Request.Context().Err())
+			break waitForStream
+		}
 	}
 
 	cleanup()

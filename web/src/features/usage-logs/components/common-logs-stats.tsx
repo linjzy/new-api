@@ -18,7 +18,9 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useQuery } from '@tanstack/react-query'
 import { getRouteApi } from '@tanstack/react-router'
+import { useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
 
 import { Skeleton } from '@/components/ui/skeleton'
 import { formatLogQuota } from '@/lib/format'
@@ -26,6 +28,10 @@ import { cn } from '@/lib/utils'
 
 import { getLogStats, getUserLogStats } from '../api'
 import { DEFAULT_LOG_STATS } from '../constants'
+import {
+  getUsageLogsRefetchInterval,
+  USAGE_LOGS_AUTO_REFRESH_ERROR_TOAST_ID,
+} from '../lib/auto-refresh'
 import { buildApiParams } from '../lib/utils'
 import { useLogsViewScope, useUsageLogsContext } from './usage-logs-provider'
 
@@ -51,9 +57,15 @@ export function CommonLogsStats() {
   const { t } = useTranslation()
   const { isAdminView: isAdmin } = useLogsViewScope()
   const searchParams = route.useSearch()
-  const { sensitiveVisible } = useUsageLogsContext()
+  const { sensitiveVisible, autoRefresh, setAutoRefresh } =
+    useUsageLogsContext()
 
-  const { data: stats, isLoading } = useQuery({
+  const {
+    data: stats,
+    isLoading,
+    error,
+    errorUpdatedAt,
+  } = useQuery({
     queryKey: ['usage-logs-stats', isAdmin, searchParams],
     queryFn: async () => {
       const params = buildApiParams({
@@ -68,12 +80,30 @@ export function CommonLogsStats() {
         ? await getLogStats(params)
         : await getUserLogStats(params)
 
-      return result.success
-        ? result.data || DEFAULT_LOG_STATS
-        : DEFAULT_LOG_STATS
+      if (!result.success) {
+        throw new Error(result.message || t('Failed to load logs'))
+      }
+      return result.data || DEFAULT_LOG_STATS
     },
     placeholderData: (previousData) => previousData,
+    retry: false,
+    refetchInterval: (query) =>
+      getUsageLogsRefetchInterval(
+        autoRefresh,
+        searchParams.page ?? 1,
+        query.state.status
+      ),
+    refetchIntervalInBackground: false,
   })
+
+  useEffect(() => {
+    if (!error || errorUpdatedAt === 0) return
+    toast.error(
+      error instanceof Error ? error.message : t('Failed to load logs'),
+      { id: USAGE_LOGS_AUTO_REFRESH_ERROR_TOAST_ID }
+    )
+    setAutoRefresh(false)
+  }, [error, errorUpdatedAt, setAutoRefresh, t])
 
   if (isLoading) {
     return (
