@@ -15,6 +15,7 @@ fi
 IMAGE_REPOSITORY="${NEWAPI_IMAGE_REPOSITORY:-}"
 SOURCE_REPOSITORY="${NEWAPI_SOURCE_REPOSITORY:-}"
 CANDIDATE_TAG="${NEWAPI_CANDIDATE_TAG:-candidate}"
+GITHUB_TOKEN_FILE="${NEWAPI_GITHUB_TOKEN_FILE:-}"
 
 BASE_DIR="${NEWAPI_CUSTOM_BASE_DIR:-$PACKAGE_DIR}"
 STATE_DIR="${NEWAPI_CUSTOM_STATE_DIR:-$BASE_DIR/state}"
@@ -43,6 +44,7 @@ CANDIDATE_STATE_FILE="$STATE_DIR/candidate.env"
 CURRENT_STATE_FILE="$STATE_DIR/current.env"
 SCHEDULED_STATE_FILE="$STATE_DIR/scheduled.env"
 JOB_STATE_FILE="$STATE_DIR/job.env"
+BRANCH_CLEANUP_STATE_FILE="$STATE_DIR/branch-cleanup.json"
 SCRIPT_SHA256="$(sha256sum "$SCRIPT_PATH" | awk '{print $1}')"
 JOB_PHASE=idle
 JOB_STARTED_SECONDS=$SECONDS
@@ -75,6 +77,7 @@ Usage:
   newapi-custom-upgrade.sh deploy
   newapi-custom-upgrade.sh upgrade [release-tag|latest|image-reference]
   newapi-custom-upgrade.sh cleanup
+  newapi-custom-upgrade.sh cleanup-branches
 
 Commands:
   latest    Print the configured GHCR candidate reference.
@@ -85,6 +88,7 @@ Commands:
   upgrade   Pull, drain connections, and deploy in a detached systemd job.
   cleanup   Remove unused New API managed resources and expired task logs.
             Other projects and shared Docker build caches are untouched.
+  cleanup-branches  Request GitHub cleanup for the verified running image.
 
 Production hosts do not fetch source code, apply patches, or build Docker
 images.
@@ -575,6 +579,20 @@ safe_cleanup() {
   df -h "$BASE_DIR" || true
 }
 
+check_branch_cleanup() {
+  [[ -n "$GITHUB_TOKEN_FILE" ]] || return 0
+  python3 "$PACKAGE_DIR/bin/newapi-branch-cleanup.py" \
+    --repository "$SOURCE_REPOSITORY" --token-file "$GITHUB_TOKEN_FILE" \
+    --state-file "$BRANCH_CLEANUP_STATE_FILE" check
+}
+
+request_branch_cleanup() {
+  [[ -n "$GITHUB_TOKEN_FILE" ]] || return 0
+  python3 "$PACKAGE_DIR/bin/newapi-branch-cleanup.py" \
+    --repository "$SOURCE_REPOSITORY" --token-file "$GITHUB_TOKEN_FILE" \
+    --state-file "$BRANCH_CLEANUP_STATE_FILE" submit "$1" "$2" "$3"
+}
+
 activate_image() {
   local image_ref="$1"
   local release_tag="$2"
@@ -597,9 +615,12 @@ activate_image() {
       die "running candidate failed public verification"
     rm -f "$CANDIDATE_STATE_FILE" "$SCHEDULED_STATE_FILE"
     set_phase unchanged
+    request_branch_cleanup "$image_ref" "$source_ref" "$source_commit" ||
+      log "application is healthy; branch cleanup request failed, inspect branch-cleanup.json"
     return 0
   fi
 
+  check_branch_cleanup || die "previous branch cleanup must finish before changing the running image"
   set_phase preflight
   preflight_deployment "$image_ref"
   set_phase gate
@@ -653,6 +674,8 @@ activate_image() {
   # No retained rollback image or previous-version state after success.
   # Broader maintenance is an explicit, scoped command.
   cleanup_managed_images
+  request_branch_cleanup "$image_ref" "$source_ref" "$source_commit" ||
+    log "deployment succeeded; branch cleanup request failed, inspect branch-cleanup.json"
 }
 
 existing_background_job() {
@@ -743,6 +766,10 @@ show_status() {
   if [[ -f "$JOB_STATE_FILE" ]]; then
     printf '%s\n' 'Last job result:'
     sed 's/^/  /' "$JOB_STATE_FILE"
+  fi
+  if [[ -f "$BRANCH_CLEANUP_STATE_FILE" ]]; then
+    printf '%s\n' 'Branch cleanup request:'
+    python3 -m json.tool "$BRANCH_CLEANUP_STATE_FILE"
   fi
   printf 'Deployment script: %s\n' "$SCRIPT_SHA256"
   printf '%s\n' 'Background jobs:'
@@ -857,6 +884,25 @@ main() {
       acquire_lock
       [[ $# -eq 0 ]] || die "cleanup does not accept arguments"
       safe_cleanup
+      ;;
+    cleanup-branches)
+      require_root
+      require_runtime_commands
+      ensure_registry_config
+      ensure_runtime_dirs
+      acquire_lock
+      [[ $# -eq 0 ]] || die "cleanup-branches does not accept arguments"
+      [[ -n "$GITHUB_TOKEN_FILE" ]] || die "NEWAPI_GITHUB_TOKEN_FILE is not configured"
+      check_branch_cleanup || die "previous branch cleanup is pending"
+      local running_ref running_id
+      running_id="$(docker inspect "$APP_CONTAINER" --format '{{.Image}}')"
+      running_ref="$(state_value "$CURRENT_STATE_FILE" CURRENT_IMAGE)"
+      [[ -n "$running_ref" && "$(docker image inspect "$running_ref" --format '{{.Id}}')" == "$running_id" ]] ||
+        die "running image does not match deployment state"
+      validate_candidate_image "$running_ref"
+      wait_for_app_health
+      verify_public_entry
+      request_branch_cleanup "$running_ref" "$PULLED_SOURCE_REF" "$PULLED_SOURCE_COMMIT"
       ;;
     _upgrade)
       [[ $# -eq 1 ]] || die "invalid internal upgrade arguments"

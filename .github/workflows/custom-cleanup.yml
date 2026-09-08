@@ -1,0 +1,61 @@
+name: Clean obsolete custom branches
+
+on:
+  workflow_dispatch:
+    inputs:
+      production_image:
+        description: Verified running image by immutable GHCR digest
+        required: true
+        type: string
+      production_source:
+        description: Running image source branch
+        required: true
+        type: string
+      production_commit:
+        description: Running image source commit
+        required: true
+        type: string
+      dry_run:
+        description: Preview without deleting branches
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  packages: read
+
+concurrency:
+  group: custom-new-api-release
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Reject stale reruns
+        if: github.run_attempt != 1
+        run: |
+          echo 'Request a fresh cleanup from the deployment host; old deployment reports cannot be rerun.' >&2
+          exit 1
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Keep running and candidate source; remove superseded release refs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRODUCTION_IMAGE: ${{ inputs.production_image }}
+          PRODUCTION_SOURCE: ${{ inputs.production_source }}
+          PRODUCTION_COMMIT: ${{ inputs.production_commit }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          args=()
+          if [[ "$DRY_RUN" == true ]]; then args+=(--dry-run); fi
+          python3 .linjzy/bin/cleanup-branches.py --repository "$GITHUB_REPOSITORY" \
+            --production-image "$PRODUCTION_IMAGE" --production-source "$PRODUCTION_SOURCE" \
+            --production-commit "$PRODUCTION_COMMIT" "${args[@]}"
