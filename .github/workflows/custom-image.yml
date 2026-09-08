@@ -130,6 +130,8 @@ jobs:
             cp -R "$RUNNER_TEMP/current-custom" .linjzy
             bash .linjzy/bin/prepare-release.sh . "$RELEASE" "$UPSTREAM" "$SOURCE_REF"
             printf 'build_sha256=%s\n' "$BUILD_SHA" >> .linjzy/BUILD-METADATA
+            # GITHUB_TOKEN can publish refs using the default branch's workflows.
+            git restore --source="$GITHUB_SHA" --staged --worktree -- .github/workflows
             git add -A
             git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m "custom: $RELEASE production customizations"
           fi

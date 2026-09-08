@@ -21,7 +21,10 @@ def identities(bundle):
     validation_files = [str(f.relative_to(bundle)) for f in (bundle / "tests").rglob("*") if f.is_file() and "__pycache__" not in f.parts]
     validation_files += [str(f.relative_to(bundle)) for f in (bundle / "deploy").rglob("*") if f.is_file()]
     validation_files += ["bin/verify-release.sh", "bin/smoke-test-image.sh"]
-    workflow = (bundle.parent / ".github/workflows/custom-image.yml").read_bytes()
+    # Release refs carry the default branch's workflows so GITHUB_TOKEN can
+    # publish them. Any workflow change must invalidate their source identity.
+    workflow_files = [str(f.relative_to(bundle.parent)) for f in (bundle.parent / ".github/workflows").rglob("*") if f.is_file()]
+    workflow = digest_files(bundle.parent, workflow_files).encode()
     build = hashlib.sha256((digest_files(bundle, build_files) + "\n").encode() + workflow).hexdigest()
     validation = hashlib.sha256((digest_files(bundle, validation_files) + "\n").encode() + workflow).hexdigest()
     return {"patch_sha": patch_digest, "build_sha": build, "validation_sha": validation}
