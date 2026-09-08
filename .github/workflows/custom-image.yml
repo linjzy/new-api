@@ -76,7 +76,9 @@ jobs:
             echo "source_ref=custom/$tag"
             echo "image=$repository:$tag"
             echo "proof=$repository:verified-${validation_sha:0:12}-${extended}-$tag"
+            echo "proof_full=$repository:verified-${validation_sha:0:12}-true-$tag"
             echo "candidate=$repository:candidate"
+            echo "previous=$repository:previous"
             echo "extended=$extended"
           } >> "$GITHUB_OUTPUT"
 
@@ -92,12 +94,15 @@ jobs:
         env:
           IMAGE: ${{ steps.plan.outputs.image }}
           PROOF: ${{ steps.plan.outputs.proof }}
+          PROOF_FULL: ${{ steps.plan.outputs.proof_full }}
         run: |
           set -Eeuo pipefail
           digest="$(bash .linjzy/bin/registry-digest.sh "$IMAGE")"
           proof="$(bash .linjzy/bin/registry-digest.sh "$PROOF")"
+          full="$(bash .linjzy/bin/registry-digest.sh "$PROOF_FULL")"
           echo "exists=$([[ -n "$digest" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
-          echo "verified=$([[ -n "$digest" && "$digest" == "$proof" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          # A full validation (MySQL and race) also satisfies a regular one.
+          echo "verified=$([[ -n "$digest" && ( "$digest" == "$proof" || "$digest" == "$full" ) ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
       - name: Prepare exact source and current verification bundle
         id: source
@@ -228,6 +233,7 @@ jobs:
           IMAGE: ${{ steps.plan.outputs.image }}
           PROOF: ${{ steps.plan.outputs.proof }}
           CANDIDATE: ${{ steps.plan.outputs.candidate }}
+          PREVIOUS: ${{ steps.plan.outputs.previous }}
           VERIFIED: ${{ steps.registry.outputs.verified }}
           PROMOTE: ${{ github.event_name == 'schedule' || inputs.promote_candidate || false }}
           RELEASE: ${{ steps.plan.outputs.release }}
@@ -239,10 +245,14 @@ jobs:
           if [[ "$VERIFIED" != true ]]; then
             docker buildx imagetools create --prefer-index=false --tag "$PROOF" "$IMAGE"
           fi
+          digest="$(bash "$RUNNER_TEMP/current-custom/bin/registry-digest.sh" "$IMAGE")"
           if [[ "$PROMOTE" == true ]]; then
+            candidate="$(bash "$RUNNER_TEMP/current-custom/bin/registry-digest.sh" "$CANDIDATE")"
+            if [[ -n "$candidate" && "$candidate" != "$digest" ]]; then
+              docker buildx imagetools create --prefer-index=false --tag "$PREVIOUS" "$CANDIDATE"
+            fi
             docker buildx imagetools create --prefer-index=false --tag "$CANDIDATE" "$IMAGE"
           fi
-          digest="$(docker buildx imagetools inspect "$IMAGE" | awk '/^Digest:/ {print $2; exit}')"
           # shellcheck disable=SC2016
           {
             printf 'Image: `%s`\n\nDigest: `%s`\n\n' "$IMAGE" "$digest"
@@ -252,7 +262,7 @@ jobs:
             printf 'Validation reused: %s; candidate promoted: %s\n' "$VERIFIED" "$PROMOTE"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Keep candidate, current and one previous image
+      - name: Keep candidate, previous and current image
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.plan.outputs.tag }}

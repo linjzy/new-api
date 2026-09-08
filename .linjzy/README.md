@@ -19,8 +19,8 @@
 
 - 镜像 `ghcr.io/linjzy/new-api:<release>-custom-<build-sha>-<upstream-sha>`，源码分支 `custom/<同名>`；分支不含 `.github/workflows`。
 - 构建输入（补丁、prepare 脚本）与验证输入（tests、deploy、verify 脚本）分别计算摘要；镜像和匹配的 `verified-*` 记录已存在时直接复用，改 workflow 或文档不会重建。
-- 定时运行或手动 `promote_candidate=true` 才移动 `candidate`；定时运行和后端补丁变更会追加 MySQL 与 race 检查。
-- 每次成功后只保留 `candidate`、本次镜像和最近一个其他镜像及其 `custom/*` 分支，其余 ghcr 版本和分支删除。
+- 定时运行或手动 `promote_candidate=true` 才移动 `candidate`，旧 `candidate` 改标为 `previous`；定时运行和后端补丁变更会追加 MySQL 与 race 检查。
+- 每次成功后只保留 `candidate`、`previous` 和本次镜像及其 `custom/*` 分支，其余 ghcr 版本和分支删除。
 
 补丁失配时构建失败，日志打印 `.rej` 内容。移植：
 

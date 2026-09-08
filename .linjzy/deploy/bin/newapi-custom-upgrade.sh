@@ -73,8 +73,7 @@ Usage:
   newapi-custom-upgrade.sh status
   newapi-custom-upgrade.sh pull [release-tag|latest|image-reference]
   newapi-custom-upgrade.sh deploy
-  newapi-custom-upgrade.sh upgrade [release-tag|latest|image-reference]
-  newapi-custom-upgrade.sh rollback
+  newapi-custom-upgrade.sh upgrade [release-tag|latest|previous|image-reference]
   newapi-custom-upgrade.sh cleanup
 
 Commands:
@@ -84,7 +83,7 @@ Commands:
   pull      Pull and validate a prebuilt GHCR image without changing service.
   deploy    Deploy the last pulled and validated candidate in a detached job.
   upgrade   Pull, drain connections, and deploy in a detached systemd job.
-  rollback  Deploy the retained previous image in a detached systemd job.
+            "previous" redeploys the registry's previous candidate.
   cleanup   Remove unused New API managed resources and expired task logs.
             Other projects and shared Docker build caches are untouched.
 
@@ -289,16 +288,10 @@ pull_candidate() {
     die "unable to resolve immutable registry digest for $requested_ref"
   validate_image_ref "$repo_digest"
 
-  record_candidate_state "$requested_ref" "$repo_digest"
-}
+  validate_candidate_image "$repo_digest"
 
-record_candidate_state() {
-  local requested_ref="$1"
-  local image_ref="$2"
-
-  validate_candidate_image "$image_ref"
-  PULLED_IMAGE="$image_ref"
-  PULLED_IMAGE_ID="$(docker image inspect "$image_ref" --format '{{.Id}}')"
+  PULLED_IMAGE="$repo_digest"
+  PULLED_IMAGE_ID="$(docker image inspect "$repo_digest" --format '{{.Id}}')"
   write_env_file "$CANDIDATE_STATE_FILE" \
     "CANDIDATE_REQUESTED_IMAGE=$requested_ref" \
     "CANDIDATE_IMAGE=$PULLED_IMAGE" \
@@ -312,12 +305,6 @@ record_candidate_state() {
 
   log "candidate ready: $PULLED_IMAGE"
   log "public source: https://github.com/$SOURCE_REPOSITORY/tree/$PULLED_SOURCE_REF"
-}
-
-retained_previous_ref() {
-  docker image inspect "$ROLLBACK_REF" \
-    --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null |
-    awk -v prefix="${IMAGE_REPOSITORY}@" 'index($0, prefix) == 1 {print; exit}'
 }
 
 backup_database() {
@@ -569,7 +556,7 @@ activate_image() {
   local patch_sha="$4"
   local source_ref="$5"
   local source_commit="$6"
-  local candidate_id previous_id rollback_ref
+  local candidate_id previous_id
 
   validate_image_ref "$image_ref"
   docker image inspect "$image_ref" >/dev/null 2>&1 ||
@@ -598,12 +585,10 @@ activate_image() {
   set_phase activate
   ensure_override_manageable
   docker tag "$previous_id" "$ROLLBACK_REF"
-  rollback_ref="$(retained_previous_ref || true)"
-  rollback_ref="${rollback_ref:-$ROLLBACK_REF}"
-  log "activating $image_ref; previous image retained as $rollback_ref"
+  log "activating $image_ref; previous image retained as $ROLLBACK_REF"
   if ! deploy_local_and_verify "$image_ref" "$candidate_id"; then
     log "candidate local verification failed"
-    if rollback_to_image "$rollback_ref"; then
+    if rollback_to_image "$ROLLBACK_REF"; then
       log "automatic rollback succeeded"
     else
       log "CRITICAL: automatic rollback verification failed"
@@ -616,7 +601,7 @@ activate_image() {
   disable_request_gate
   if ! verify_public_entry; then
     log "candidate public verification failed"
-    if rollback_to_image "$rollback_ref"; then
+    if rollback_to_image "$ROLLBACK_REF"; then
       log "automatic rollback succeeded"
     else
       log "CRITICAL: automatic rollback verification failed"
@@ -732,7 +717,8 @@ show_status() {
     printf '%s\n' 'Last job result:'
     sed 's/^/  /' "$JOB_STATE_FILE"
   fi
-  printf 'Retained previous image: %s\n' "$(retained_previous_ref || true)"
+  printf 'Retained previous image: %s\n' \
+    "$(docker image inspect "$ROLLBACK_REF" --format '{{join .RepoDigests " "}}' 2>/dev/null || echo none)"
   if [[ -f "$DB_BACKUP_FILE" ]]; then
     printf 'Database backup: %s (%s)\n' "$DB_BACKUP_FILE" "$(date -r "$DB_BACKUP_FILE" -Is)"
   fi
@@ -841,20 +827,6 @@ main() {
       [[ $# -le 1 ]] || die "upgrade accepts at most one image selector"
       local requested="${1:-latest}"
       schedule_internal_job upgrade "$requested"
-      ;;
-    rollback)
-      require_root
-      require_runtime_commands
-      ensure_registry_config
-      ensure_runtime_dirs
-      acquire_lock
-      [[ $# -eq 0 ]] || die "rollback does not accept arguments"
-      local previous_ref
-      previous_ref="$(retained_previous_ref || true)"
-      [[ -n "$previous_ref" ]] ||
-        die "no retained previous image; use upgrade <image-reference> instead"
-      record_candidate_state "$ROLLBACK_REF" "$previous_ref"
-      schedule_internal_job activate "$previous_ref"
       ;;
     cleanup)
       require_root

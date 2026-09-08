@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Keep the candidate, the current image and one previous image; delete other registry versions and their custom/* refs."""
+"""Keep the versions tagged candidate or previous and the current image; delete other registry versions and their custom/* refs."""
 import argparse
 import json
 import subprocess
+
+POINTERS = ("candidate", "previous")
 
 
 def gh(*args):
@@ -10,15 +12,11 @@ def gh(*args):
 
 
 def image_tags(version):
-    return [tag for tag in version["tags"] if tag != "candidate" and not tag.startswith("verified-")]
+    return [tag for tag in version["tags"] if tag not in POINTERS and not tag.startswith("verified-")]
 
 
 def plan(versions, current_tag):
-    keep = [v for v in versions if current_tag in v["tags"] or "candidate" in v["tags"]]
-    previous = next((v for v in sorted(versions, key=lambda v: v["created_at"], reverse=True)
-                     if v not in keep and image_tags(v)), None)
-    if previous:
-        keep.append(previous)
+    keep = [v for v in versions if current_tag in v["tags"] or any(p in v["tags"] for p in POINTERS)]
     keep_tags = {tag for v in keep for tag in image_tags(v)}
     return keep_tags, [v for v in versions if v not in keep]
 
