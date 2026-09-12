@@ -1,5 +1,5 @@
 diff --git a/constant/context_key.go b/constant/context_key.go
-index 994e657..e7af897 100644
+index 994e65751..e7af897ef 100644
 --- a/constant/context_key.go
 +++ b/constant/context_key.go
 @@ -66,8 +66,10 @@ const (
@@ -16,7 +16,7 @@ index 994e657..e7af897 100644
  	// ContextKeyAuditLogged marks that the current request has already recorded
  	// a manage/operation audit log inside the handler. When set, the admin-audit
 diff --git a/controller/relay.go b/controller/relay.go
-index 10e6996..68e4582 100644
+index 5cd64859c..b03bbc634 100644
 --- a/controller/relay.go
 +++ b/controller/relay.go
 @@ -94,6 +94,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
@@ -97,7 +97,7 @@ index 10e6996..68e4582 100644
  		return false
  	}
 diff --git a/dto/channel_constraints.go b/dto/channel_constraints.go
-index 3ed88dc..4e57757 100644
+index 7dfdecafd..765969d34 100644
 --- a/dto/channel_constraints.go
 +++ b/dto/channel_constraints.go
 @@ -38,6 +38,7 @@ type ChannelFilterKind string
@@ -108,16 +108,16 @@ index 3ed88dc..4e57757 100644
  )
  
  type ChannelFilter struct {
-@@ -45,6 +46,7 @@ type ChannelFilter struct {
- 	RequestPath            string
+@@ -46,6 +47,7 @@ type ChannelFilter struct {
  	TaskPluginKey          string
+ 	TaskPluginKeys         []string
  	TaskPluginChannelTypes []int
 +	ExcludedChannelIDs     []int
  }
  
  type ChannelConstraints struct {
 diff --git a/middleware/distributor.go b/middleware/distributor.go
-index 9f0a074..fa84392 100644
+index 524a81502..fa2d1869d 100644
 --- a/middleware/distributor.go
 +++ b/middleware/distributor.go
 @@ -197,7 +197,8 @@ func Distribute() func(c *gin.Context) {
@@ -131,7 +131,7 @@ index 9f0a074..fa84392 100644
  		}
  	}
 diff --git a/model/ability.go b/model/ability.go
-index ecfcb5c..b86c442 100644
+index ecfcb5c04..b86c442dc 100644
 --- a/model/ability.go
 +++ b/model/ability.go
 @@ -165,7 +165,8 @@ func GetChannel(
@@ -157,7 +157,7 @@ index ecfcb5c..b86c442 100644
  			return nil
  		}
 diff --git a/model/channel_constraint.go b/model/channel_constraint.go
-index 2986cf7..23af71e 100644
+index 2168b34d9..d7d6ac75a 100644
 --- a/model/channel_constraint.go
 +++ b/model/channel_constraint.go
 @@ -8,13 +8,14 @@ import (
@@ -186,8 +186,23 @@ index 2986cf7..23af71e 100644
  	case dto.FilterRequestPath:
  		if filter.RequestPath == "" {
  			return true
+diff --git a/relay/channel/api_request.go b/relay/channel/api_request.go
+index e30dd0ce9..7ef95088b 100644
+--- a/relay/channel/api_request.go
++++ b/relay/channel/api_request.go
+@@ -511,7 +511,9 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
+ 
+ 	var stopPinger context.CancelFunc
+ 	var pingerDone <-chan struct{}
+-	if info.IsStream {
++	// Responses decides whether a failed stream can be retried before sending
++	// headers or pings. Its response scanner owns the first downstream write.
++	if info.IsStream && info.RelayMode != constant.RelayModeResponses {
+ 		helper.SetEventStreamHeaders(c)
+ 		// 处理流式请求的 ping 保活
+ 		generalSettings := operation_setting.GetGeneralSetting()
 diff --git a/relay/channel/openai/relay_responses.go b/relay/channel/openai/relay_responses.go
-index 93b2599..637701e 100644
+index 93b2599de..637701ef0 100644
 --- a/relay/channel/openai/relay_responses.go
 +++ b/relay/channel/openai/relay_responses.go
 @@ -7,6 +7,7 @@ import (
@@ -547,10 +562,10 @@ index 93b2599..637701e 100644
 +	return types.WithOpenAIError(*upstreamError, http.StatusBadGateway, types.ErrOptionWithSkipRetry()), false
  }
 diff --git a/relay/common/relay_info.go b/relay/common/relay_info.go
-index e025597..3e664ed 100644
+index cc8bce53c..453b0528f 100644
 --- a/relay/common/relay_info.go
 +++ b/relay/common/relay_info.go
-@@ -187,6 +187,9 @@ type RelayInfo struct {
+@@ -192,6 +192,9 @@ type RelayInfo struct {
  	FinalRequestRelayFormat types.RelayFormat
  
  	StreamStatus *StreamStatus
@@ -561,7 +576,7 @@ index e025597..3e664ed 100644
  	// convOptions caches the converter settings snapshot (see ConvOptions).
  	convOptions *convmeta.Options
 diff --git a/relay/common/stream_status.go b/relay/common/stream_status.go
-index 4734b26..f10cd90 100644
+index 4734b2640..f10cd901d 100644
 --- a/relay/common/stream_status.go
 +++ b/relay/common/stream_status.go
 @@ -10,15 +10,16 @@ import (
@@ -613,10 +628,10 @@ index 4734b26..f10cd90 100644
  	if s == nil {
  		return false
 diff --git a/relay/helper/stream_scanner.go b/relay/helper/stream_scanner.go
-index f88bef5..bb072d4 100644
+index e620469ae..bf66a0982 100644
 --- a/relay/helper/stream_scanner.go
 +++ b/relay/helper/stream_scanner.go
-@@ -74,7 +74,17 @@ func ExtendWriteDeadline(c *gin.Context) {
+@@ -80,7 +80,17 @@ func ExtendWriteDeadline(c *gin.Context) {
  	_ = http.NewResponseController(c.Writer).SetWriteDeadline(time.Now().Add(streamWriteTimeout))
  }
  
@@ -635,7 +650,7 @@ index f88bef5..bb072d4 100644
  
  	if resp == nil || dataHandler == nil {
  		return
-@@ -82,6 +92,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
+@@ -88,6 +98,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
  
  	// 无条件新建 StreamStatus
  	info.StreamStatus = relaycommon.NewStreamStatus()
@@ -643,7 +658,7 @@ index f88bef5..bb072d4 100644
  
  	ctx, cancel := context.WithCancel(context.Background())
  
-@@ -141,8 +152,16 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
+@@ -147,8 +158,16 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
  	defer cleanup()
  
  	scanner.Split(bufio.ScanLines)
@@ -662,7 +677,7 @@ index f88bef5..bb072d4 100644
  
  	ctx = context.WithValue(ctx, "stop_chan", stopChan)
  
-@@ -172,6 +191,9 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
+@@ -178,6 +197,9 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
  					func() {
  						writeMutex.Lock()
  						defer writeMutex.Unlock()
@@ -672,7 +687,7 @@ index f88bef5..bb072d4 100644
  						ExtendWriteDeadline(c)
  						err = PingData(c)
  					}()
-@@ -290,15 +312,30 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
+@@ -296,15 +318,30 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
  	})
  
  	// 主循环等待完成或超时
@@ -713,7 +728,7 @@ index f88bef5..bb072d4 100644
  
  	cleanup()
 diff --git a/relay/responses_handler.go b/relay/responses_handler.go
-index 698f6ee..1c0b8d7 100644
+index 698f6eef6..1c0b8d7cb 100644
 --- a/relay/responses_handler.go
 +++ b/relay/responses_handler.go
 @@ -20,6 +20,8 @@ import (
@@ -740,10 +755,10 @@ index 698f6ee..1c0b8d7 100644
  		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
  		return newAPIError
 diff --git a/relaykit/dto/openai_response.go b/relaykit/dto/openai_response.go
-index 6ab5c6f..1d37c6a 100644
+index f50724124..93be6d8fa 100644
 --- a/relaykit/dto/openai_response.go
 +++ b/relaykit/dto/openai_response.go
-@@ -517,6 +517,7 @@ const (
+@@ -549,6 +549,7 @@ const (
  type ResponsesStreamResponse struct {
  	Type            string                   `json:"type"`
  	Response        *OpenAIResponsesResponse `json:"response,omitempty"`
@@ -752,7 +767,7 @@ index 6ab5c6f..1d37c6a 100644
  	Message         string                   `json:"message,omitempty"`
  	Param           string                   `json:"param,omitempty"`
 diff --git a/service/channel_select.go b/service/channel_select.go
-index 7f623ea..b14e751 100644
+index 62cf916b0..2a2ef5cda 100644
 --- a/service/channel_select.go
 +++ b/service/channel_select.go
 @@ -2,6 +2,7 @@ package service
@@ -763,7 +778,7 @@ index 7f623ea..b14e751 100644
  
  	"github.com/QuantumNous/new-api/common"
  	"github.com/QuantumNous/new-api/constant"
-@@ -135,6 +136,20 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string,
+@@ -137,6 +138,20 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string,
  	selectGroup := param.TokenGroup
  	userGroup := common.GetContextKeyString(param.Ctx, constant.ContextKeyUserGroup)
  	filters := GetChannelConstraints(param.Ctx).Filters
@@ -784,7 +799,7 @@ index 7f623ea..b14e751 100644
  
  	if param.TokenGroup == "auto" {
  		autoGroups := GetRequestAutoGroups(param.Ctx, userGroup)
-@@ -157,7 +172,7 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string,
+@@ -159,7 +174,7 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string,
  			autoGroup := autoGroups[i]
  			// Calculate priorityRetry for current group
  			// 计算当前分组的 priorityRetry
@@ -793,7 +808,7 @@ index 7f623ea..b14e751 100644
  			// If moved to a new group, reset priorityRetry and update startRetryIndex
  			// 如果切换到新分组，重置 priorityRetry 并更新 startRetryIndex
  			if i > startGroupIndex {
-@@ -211,7 +226,7 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string,
+@@ -213,7 +228,7 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string,
  		channel, err = model.GetRandomSatisfiedChannel(
  			param.TokenGroup,
  			param.ModelName,
@@ -803,7 +818,7 @@ index 7f623ea..b14e751 100644
  		)
  		if err != nil {
 diff --git a/service/log_info_generate.go b/service/log_info_generate.go
-index aec98ce..4a34d68 100644
+index bf2e58d07..4387e226e 100644
 --- a/service/log_info_generate.go
 +++ b/service/log_info_generate.go
 @@ -73,6 +73,10 @@ func AppendRelayLogAdminInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo,
@@ -818,10 +833,10 @@ index aec98ce..4a34d68 100644
  			other.SetAdmin("billing_model", billingModel)
  		}
 diff --git a/service/text_quota.go b/service/text_quota.go
-index 83fe6ff..3b4194a 100644
+index 543ebb000..b445ad1a4 100644
 --- a/service/text_quota.go
 +++ b/service/text_quota.go
-@@ -400,13 +400,17 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
+@@ -398,13 +398,17 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
  	if usage == nil {
  		extraContent = append(extraContent, "上游无计费信息")
  	}
@@ -840,20 +855,5 @@ index 83fe6ff..3b4194a 100644
 -	summary := calculateTextQuotaSummary(ctx, relayInfo, billingUsage)
 -
  	var tieredResult *billingexpr.TieredResult
+ 	var tieredTokens billingexpr.TokenParams
  	tieredBillingApplied := false
- 	if originUsage != nil {
-diff --git a/relay/channel/api_request.go b/relay/channel/api_request.go
-index e30dd0c..7ef9508 100644
---- a/relay/channel/api_request.go
-+++ b/relay/channel/api_request.go
-@@ -511,7 +511,9 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
- 
- 	var stopPinger context.CancelFunc
- 	var pingerDone <-chan struct{}
--	if info.IsStream {
-+	// Responses decides whether a failed stream can be retried before sending
-+	// headers or pings. Its response scanner owns the first downstream write.
-+	if info.IsStream && info.RelayMode != constant.RelayModeResponses {
- 		helper.SetEventStreamHeaders(c)
- 		// 处理流式请求的 ping 保活
- 		generalSettings := operation_setting.GetGeneralSetting()

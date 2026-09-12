@@ -1,5 +1,5 @@
 diff --git a/constant/multi_key_mode.go b/constant/multi_key_mode.go
-index cd0cdbf..2a5e00d 100644
+index cd0cdbff5..2a5e00d86 100644
 --- a/constant/multi_key_mode.go
 +++ b/constant/multi_key_mode.go
 @@ -3,6 +3,7 @@ package constant
@@ -13,7 +13,7 @@ index cd0cdbf..2a5e00d 100644
 +	MultiKeyModeSequential MultiKeyMode = "sequential" // 顺序优先
  )
 diff --git a/controller/channel-test.go b/controller/channel-test.go
-index f8fad94..abf65bc 100644
+index 1248853a5..6a04c36ce 100644
 --- a/controller/channel-test.go
 +++ b/controller/channel-test.go
 @@ -69,7 +69,11 @@ func resolveChannelTestUserID(c *gin.Context) (int, error) {
@@ -169,7 +169,7 @@ index f8fad94..abf65bc 100644
  		selected = append(selected, channel)
  	}
 diff --git a/controller/relay.go b/controller/relay.go
-index ca9b35d..10e6996 100644
+index 0c7ab4319..5cd64859c 100644
 --- a/controller/relay.go
 +++ b/controller/relay.go
 @@ -193,7 +193,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
@@ -394,10 +394,10 @@ index ca9b35d..10e6996 100644
  func respondTaskError(c *gin.Context, taskErr *taskdto.TaskError) {
  	if taskErr.StatusCode == http.StatusTooManyRequests {
 diff --git a/middleware/distributor.go b/middleware/distributor.go
-index e7fa84f..9f0a074 100644
+index 6bad3d80c..524a81502 100644
 --- a/middleware/distributor.go
 +++ b/middleware/distributor.go
-@@ -604,6 +604,18 @@ func getTaskOriginModelName(c *gin.Context) string {
+@@ -611,6 +611,18 @@ func getTaskOriginModelName(c *gin.Context) string {
  }
  
  func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, modelName string) *types.NewAPIError {
@@ -416,7 +416,7 @@ index e7fa84f..9f0a074 100644
  	c.Set("original_model", modelName) // for retry
  	expectedPlugin := c.GetString("expected_task_plugin_key")
  	if channel == nil {
-@@ -667,9 +679,32 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
+@@ -674,9 +686,32 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
  	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
  	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
  
@@ -453,7 +453,7 @@ index e7fa84f..9f0a074 100644
  	if channel.ChannelInfo.IsMultiKey {
  		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, true)
 diff --git a/model/channel.go b/model/channel.go
-index 268f190..84291d0 100644
+index f62ed09e8..b6c32d77b 100644
 --- a/model/channel.go
 +++ b/model/channel.go
 @@ -6,6 +6,7 @@ import (
@@ -677,7 +677,7 @@ index 268f190..84291d0 100644
  				shouldUpdateAbilities = true
  			}
 diff --git a/model/channel_cache.go b/model/channel_cache.go
-index 1fcfe61..e8d964c 100644
+index fa1107eff..7e586f825 100644
 --- a/model/channel_cache.go
 +++ b/model/channel_cache.go
 @@ -307,3 +307,50 @@ func CacheUpdateChannel(channel *Channel) {
@@ -732,7 +732,7 @@ index 1fcfe61..e8d964c 100644
 +	}
 +}
 diff --git a/service/channel.go b/service/channel.go
-index f348e08..6cc6900 100644
+index f348e081e..6cc690098 100644
 --- a/service/channel.go
 +++ b/service/channel.go
 @@ -4,7 +4,10 @@ import (
@@ -858,10 +858,10 @@ index f348e08..6cc6900 100644
  	if !common.AutomaticEnableChannelEnabled {
  		return false
 diff --git a/service/channel_select.go b/service/channel_select.go
-index d37d4f6..7f623ea 100644
+index b6ed44a31..62cf916b0 100644
 --- a/service/channel_select.go
 +++ b/service/channel_select.go
-@@ -42,6 +42,10 @@ type RetryParam struct {
+@@ -44,6 +44,10 @@ type RetryParam struct {
  	RequestPath  string
  	Retry        *int
  	resetNextTry bool
@@ -872,7 +872,7 @@ index d37d4f6..7f623ea 100644
  }
  
  func (p *RetryParam) GetRetry() int {
-@@ -70,6 +74,26 @@ func (p *RetryParam) ResetRetryNextTry() {
+@@ -72,6 +76,26 @@ func (p *RetryParam) ResetRetryNextTry() {
  	p.resetNextTry = true
  }
  
@@ -900,7 +900,7 @@ index d37d4f6..7f623ea 100644
  // 尝试获取一个满足要求的随机渠道。
  //
 diff --git a/web/src/features/channels/components/channels-columns.tsx b/web/src/features/channels/components/channels-columns.tsx
-index ad6fadc..820d840 100644
+index 34ce59152..11762d736 100644
 --- a/web/src/features/channels/components/channels-columns.tsx
 +++ b/web/src/features/channels/components/channels-columns.tsx
 @@ -21,6 +21,7 @@ import { useQueryClient } from '@tanstack/react-query'
@@ -911,7 +911,7 @@ index ad6fadc..820d840 100644
    ChevronDown,
    ChevronRight,
    ListOrdered,
-@@ -787,12 +788,15 @@ export function useChannelsColumns(
+@@ -786,12 +787,15 @@ export function useChannelsColumns(
            const channel = row.original as Channel
            const isMultiKey = isMultiKeyChannel(channel)
            const multiKeyMode = channel.channel_info?.multi_key_mode ?? 'random'
@@ -934,19 +934,10 @@ index ad6fadc..820d840 100644
            const ionetMeta = parseIonetMeta(channel.other_info)
            const isIonet = ionetMeta?.source === 'ionet'
 diff --git a/web/src/features/channels/components/dialogs/multi-key-manage-dialog.tsx b/web/src/features/channels/components/dialogs/multi-key-manage-dialog.tsx
-index 22f7521..d349da9 100644
+index 0fd28bffe..5cd785dc0 100644
 --- a/web/src/features/channels/components/dialogs/multi-key-manage-dialog.tsx
 +++ b/web/src/features/channels/components/dialogs/multi-key-manage-dialog.tsx
-@@ -149,7 +149,7 @@ export function MultiKeyManageDialog({
-   }
- 
-   const handleStatusFilterChange = (value: string) => {
--    const newFilter = value === 'all' ? null : parseInt(value)
-+    const newFilter = value === 'all' ? null : Number.parseInt(value)
-     setStatusFilter(newFilter)
-     setCurrentPage(1)
-     loadKeyStatus(1, pageSize, newFilter)
-@@ -235,6 +235,13 @@ export function MultiKeyManageDialog({
+@@ -232,6 +232,13 @@ export function MultiKeyManageDialog({
  
    if (!currentRow) return null
  
@@ -960,7 +951,7 @@ index 22f7521..d349da9 100644
    return (
      <>
        <Dialog
-@@ -250,11 +257,7 @@ export function MultiKeyManageDialog({
+@@ -247,11 +254,7 @@ export function MultiKeyManageDialog({
              />
              {currentRow.channel_info?.multi_key_mode && (
                <StatusBadge
@@ -973,52 +964,23 @@ index 22f7521..d349da9 100644
                  variant='neutral'
                  copyable={false}
                />
-@@ -294,12 +297,10 @@ export function MultiKeyManageDialog({
-           {/* Toolbar */}
-           <div className='flex shrink-0 items-center justify-between'>
-             <Select
--              items={[
--                ...MULTI_KEY_FILTER_OPTIONS.map((option) => ({
--                  value: option.value,
--                  label: t(option.label),
--                })),
--              ]}
-+              items={MULTI_KEY_FILTER_OPTIONS.map((option) => ({
-+                value: option.value,
-+                label: t(option.label),
-+              }))}
-               value={statusFilter === null ? 'all' : statusFilter.toString()}
-               onValueChange={(v) => v !== null && handleStatusFilterChange(v)}
-             >
-@@ -378,15 +379,17 @@ export function MultiKeyManageDialog({
- 
-           {/* Table */}
-           <div className='min-h-0 flex-1 overflow-auto rounded-md border'>
--            {isLoading ? (
-+            {isLoading && (
-               <div className='flex items-center justify-center py-12'>
-                 <Loader2 className='text-muted-foreground h-8 w-8 animate-spin' />
-               </div>
--            ) : keys.length === 0 ? (
-+            )}
-+            {!isLoading && keys.length === 0 && (
-               <div className='text-muted-foreground py-12 text-center'>
+@@ -383,7 +386,7 @@ export function MultiKeyManageDialog({
                  {t('No keys found')}
                </div>
--            ) : (
-+            )}
+             )}
+-            {!isLoading && !(keys.length === 0) && (
 +            {!isLoading && keys.length > 0 && (
                <StaticDataTable
                  className='rounded-none border-0'
                  tableClassName='min-w-[800px]'
 diff --git a/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx b/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx
-index 075b1e1..e7d851e 100644
+index bfd3c7b29..373cb0e14 100644
 --- a/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx
 +++ b/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx
-@@ -699,6 +699,22 @@ export function ChannelMutateDrawer({
-   // Watch form values for conditional rendering
-   const multiKeyMode = form.watch('multi_key_mode')
-   const multiKeyType = form.watch('multi_key_type')
+@@ -501,6 +501,22 @@ export function ChannelMutateDrawer({
+   const formValues = form.watch()
+   const multiKeyMode = formValues.multi_key_mode
+   const multiKeyType = formValues.multi_key_type
 +  let multiKeyDescription: ReactNode = t(
 +    'Randomly select a key from the pool for each request'
 +  )
@@ -1035,51 +997,51 @@ index 075b1e1..e7d851e 100644
 +      'Always use the first enabled key; when a request failure matches the auto-disable rules, automatically try the next one'
 +    )
 +  }
-   const keyMode = form.watch('key_mode')
-   const currentGroups = form.watch('group')
-   const currentType = form.watch('type')
-@@ -3207,6 +3223,10 @@ placeholder={t(
-                                               value: 'polling',
-                                               label: t('Polling'),
-                                             },
-+                                            {
-+                                              value: 'sequential',
-+                                              label: t('Sequential'),
-+                                            },
-                                           ]}
-                                           onValueChange={field.onChange}
-                                           value={field.value}
-@@ -3226,21 +3246,14 @@ placeholder={t(
-                                               <SelectItem value='polling'>
-                                                 {t('Polling')}
-                                               </SelectItem>
-+                                              <SelectItem value='sequential'>
-+                                                {t('Sequential')}
-+                                              </SelectItem>
-                                             </SelectGroup>
-                                           </SelectContent>
-                                         </Select>
-                                         <FormDescription>
--                                          {multiKeyType === 'polling' ? (
--                                            <span className='text-warning'>
--                                              {t(
--                                                'Polling mode requires Redis and memory cache, otherwise performance will be significantly degraded'
--                                              )}
--                                            </span>
--                                          ) : (
--                                            t(
--                                              'Randomly select a key from the pool for each request'
--                                            )
--                                          )}
-+                                          {multiKeyDescription}
-                                         </FormDescription>
-                                         <FormMessage />
-                                       </FormItem>
+   const keyMode = formValues.key_mode
+   const currentGroups = formValues.group
+   const currentType = formValues.type
+@@ -4036,6 +4052,10 @@ export function ChannelMutateDrawer({
+                             value: 'polling',
+                             label: t('Polling'),
+                           },
++                          {
++                            value: 'sequential',
++                            label: t('Sequential'),
++                          },
+                         ]}
+                         onValueChange={field.onChange}
+                         value={field.value}
+@@ -4053,21 +4073,14 @@ export function ChannelMutateDrawer({
+                             <SelectItem value='polling'>
+                               {t('Polling')}
+                             </SelectItem>
++                            <SelectItem value='sequential'>
++                              {t('Sequential')}
++                            </SelectItem>
+                           </SelectGroup>
+                         </SelectContent>
+                       </Select>
+                       <FormDescription>
+-                        {multiKeyType === 'polling' ? (
+-                          <span className='text-warning'>
+-                            {t(
+-                              'Polling mode requires Redis and memory cache, otherwise performance will be significantly degraded'
+-                            )}
+-                          </span>
+-                        ) : (
+-                          t(
+-                            'Randomly select a key from the pool for each request'
+-                          )
+-                        )}
++                        {multiKeyDescription}
+                       </FormDescription>
+                       <FormMessage />
+                     </FormItem>
 diff --git a/web/src/features/channels/constants.ts b/web/src/features/channels/constants.ts
-index 4fd4956..cee7f4c 100644
+index 62c523727..3f31b9dd3 100644
 --- a/web/src/features/channels/constants.ts
 +++ b/web/src/features/channels/constants.ts
-@@ -203,6 +203,7 @@ export const MULTI_KEY_STATUS_CONFIG = {
+@@ -285,6 +285,7 @@ export const MULTI_KEY_STATUS_CONFIG = {
  export const MULTI_KEY_MODES = [
    { value: 'random', label: 'Random' },
    { value: 'polling', label: 'Polling' },
@@ -1088,7 +1050,7 @@ index 4fd4956..cee7f4c 100644
  
  export const ADD_MODE_OPTIONS = [
 diff --git a/web/src/features/channels/lib/channel-form.ts b/web/src/features/channels/lib/channel-form.ts
-index f31a5c4..eebc4a3 100644
+index f31a5c424..eebc4a354 100644
 --- a/web/src/features/channels/lib/channel-form.ts
 +++ b/web/src/features/channels/lib/channel-form.ts
 @@ -251,7 +251,7 @@ export const channelFormSchema = z
@@ -1110,7 +1072,7 @@ index f31a5c4..eebc4a3 100644
    channel: Partial<Channel>
  } {
 diff --git a/web/src/features/channels/types.ts b/web/src/features/channels/types.ts
-index 6b53c33..216a63a 100644
+index 419e369e1..0e37545c8 100644
 --- a/web/src/features/channels/types.ts
 +++ b/web/src/features/channels/types.ts
 @@ -29,7 +29,7 @@ export const channelInfoSchema = z.object({
@@ -1122,7 +1084,7 @@ index 6b53c33..216a63a 100644
  })
  
  export type ChannelInfo = z.infer<typeof channelInfoSchema>
-@@ -364,7 +364,7 @@ export interface ChannelFormData {
+@@ -365,7 +365,7 @@ export interface ChannelFormData {
    other?: string
    // Multi-key specific
    multi_key_mode?: 'single' | 'batch' | 'multi_to_single'
@@ -1131,7 +1093,7 @@ index 6b53c33..216a63a 100644
    batch_add_set_key_prefix_2_name?: boolean
  }
  
-@@ -374,7 +374,7 @@ export interface ChannelFormData {
+@@ -375,7 +375,7 @@ export interface ChannelFormData {
  
  export interface AddChannelRequest {
    mode: 'single' | 'batch' | 'multi_to_single'
@@ -1141,10 +1103,10 @@ index 6b53c33..216a63a 100644
    channel: Partial<Channel>
  }
 diff --git a/web/src/i18n/locales/en.json b/web/src/i18n/locales/en.json
-index 7a6fdd1..b8fa906 100644
+index 800d25f37..f11f4eaf8 100644
 --- a/web/src/i18n/locales/en.json
 +++ b/web/src/i18n/locales/en.json
-@@ -404,6 +404,7 @@
+@@ -449,6 +449,7 @@
      "Also remove from all channels": "Also remove from all channels",
      "Also remove pricing": "Also remove pricing",
      "Always matches (default tier).": "Always matches (default tier).",
@@ -1152,7 +1114,7 @@ index 7a6fdd1..b8fa906 100644
      "Amount": "Amount",
      "Amount cannot be changed when editing.": "Amount cannot be changed when editing.",
      "Amount discount": "Amount discount",
-@@ -3145,6 +3146,7 @@
+@@ -3400,6 +3401,7 @@
      "Multi-Key Strategy": "Multi-Key Strategy",
      "Multi-key: Polling rotation": "Multi-key: Polling rotation",
      "Multi-key: Random rotation": "Multi-key: Random rotation",
@@ -1160,7 +1122,7 @@ index 7a6fdd1..b8fa906 100644
      "Multi-protocol Compatible": "Multi-protocol Compatible",
      "Multi-region deployment for stable global access": "Multi-region deployment for stable global access",
      "Multi-step thinking before final answer": "Multi-step thinking before final answer",
-@@ -4096,6 +4098,7 @@
+@@ -4432,6 +4434,7 @@
      "Quota:": "Quota:",
      "Radius": "Radius",
      "Random": "Random",
@@ -1169,10 +1131,10 @@ index 7a6fdd1..b8fa906 100644
      "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.",
      "Rankings": "Rankings",
 diff --git a/web/src/i18n/locales/fr.json b/web/src/i18n/locales/fr.json
-index e28f968..93bec3e 100644
+index d0c20bfed..f3f7bb310 100644
 --- a/web/src/i18n/locales/fr.json
 +++ b/web/src/i18n/locales/fr.json
-@@ -404,6 +404,7 @@
+@@ -449,6 +449,7 @@
      "Also remove from all channels": "Retirer aussi de tous les canaux",
      "Also remove pricing": "Supprimer aussi les prix",
      "Always matches (default tier).": "Toujours appliqué (palier par défaut).",
@@ -1180,7 +1142,7 @@ index e28f968..93bec3e 100644
      "Amount": "Montant",
      "Amount cannot be changed when editing.": "Le montant ne peut pas être modifié lors de la modification.",
      "Amount discount": "Remise sur le montant",
-@@ -3145,6 +3146,7 @@
+@@ -3400,6 +3401,7 @@
      "Multi-Key Strategy": "Stratégie multi-clés",
      "Multi-key: Polling rotation": "Multi-clé : Rotation par sondage",
      "Multi-key: Random rotation": "Multi-clé : Rotation aléatoire",
@@ -1188,7 +1150,7 @@ index e28f968..93bec3e 100644
      "Multi-protocol Compatible": "Compatible multi-protocole",
      "Multi-region deployment for stable global access": "Déploiement multirégional pour un accès mondial stable",
      "Multi-step thinking before final answer": "Raisonnement en plusieurs étapes avant la réponse finale",
-@@ -4096,6 +4098,7 @@
+@@ -4432,6 +4434,7 @@
      "Quota:": "Quota :",
      "Radius": "Rayon",
      "Random": "Aléatoire",
@@ -1197,10 +1159,10 @@ index e28f968..93bec3e 100644
      "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "Les données de classement sont actuellement simulées à des fins d'aperçu et seront remplacées par des analyses en direct une fois l'intégration backend livrée.",
      "Rankings": "Classements",
 diff --git a/web/src/i18n/locales/ja.json b/web/src/i18n/locales/ja.json
-index 6eae5ab..2f4f494 100644
+index 56df3874e..fb4c13bb1 100644
 --- a/web/src/i18n/locales/ja.json
 +++ b/web/src/i18n/locales/ja.json
-@@ -404,6 +404,7 @@
+@@ -449,6 +449,7 @@
      "Also remove from all channels": "すべてのチャネルからも削除",
      "Also remove pricing": "料金設定も削除",
      "Always matches (default tier).": "常に一致（デフォルト ティア）。",
@@ -1208,7 +1170,7 @@ index 6eae5ab..2f4f494 100644
      "Amount": "金額",
      "Amount cannot be changed when editing.": "編集時は金額を変更できません。",
      "Amount discount": "割引額",
-@@ -3145,6 +3146,7 @@
+@@ -3400,6 +3401,7 @@
      "Multi-Key Strategy": "マルチキー戦略",
      "Multi-key: Polling rotation": "マルチキー：ポーリングローテーション",
      "Multi-key: Random rotation": "マルチキー：ランダムローテーション",
@@ -1216,7 +1178,7 @@ index 6eae5ab..2f4f494 100644
      "Multi-protocol Compatible": "マルチプロトコル互換",
      "Multi-region deployment for stable global access": "安定したグローバルアクセスを実現するマルチリージョンデプロイメント",
      "Multi-step thinking before final answer": "最終回答の前に複数ステップで思考",
-@@ -4096,6 +4098,7 @@
+@@ -4432,6 +4434,7 @@
      "Quota:": "クォータ：",
      "Radius": "角丸",
      "Random": "ランダム",
@@ -1225,10 +1187,10 @@ index 6eae5ab..2f4f494 100644
      "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "現在のランキングデータはプレビュー用のシミュレーションです。バックエンド連携が完了次第、リアルタイム分析データに置き換わります。",
      "Rankings": "ランキング",
 diff --git a/web/src/i18n/locales/ru.json b/web/src/i18n/locales/ru.json
-index 8abaf2b..94fa784 100644
+index 5623b9399..58b50917e 100644
 --- a/web/src/i18n/locales/ru.json
 +++ b/web/src/i18n/locales/ru.json
-@@ -404,6 +404,7 @@
+@@ -449,6 +449,7 @@
      "Also remove from all channels": "Также удалить из всех каналов",
      "Also remove pricing": "Также удалить цены",
      "Always matches (default tier).": "Всегда совпадает (уровень по умолчанию).",
@@ -1236,7 +1198,7 @@ index 8abaf2b..94fa784 100644
      "Amount": "Сумма",
      "Amount cannot be changed when editing.": "Количество нельзя изменить при редактировании.",
      "Amount discount": "Скидка на сумму",
-@@ -3145,6 +3146,7 @@
+@@ -3400,6 +3401,7 @@
      "Multi-Key Strategy": "Стратегия нескольких ключей",
      "Multi-key: Polling rotation": "Мульти-ключ: Циклическая ротация",
      "Multi-key: Random rotation": "Мульти-ключ: Случайная ротация",
@@ -1244,7 +1206,7 @@ index 8abaf2b..94fa784 100644
      "Multi-protocol Compatible": "Совместимо с несколькими протоколами",
      "Multi-region deployment for stable global access": "Мультирегиональное развертывание для стабильного глобального доступа",
      "Multi-step thinking before final answer": "Многошаговые рассуждения перед итоговым ответом",
-@@ -4096,6 +4098,7 @@
+@@ -4432,6 +4434,7 @@
      "Quota:": "Квота:",
      "Radius": "Радиус",
      "Random": "Случайный",
@@ -1253,10 +1215,10 @@ index 8abaf2b..94fa784 100644
      "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "Сейчас данные рейтинга смоделированы для превью; после внедрения бэкенда они будут заменены реальной аналитикой.",
      "Rankings": "Рейтинги",
 diff --git a/web/src/i18n/locales/vi.json b/web/src/i18n/locales/vi.json
-index f735ea6..d102b63 100644
+index 0b559956b..f082917b7 100644
 --- a/web/src/i18n/locales/vi.json
 +++ b/web/src/i18n/locales/vi.json
-@@ -404,6 +404,7 @@
+@@ -449,6 +449,7 @@
      "Also remove from all channels": "Đồng thời xóa khỏi tất cả các kênh",
      "Also remove pricing": "Đồng thời xóa giá",
      "Always matches (default tier).": "Luôn khớp (bậc mặc định).",
@@ -1264,7 +1226,7 @@ index f735ea6..d102b63 100644
      "Amount": "Số lượng",
      "Amount cannot be changed when editing.": "Số tiền không thể thay đổi khi chỉnh sửa.",
      "Amount discount": "Số tiền giảm giá",
-@@ -3145,6 +3146,7 @@
+@@ -3400,6 +3401,7 @@
      "Multi-Key Strategy": "Chiến lược đa khóa",
      "Multi-key: Polling rotation": "Đa khóa: Xoay vòng tuần tự",
      "Multi-key: Random rotation": "Đa khóa: Xoay vòng ngẫu nhiên",
@@ -1272,7 +1234,7 @@ index f735ea6..d102b63 100644
      "Multi-protocol Compatible": "Tương thích đa giao thức",
      "Multi-region deployment for stable global access": "Triển khai đa khu vực để truy cập toàn cầu ổn định",
      "Multi-step thinking before final answer": "Suy luận nhiều bước trước khi đưa ra câu trả lời cuối",
-@@ -4096,6 +4098,7 @@
+@@ -4432,6 +4434,7 @@
      "Quota:": "Hạn ngạch:",
      "Radius": "Bo góc",
      "Random": "Ngẫu nhiên",
@@ -1281,10 +1243,10 @@ index f735ea6..d102b63 100644
      "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "Dữ liệu xếp hạng hiện đang được mô phỏng để xem trước và sẽ được thay bằng dữ liệu thực sau khi tích hợp backend.",
      "Rankings": "Bảng xếp hạng",
 diff --git a/web/src/i18n/locales/zh-TW.json b/web/src/i18n/locales/zh-TW.json
-index af7429d..16f2d0f 100644
+index e81515c75..62574102f 100644
 --- a/web/src/i18n/locales/zh-TW.json
 +++ b/web/src/i18n/locales/zh-TW.json
-@@ -404,6 +404,7 @@
+@@ -449,6 +449,7 @@
      "Also remove from all channels": "同時從所有渠道移除",
      "Also remove pricing": "同時移除定價",
      "Always matches (default tier).": "始終匹配（預設檔位）。",
@@ -1292,7 +1254,7 @@ index af7429d..16f2d0f 100644
      "Amount": "金額",
      "Amount cannot be changed when editing.": "編輯時無法更改數量。",
      "Amount discount": "金額折扣",
-@@ -3145,6 +3146,7 @@
+@@ -3400,6 +3401,7 @@
      "Multi-Key Strategy": "多金鑰策略",
      "Multi-key: Polling rotation": "多金鑰：輪詢",
      "Multi-key: Random rotation": "多金鑰：隨機",
@@ -1300,7 +1262,7 @@ index af7429d..16f2d0f 100644
      "Multi-protocol Compatible": "兼容多協定",
      "Multi-region deployment for stable global access": "多區域部署，實現穩定的全球存取",
      "Multi-step thinking before final answer": "在給出最終答案前進行多步推理",
-@@ -4096,6 +4098,7 @@
+@@ -4432,6 +4434,7 @@
      "Quota:": "Quota:",
      "Radius": "圓角",
      "Random": "隨機",
@@ -1309,10 +1271,10 @@ index af7429d..16f2d0f 100644
      "Ranking data is currently simulated for preview purposes and will be replaced with live analytics once the backend integration ships.": "目前排行榜數據為預覽用模擬數據，後端整合完成後將替換為真實分析數據。",
      "Rankings": "排行榜",
 diff --git a/web/src/i18n/locales/zh.json b/web/src/i18n/locales/zh.json
-index abce204..0ff94b8 100644
+index 495f49bbc..fb991587e 100644
 --- a/web/src/i18n/locales/zh.json
 +++ b/web/src/i18n/locales/zh.json
-@@ -404,6 +404,7 @@
+@@ -449,6 +449,7 @@
      "Also remove from all channels": "同时从所有渠道移除",
      "Also remove pricing": "同时移除定价",
      "Always matches (default tier).": "始终匹配（默认档位）。",
@@ -1320,7 +1282,7 @@ index abce204..0ff94b8 100644
      "Amount": "金额",
      "Amount cannot be changed when editing.": "编辑时无法更改数量。",
      "Amount discount": "金额折扣",
-@@ -3145,6 +3146,7 @@
+@@ -3400,6 +3401,7 @@
      "Multi-Key Strategy": "多密钥策略",
      "Multi-key: Polling rotation": "多密钥：轮询",
      "Multi-key: Random rotation": "多密钥：随机",
@@ -1328,7 +1290,7 @@ index abce204..0ff94b8 100644
      "Multi-protocol Compatible": "兼容多协议",
      "Multi-region deployment for stable global access": "多区域部署，实现稳定的全球访问",
      "Multi-step thinking before final answer": "在给出最终答案前进行多步推理",
-@@ -4096,6 +4098,7 @@
+@@ -4432,6 +4434,7 @@
      "Quota:": "Quota:",
      "Radius": "圆角",
      "Random": "随机",

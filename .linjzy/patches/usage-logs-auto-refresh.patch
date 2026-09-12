@@ -1,5 +1,5 @@
 diff --git a/web/src/features/usage-logs/api.ts b/web/src/features/usage-logs/api.ts
-index 793010b..bcc1ccc 100644
+index 793010be4..bcc1ccc7e 100644
 --- a/web/src/features/usage-logs/api.ts
 +++ b/web/src/features/usage-logs/api.ts
 @@ -35,6 +35,13 @@ import type {
@@ -35,7 +35,7 @@ index 793010b..bcc1ccc 100644
  }
  
 diff --git a/web/src/features/usage-logs/components/common-logs-stats.tsx b/web/src/features/usage-logs/components/common-logs-stats.tsx
-index dd754e2..a104d7e 100644
+index 91b82af7d..06f671af6 100644
 --- a/web/src/features/usage-logs/components/common-logs-stats.tsx
 +++ b/web/src/features/usage-logs/components/common-logs-stats.tsx
 @@ -18,7 +18,9 @@ For commercial licensing, please contact support@quantumnous.com
@@ -48,7 +48,7 @@ index dd754e2..a104d7e 100644
  
  import { Skeleton } from '@/components/ui/skeleton'
  import { formatLogQuota } from '@/lib/format'
-@@ -26,6 +28,10 @@ import { cn } from '@/lib/utils'
+@@ -27,6 +29,10 @@ import { cn } from '@/lib/utils'
  
  import { getLogStats, getUserLogStats } from '../api'
  import { DEFAULT_LOG_STATS } from '../constants'
@@ -59,7 +59,7 @@ index dd754e2..a104d7e 100644
  import { buildApiParams } from '../lib/utils'
  import { useLogsViewScope, useUsageLogsContext } from './usage-logs-provider'
  
-@@ -51,9 +57,15 @@ export function CommonLogsStats() {
+@@ -52,9 +58,15 @@ export function CommonLogsStats() {
    const { t } = useTranslation()
    const { isAdminView: isAdmin } = useLogsViewScope()
    const searchParams = route.useSearch()
@@ -77,9 +77,9 @@ index dd754e2..a104d7e 100644
      queryKey: ['usage-logs-stats', isAdmin, searchParams],
      queryFn: async () => {
        const params = buildApiParams({
-@@ -68,13 +80,31 @@ export function CommonLogsStats() {
-         ? await getLogStats(params)
-         : await getUserLogStats(params)
+@@ -69,13 +81,31 @@ export function CommonLogsStats() {
+         ? requireServerSuccess(await getLogStats(params))
+         : requireServerSuccess(await getUserLogStats(params))
  
 -      return result.success
 -        ? result.data || DEFAULT_LOG_STATS
@@ -113,10 +113,10 @@ index dd754e2..a104d7e 100644
      return (
        <div className='flex items-center gap-2'>
 diff --git a/web/src/features/usage-logs/components/dialogs/details-dialog.tsx b/web/src/features/usage-logs/components/dialogs/details-dialog.tsx
-index c3f457e..e43220b 100644
+index bd5d5d1d2..e6264d9ef 100644
 --- a/web/src/features/usage-logs/components/dialogs/details-dialog.tsx
 +++ b/web/src/features/usage-logs/components/dialogs/details-dialog.tsx
-@@ -445,6 +445,17 @@ export function DetailsDialog(props: DetailsDialogProps) {
+@@ -477,6 +477,17 @@ export function DetailsDialog(props: DetailsDialogProps) {
    const { copiedText, copyToClipboard } = useCopyToClipboard({ notify: false })
    const other = parseLogOther(props.log.other)
    const typeConfig = getLogTypeConfig(props.log.type)
@@ -134,7 +134,7 @@ index c3f457e..e43220b 100644
  
    const isViolation = isViolationFeeLog(other)
    const isRefund = props.log.type === 6
-@@ -1151,43 +1162,42 @@ export function DetailsDialog(props: DetailsDialogProps) {
+@@ -1194,43 +1205,42 @@ export function DetailsDialog(props: DetailsDialogProps) {
            )}
  
          {/* Stream status details */}
@@ -192,7 +192,7 @@ index c3f457e..e43220b 100644
          )}
  
 diff --git a/web/src/features/usage-logs/components/usage-logs-provider.tsx b/web/src/features/usage-logs/components/usage-logs-provider.tsx
-index 930634c..77689c7 100644
+index 930634c4e..77689c785 100644
 --- a/web/src/features/usage-logs/components/usage-logs-provider.tsx
 +++ b/web/src/features/usage-logs/components/usage-logs-provider.tsx
 @@ -46,6 +46,8 @@ interface UsageLogsContextValue {
@@ -222,10 +222,10 @@ index 930634c..77689c7 100644
          setViewScope,
        }}
 diff --git a/web/src/features/usage-logs/components/usage-logs-table.tsx b/web/src/features/usage-logs/components/usage-logs-table.tsx
-index 8d57cf3..3d64256 100644
+index c97b06f9c..e799e3569 100644
 --- a/web/src/features/usage-logs/components/usage-logs-table.tsx
 +++ b/web/src/features/usage-logs/components/usage-logs-table.tsx
-@@ -18,7 +18,12 @@ For commercial licensing, please contact support@quantumnous.com
+@@ -18,8 +18,14 @@ For commercial licensing, please contact support@quantumnous.com
  */
  import { useQuery } from '@tanstack/react-query'
  import { getRouteApi } from '@tanstack/react-router'
@@ -237,9 +237,11 @@ index 8d57cf3..3d64256 100644
 +} from '@tanstack/react-table'
 +import { useCallback, useEffect } from 'react'
  import { useTranslation } from 'react-i18next'
- import { toast } from 'sonner'
++import { toast } from 'sonner'
  
-@@ -36,6 +41,10 @@ import {
+ import {
+   DataTablePage,
+@@ -36,6 +42,10 @@ import {
    LOG_TYPE_ALL_VALUE,
    LOG_TYPE_ENUM,
  } from '../constants'
@@ -250,7 +252,7 @@ index 8d57cf3..3d64256 100644
  import { useColumnsByCategory } from '../lib/columns'
  import { parseLogOther } from '../lib/format'
  import { fetchLogsByCategory } from '../lib/utils'
-@@ -43,7 +52,11 @@ import type { LogCategory } from '../types'
+@@ -43,7 +53,11 @@ import type { LogCategory } from '../types'
  import { CommonLogsFilterBar } from './common-logs-filter-bar'
  import { TaskLogsFilterBar } from './task-logs-filter-bar'
  import { UsageLogsMobileList } from './usage-logs-mobile-card'
@@ -263,7 +265,7 @@ index 8d57cf3..3d64256 100644
  
  const route = getRouteApi('/_authenticated/usage-logs/$section')
  
-@@ -84,6 +97,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
+@@ -84,6 +98,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
      isRootView: isRoot,
      viewAccess,
    } = useLogsViewScope()
@@ -271,7 +273,7 @@ index 8d57cf3..3d64256 100644
    const isMobile = useMediaQuery('(max-width: 640px)')
    const searchParams = route.useSearch()
  
-@@ -125,7 +139,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
+@@ -125,7 +140,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
      ],
    })
  
@@ -280,17 +282,7 @@ index 8d57cf3..3d64256 100644
      queryKey: [
        'logs',
        logCategory,
-@@ -147,8 +161,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
-       })
- 
-       if (!result?.success) {
--        toast.error(result?.message || t('Failed to load logs'))
--        return DEFAULT_LOGS_DATA
-+        throw new Error(result?.message || t('Failed to load logs'))
-       }
- 
-       return result.data || DEFAULT_LOGS_DATA
-@@ -162,8 +175,36 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
+@@ -161,8 +176,36 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
        }
        return undefined
      },
@@ -327,7 +319,7 @@ index 8d57cf3..3d64256 100644
    const logs = data?.items || []
    const columns = useColumnsByCategory(logCategory, isAdmin, isRoot)
    const isLoadingData = isLoading || (isFetching && !data)
-@@ -178,7 +219,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
+@@ -177,7 +220,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
      ),
      pagination,
      enableRowSelection: false,
@@ -337,7 +329,7 @@ index 8d57cf3..3d64256 100644
      manualPagination: true,
      manualFiltering: true,
 diff --git a/web/src/features/usage-logs/constants.ts b/web/src/features/usage-logs/constants.ts
-index 95f2647..39994e7 100644
+index 95f2647ce..39994e784 100644
 --- a/web/src/features/usage-logs/constants.ts
 +++ b/web/src/features/usage-logs/constants.ts
 @@ -44,6 +44,9 @@ export const DEFAULT_LOGS_DATA = {
@@ -351,7 +343,7 @@ index 95f2647..39994e7 100644
  // Log Type Enum
  // ============================================================================
 diff --git a/web/src/features/usage-logs/index.tsx b/web/src/features/usage-logs/index.tsx
-index b0f911b..8ab57ef 100644
+index b0f911b71..8ab57ef05 100644
 --- a/web/src/features/usage-logs/index.tsx
 +++ b/web/src/features/usage-logs/index.tsx
 @@ -16,12 +16,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
@@ -451,44 +443,3 @@ index b0f911b..8ab57ef 100644
          </SectionPageLayout.Actions>
          <SectionPageLayout.Content>
            <div className='flex h-full min-h-0 flex-col gap-4'>
-diff --git a/web/src/features/usage-logs/lib/auto-refresh.ts b/web/src/features/usage-logs/lib/auto-refresh.ts
-new file mode 100644
-index 0000000..40d8486
---- /dev/null
-+++ b/web/src/features/usage-logs/lib/auto-refresh.ts
-@@ -0,0 +1,35 @@
-+/*
-+Copyright (C) 2023-2026 QuantumNous
-+
-+This program is free software: you can redistribute it and/or modify
-+it under the terms of the GNU Affero General Public License as
-+published by the Free Software Foundation, either version 3 of the
-+License, or (at your option) any later version.
-+
-+This program is distributed in the hope that it will be useful,
-+but WITHOUT ANY WARRANTY; without even the implied warranty of
-+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-+GNU Affero General Public License for more details.
-+
-+You should have received a copy of the GNU Affero General Public License
-+along with this program. If not, see <https://www.gnu.org/licenses/>.
-+
-+For commercial licensing, please contact support@quantumnous.com
-+*/
-+import { USAGE_LOGS_AUTO_REFRESH_INTERVAL_MS } from '../constants'
-+
-+type UsageLogsQueryStatus = 'pending' | 'error' | 'success'
-+
-+export const USAGE_LOGS_AUTO_REFRESH_ERROR_TOAST_ID =
-+  'usage-logs-auto-refresh-error'
-+
-+export function getUsageLogsRefetchInterval(
-+  autoRefresh: boolean,
-+  page: number,
-+  queryStatus: UsageLogsQueryStatus
-+): number | false {
-+  if (!autoRefresh || page !== 1 || queryStatus === 'error') {
-+    return false
-+  }
-+  return USAGE_LOGS_AUTO_REFRESH_INTERVAL_MS
-+}
