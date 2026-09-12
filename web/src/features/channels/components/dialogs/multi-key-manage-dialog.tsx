@@ -232,6 +232,13 @@ export function MultiKeyManageDialog({
 
   if (!currentRow) return null
 
+  let multiKeyModeLabel = t('Polling')
+  if (currentRow.channel_info?.multi_key_mode === 'random') {
+    multiKeyModeLabel = t('Random')
+  } else if (currentRow.channel_info?.multi_key_mode === 'sequential') {
+    multiKeyModeLabel = t('Sequential')
+  }
+
   return (
     <>
       <Dialog
@@ -247,11 +254,7 @@ export function MultiKeyManageDialog({
             />
             {currentRow.channel_info?.multi_key_mode && (
               <StatusBadge
-                label={
-                  currentRow.channel_info.multi_key_mode === 'random'
-                    ? t('Random')
-                    : t('Polling')
-                }
+                label={multiKeyModeLabel}
                 variant='neutral'
                 copyable={false}
               />
@@ -383,7 +386,7 @@ export function MultiKeyManageDialog({
                 {t('No keys found')}
               </div>
             )}
-            {!isLoading && !(keys.length === 0) && (
+            {!isLoading && keys.length > 0 && (
               <StaticDataTable
                 className='rounded-none border-0'
                 tableClassName='min-w-[800px]'

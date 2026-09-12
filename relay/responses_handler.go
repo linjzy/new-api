@@ -20,6 +20,8 @@ import (
 )
 
 func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.NewAPIError) {
+	info.ResponsesStreamError = nil
+	info.ResponsesCapacityFailure = false
 	info.InitChannelMeta(c)
 	if info.RelayMode == relayconstant.RelayModeResponsesCompact &&
 		!common.SupportsResponsesCompact(info.ChannelType, info.ApiType) {
@@ -142,6 +144,13 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 
 	usage, newAPIError := adaptor.DoResponse(c, httpResp, info)
 	if newAPIError != nil {
+		// A partial/billed response is never replayed. Preserve real or existing
+		// estimated usage and let the billing session settle once before returning.
+		// Upstream usage remains billable if the client disconnects before the
+		// first write. PostTextConsumeQuota ignores unbilled failed streams.
+		if usageDto, ok := usage.(*dto.Usage); ok && usageDto != nil {
+			service.PostTextConsumeQuota(c, info, usageDto, nil)
+		}
 		// reset status code 重置状态码
 		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
 		return newAPIError

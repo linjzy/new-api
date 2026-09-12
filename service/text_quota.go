@@ -398,12 +398,16 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 	if usage == nil {
 		extraContent = append(extraContent, "上游无计费信息")
 	}
+	adminRejectReason := common.GetContextKeyString(ctx, constant.ContextKeyAdminRejectReason)
+	summary := calculateTextQuotaSummary(ctx, relayInfo, billingUsage)
+	if common.GetContextKeyBool(ctx, constant.ContextKeyResponsesStreamFailed) && !summary.hasBillableUsage() {
+		// The relay records the failure and refunds the precharge. Do not also
+		// log an empty consumption; real token or tool usage still settles below.
+		return
+	}
 	if originUsage != nil {
 		ObserveChannelAffinityUsageCacheByRelayFormat(ctx, billingUsage, relayInfo.GetFinalRequestRelayFormat())
 	}
-
-	adminRejectReason := common.GetContextKeyString(ctx, constant.ContextKeyAdminRejectReason)
-	summary := calculateTextQuotaSummary(ctx, relayInfo, billingUsage)
 
 	var tieredResult *billingexpr.TieredResult
 	var tieredTokens billingexpr.TokenParams

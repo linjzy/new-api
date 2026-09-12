@@ -477,6 +477,17 @@ export function DetailsDialog(props: DetailsDialogProps) {
   const { copiedText, copyToClipboard } = useCopyToClipboard({ notify: false })
   const other = parseLogOther(props.log.other)
   const typeConfig = getLogTypeConfig(props.log.type)
+  const streamStatus = other?.stream_status
+  const streamErrors = Array.isArray(streamStatus?.errors)
+    ? [
+        ...new Set(
+          streamStatus.errors
+            .map((error) => error.trim())
+            .filter(Boolean)
+            .filter((error) => error !== streamStatus.end_error?.trim())
+        )
+      ]
+    : []
 
   const isViolation = isViolationFeeLog(other)
   const isRefund = props.log.type === 6
@@ -1194,43 +1205,42 @@ export function DetailsDialog(props: DetailsDialogProps) {
           )}
 
         {/* Stream status details */}
-        {other?.stream_status && other.stream_status.status !== 'ok' && (
+        {streamStatus && streamStatus.status !== 'ok' && (
           <DetailSection label={t('Stream Status')}>
             <DetailRow
               label={t('Status')}
               value={
                 <StatusBadge
-                  label={other.stream_status.status || t('Error')}
+                  label={streamStatus.status || t('Error')}
                   variant='red'
                   size='sm'
                   copyable={false}
                 />
               }
             />
-            {other.stream_status.end_reason && (
+            {streamStatus.end_reason && (
               <DetailRow
                 label={t('End Reason')}
-                value={other.stream_status.end_reason}
+                value={streamStatus.end_reason}
               />
             )}
-            {(other.stream_status.error_count ?? 0) > 0 && (
+            {(streamStatus.error_count ?? 0) > 0 && (
               <DetailRow
                 label={t('Soft Errors')}
-                value={String(other.stream_status.error_count)}
+                value={String(streamStatus.error_count)}
               />
             )}
-            {other.stream_status.end_error && (
+            {streamStatus.end_error && (
               <DetailRow
                 label={t('End Error')}
-                value={other.stream_status.end_error}
+                value={streamStatus.end_error}
               />
             )}
-            {Array.isArray(other.stream_status.errors) &&
-              other.stream_status.errors.length > 0 && (
-                <pre className='bg-background/60 mt-1 max-h-32 overflow-y-auto rounded border p-2 font-mono text-[11px] leading-relaxed wrap-break-word whitespace-pre-wrap'>
-                  {other.stream_status.errors.join('\n')}
-                </pre>
-              )}
+            {streamErrors.length > 0 && (
+              <pre className='bg-background/60 mt-1 max-h-32 overflow-y-auto rounded border p-2 font-mono text-[11px] leading-relaxed wrap-break-word whitespace-pre-wrap'>
+                {streamErrors.join('\n')}
+              </pre>
+            )}
           </DetailSection>
         )}
 

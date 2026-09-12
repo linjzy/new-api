@@ -1,0 +1,859 @@
+diff --git a/constant/context_key.go b/constant/context_key.go
+index 994e65751..e7af897ef 100644
+--- a/constant/context_key.go
++++ b/constant/context_key.go
+@@ -66,8 +66,10 @@ const (
+ 	ContextKeyAdminRejectReason ContextKey = "admin_reject_reason"
+ 
+ 	// ContextKeyLanguage stores the user's language preference for i18n
+-	ContextKeyLanguage ContextKey = "language"
+-	ContextKeyIsStream ContextKey = "is_stream"
++	ContextKeyLanguage                 ContextKey = "language"
++	ContextKeyIsStream                 ContextKey = "is_stream"
++	ContextKeyResponsesStreamFailed    ContextKey = "responses_stream_failed"
++	ContextKeyResponsesCapacityRetried ContextKey = "responses_capacity_retried"
+ 
+ 	// ContextKeyAuditLogged marks that the current request has already recorded
+ 	// a manage/operation audit log inside the handler. When set, the admin-audit
+diff --git a/controller/relay.go b/controller/relay.go
+index 5cd64859c..b03bbc634 100644
+--- a/controller/relay.go
++++ b/controller/relay.go
+@@ -94,6 +94,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+ 	defer func() {
+ 		if newAPIError != nil {
+ 			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
++			// The upstream SSE failure has already been sent. Appending JSON
++			// would corrupt the stream, and its HTTP status cannot be replaced.
++			if common.GetContextKeyBool(c, constant.ContextKeyResponsesStreamFailed) && c.Writer.Written() {
++				return
++			}
+ 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
+ 			switch relayFormat {
+ 			case types.RelayFormatOpenAIRealtime:
+@@ -192,16 +197,29 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+ 	}
+ 	relayInfo.RetryIndex = 0
+ 	relayInfo.LastError = nil
++	channelAttempts := 0
+ 
+ 	for ; retryParam.GetRetry() <= common.RetryTimes || retryParam.HasSequentialChannel(); retryParam.IncreaseRetry() {
++		sequentialRetry := retryParam.HasSequentialChannel()
++		if !sequentialRetry && common.GetContextKeyBool(c, constant.ContextKeyResponsesCapacityRetried) && channelAttempts > common.RetryTimes {
++			break
++		}
+ 		relayInfo.RetryIndex = retryParam.GetRetry()
+ 		channel, channelErr := getChannel(c, relayInfo, retryParam)
+ 		if channelErr != nil {
++			if relayInfo.LastError != nil && common.GetContextKeyBool(c, constant.ContextKeyResponsesCapacityRetried) {
++				newAPIError = relayInfo.LastError
++				break
++			}
+ 			logger.LogError(c, channelErr.Error())
+ 			newAPIError = channelErr
+ 			break
+ 		}
+ 		addUsedChannel(c, channel.Id)
++		// Same-channel key rotation does not spend the channel failover budget.
++		if !sequentialRetry {
++			channelAttempts++
++		}
+ 		if billingErr := service.PrepareTieredBillingForSelectedGroup(c, relayInfo); billingErr != nil {
+ 			newAPIError = billingErr
+ 			break
+@@ -232,11 +250,15 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+ 
+ 		if newAPIError == nil {
+ 			relayInfo.LastError = nil
++			common.SetContextKey(c, constant.ContextKeyResponsesStreamFailed, false)
+ 			return
+ 		}
+ 
+ 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
+ 		relayInfo.LastError = newAPIError
++		if relayInfo.ResponsesCapacityFailure {
++			common.SetContextKey(c, constant.ContextKeyResponsesCapacityRetried, true)
++		}
+ 
+ 		// On the first attempt getChannel intentionally returns a lightweight
+ 		// placeholder because the distributor already selected the channel. Use
+@@ -260,7 +282,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+ 		// the next attempt to the same channel. Pinning suppresses the loop's next
+ 		// retry increment, so every enabled key is tried without consuming the
+ 		// normal channel retry budget.
+-		if service.SequentialKeyAutoSkip(channelForError) &&
++		if !relayInfo.ResponsesCapacityFailure && service.SequentialKeyAutoSkip(channelForError) &&
+ 			service.ShouldDisableChannelForChannel(channelForError, newAPIError) &&
+ 			sequentialKeyDisabled && sequentialKeyAvailable(channelForError.Id) {
+ 			retryParam.SetSequentialChannel(channelForError.Id)
+@@ -427,6 +449,9 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
+ 	if openaiErr == nil {
+ 		return false
+ 	}
++	if c.Writer.Written() || (c.Request != nil && c.Request.Context().Err() != nil) {
++		return false
++	}
+ 	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
+ 		return false
+ 	}
+diff --git a/dto/channel_constraints.go b/dto/channel_constraints.go
+index 7dfdecafd..765969d34 100644
+--- a/dto/channel_constraints.go
++++ b/dto/channel_constraints.go
+@@ -38,6 +38,7 @@ type ChannelFilterKind string
+ const (
+ 	FilterRequestPath        ChannelFilterKind = "request_path"
+ 	FilterTaskPluginIdentity ChannelFilterKind = "task_plugin_identity"
++	FilterExcludeChannels    ChannelFilterKind = "exclude_channels"
+ )
+ 
+ type ChannelFilter struct {
+@@ -46,6 +47,7 @@ type ChannelFilter struct {
+ 	TaskPluginKey          string
+ 	TaskPluginKeys         []string
+ 	TaskPluginChannelTypes []int
++	ExcludedChannelIDs     []int
+ }
+ 
+ type ChannelConstraints struct {
+diff --git a/middleware/distributor.go b/middleware/distributor.go
+index 524a81502..fa2d1869d 100644
+--- a/middleware/distributor.go
++++ b/middleware/distributor.go
+@@ -197,7 +197,8 @@ func Distribute() func(c *gin.Context) {
+ 		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
+ 		SetupContextForSelectedChannel(c, channel, modelRequest.Model)
+ 		c.Next()
+-		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest {
++		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest && !common.GetContextKeyBool(c, constant.ContextKeyResponsesStreamFailed) {
++			// RecordChannelAffinity applies the configured switch-on-success policy.
+ 			service.RecordChannelAffinity(c, channel.Id)
+ 		}
+ 	}
+diff --git a/model/ability.go b/model/ability.go
+index ecfcb5c04..b86c442dc 100644
+--- a/model/ability.go
++++ b/model/ability.go
+@@ -165,7 +165,8 @@ func GetChannel(
+ 
+ // filterAbilitiesByConstraints applies the same ChannelSatisfiesFilters
+ // predicate used by the memory-cache path. A failed channel lookup fails
+-// closed when a task-plugin identity is required and fails open otherwise.
++// closed when channel exclusion or a task-plugin identity is required, and
++// fails open otherwise.
+ func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters []dto.ChannelFilter) []Ability {
+ 	if len(abilities) == 0 {
+ 		return nil
+@@ -183,6 +184,11 @@ func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters
+ 
+ 	var channels []*Channel
+ 	if err := DB.Where("id IN ?", channelIds).Find(&channels).Error; err != nil {
++		for _, filter := range filters {
++			if filter.Kind == dto.FilterExcludeChannels {
++				return nil
++			}
++		}
+ 		if identityFilterRequiresKey(filters) {
+ 			return nil
+ 		}
+diff --git a/model/channel_constraint.go b/model/channel_constraint.go
+index 2168b34d9..d7d6ac75a 100644
+--- a/model/channel_constraint.go
++++ b/model/channel_constraint.go
+@@ -8,13 +8,14 @@ import (
+ )
+ 
+ var filterEvalOrder = []dto.ChannelFilterKind{
++	dto.FilterExcludeChannels,
+ 	dto.FilterRequestPath,
+ 	dto.FilterTaskPluginIdentity,
+ }
+ 
+ // ChannelSatisfiesFilters reports whether ch passes every filter.
+-// On false, it returns the kind of the first violated filter (request_path
+-// then task_plugin_identity) for error attribution.
++// On false, it returns the kind of the first violated filter (excluded channels,
++// request_path, then task_plugin_identity) for error attribution.
+ func ChannelSatisfiesFilters(ch *Channel, modelName string, filters []dto.ChannelFilter) (bool, dto.ChannelFilterKind) {
+ 	if ch == nil {
+ 		return false, ""
+@@ -88,6 +89,8 @@ func candidatePassesKindFilters(ch *Channel, exists bool, modelName string, kind
+ 
+ func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilter) bool {
+ 	switch filter.Kind {
++	case dto.FilterExcludeChannels:
++		return !slices.Contains(filter.ExcludedChannelIDs, ch.Id)
+ 	case dto.FilterRequestPath:
+ 		if filter.RequestPath == "" {
+ 			return true
+diff --git a/relay/channel/api_request.go b/relay/channel/api_request.go
+index e30dd0ce9..7ef95088b 100644
+--- a/relay/channel/api_request.go
++++ b/relay/channel/api_request.go
+@@ -511,7 +511,9 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
+ 
+ 	var stopPinger context.CancelFunc
+ 	var pingerDone <-chan struct{}
+-	if info.IsStream {
++	// Responses decides whether a failed stream can be retried before sending
++	// headers or pings. Its response scanner owns the first downstream write.
++	if info.IsStream && info.RelayMode != constant.RelayModeResponses {
+ 		helper.SetEventStreamHeaders(c)
+ 		// 处理流式请求的 ping 保活
+ 		generalSettings := operation_setting.GetGeneralSetting()
+diff --git a/relay/channel/openai/relay_responses.go b/relay/channel/openai/relay_responses.go
+index 93b2599de..637701ef0 100644
+--- a/relay/channel/openai/relay_responses.go
++++ b/relay/channel/openai/relay_responses.go
+@@ -7,6 +7,7 @@ import (
+ 	"strings"
+ 
+ 	"github.com/QuantumNous/new-api/common"
++	"github.com/QuantumNous/new-api/constant"
+ 	"github.com/QuantumNous/new-api/logger"
+ 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+ 	"github.com/QuantumNous/new-api/relay/helper"
+@@ -76,24 +77,96 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
+ 	var responseTextBuilder strings.Builder
+ 	imageCounter := &relaycommon.ImageGenerationCallCounter{}
+ 	imageCommitted := false
++	var streamErr *types.NewAPIError
++	var prelude []dto.ResponsesStreamResponse
++	var preludeData []string
++	preludeBytes := 0
++	terminalSeen := false
++	firstOutputEvent := ""
++	firstOutputBytes := 0
++	info.ResponsesStreamError = nil
++	info.ResponsesCapacityFailure = false
++	common.SetContextKey(c, constant.ContextKeyResponsesStreamFailed, false)
++	info.ReceivedResponseCount = 0
+ 
+ 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
+ 
+ 		// 检查当前数据是否包含 completed 状态和 usage 信息
+ 		var streamResponse dto.ResponsesStreamResponse
+ 		if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
+-			logger.LogError(c, "failed to unmarshal stream response: "+err.Error())
+-			sr.Error(err)
++			streamErr = types.NewErrorWithStatusCode(err, types.ErrorCodeBadResponseBody, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
++			sr.Stop(streamErr)
++			return
++		}
++		// Preserve cumulative usage even when the terminal failure omits it.
++		if streamResponse.Response != nil && streamResponse.Response.Usage != nil {
++			usage = dto.MergeUsageNonZero(usage, relayconvert.NormalizeResponsesUsage(streamResponse.Response.Usage))
++		}
++		failure, capacityFailure := responsesStreamFailure(streamResponse)
++		if failure != nil {
++			terminalSeen = true
++			streamErr = failure
++			info.ResponsesCapacityFailure = capacityFailure
++			// A billed response may have executed upstream work, even if no delta
++			// reached us. Commit it and preserve its usage instead of replaying it.
++			hasWork := responsesFailureHasWork(data)
++			if c.Writer.Written() || usage.TotalTokens > 0 || hasWork {
++				if !c.Writer.Written() {
++					helper.StartEventStream(c, resp)
++					for i, event := range prelude {
++						if err := helper.ResponseChunkData(c, event, preludeData[i]); err != nil {
++							sr.Stop(err)
++							return
++						}
++					}
++				}
++				_ = helper.ResponseChunkData(c, streamResponse, data)
++			}
++			sr.Stop(streamErr)
++			return
++		}
++
++		// Provider keepalives carry no generated work. Drop them before output
++		// instead of committing SSE or spending the bounded lifecycle buffer.
++		// The scanner's absolute prelude deadline still bounds the wait.
++		if !c.Writer.Written() && responsesKeepaliveEvent(streamResponse.Type, data) {
++			return
++		}
++
++		// Empty message/reasoning item and text-part placeholders are also
++		// initialization. Text, encrypted reasoning, tool and unknown events
++		// commit immediately; only explicitly empty placeholders can be withheld.
++		// Codex lifecycle events echo instructions and other large metadata;
++		// created + in_progress can exceed 64 KiB before producing any output.
++		if !c.Writer.Written() && responsesPreludeEvent(streamResponse.Type, data) && len(prelude) < 16 && preludeBytes+len(data) <= 2<<20 {
++			prelude = append(prelude, streamResponse)
++			preludeData = append(preludeData, data)
++			preludeBytes += len(data)
++			return
++		}
++		if !c.Writer.Written() {
++			firstOutputEvent = streamResponse.Type
++			firstOutputBytes = len(data)
++			helper.StartEventStream(c, resp)
++			for i, event := range prelude {
++				if err := helper.ResponseChunkData(c, event, preludeData[i]); err != nil {
++					streamErr = types.NewErrorWithStatusCode(err, types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
++					sr.Stop(streamErr)
++					return
++				}
++			}
++			prelude = nil
++			preludeData = nil
++		}
++		if err := helper.ResponseChunkData(c, streamResponse, data); err != nil {
++			streamErr = types.NewErrorWithStatusCode(err, types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
++			sr.Stop(streamErr)
+ 			return
+ 		}
+-		sendResponsesStreamData(c, streamResponse, data)
+ 		switch streamResponse.Type {
+ 		case "response.completed", "response.done":
++			terminalSeen = true
+ 			if streamResponse.Response != nil {
+-				if streamResponse.Response.Usage != nil {
+-					incomingUsage := relayconvert.NormalizeResponsesUsage(streamResponse.Response.Usage)
+-					usage = dto.MergeUsageNonZero(usage, incomingUsage)
+-				}
+ 				if !imageCommitted {
+ 					if relaycommon.IsNonBillableResponsesStatus(streamResponse.Response.Status) {
+ 						imageCounter.Reset()
+@@ -113,6 +186,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
+ 				imageCommitted = true
+ 			}
+ 		case "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
++			terminalSeen = true
+ 			if !imageCommitted {
+ 				imageCounter.Reset()
+ 				imageCounter.Commit(info)
+@@ -137,7 +211,26 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
+ 				}
+ 			}
+ 		}
+-	})
++	}, helper.StreamScannerOptions{DeferHeaders: true})
++
++	if streamErr == nil && !terminalSeen {
++		message := "response stream ended before completion"
++		statusCode := http.StatusBadGateway
++		if info.StreamStatus.EndReason == relaycommon.StreamEndReasonTimeout {
++			message = "response stream timed out before completion"
++			statusCode = http.StatusGatewayTimeout
++		}
++		streamErr = types.NewErrorWithStatusCode(fmt.Errorf("%s", message), types.ErrorCodeBadResponse, statusCode, types.ErrOptionWithSkipRetry())
++	}
++	if streamErr != nil {
++		logger.LogWarn(c, fmt.Sprintf("Responses stream failure: committed=%t first_output_event=%q first_output_bytes=%d prelude_bytes=%d capacity=%t", c.Writer.Written(), firstOutputEvent, firstOutputBytes, preludeBytes, info.ResponsesCapacityFailure))
++		info.StreamStatus.SetUpstreamError(streamErr)
++		info.ResponsesStreamError = streamErr
++		common.SetContextKey(c, constant.ContextKeyResponsesStreamFailed, true)
++		if c.Writer.Written() || c.Request.Context().Err() != nil {
++			types.ErrOptionWithSkipRetry()(streamErr)
++		}
++	}
+ 
+ 	if usage.CompletionTokens == 0 {
+ 		// 计算输出文本的 token 数量
+@@ -158,5 +251,206 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
+ 		usage.BillingUsage = dto.CloneBillingUsageWithEstimatedCompletion(usage.BillingUsage, usage.CompletionTokens)
+ 	}
+ 
+-	return usage, nil
++	return usage, streamErr
++}
++
++func responsesKeepaliveEvent(eventType, data string) bool {
++	if eventType != "keepalive" {
++		return false
++	}
++	var event map[string]any
++	if common.UnmarshalJsonStr(data, &event) != nil {
++		return false
++	}
++	for key, value := range event {
++		switch key {
++		case "type":
++		case "sequence_number", "timestamp":
++			if number, ok := value.(float64); !ok || number < 0 {
++				return false
++			}
++		default:
++			// Do not hide usage, content or unknown provider extensions.
++			return false
++		}
++	}
++	return true
++}
++
++func responsesPreludeEvent(eventType, data string) bool {
++	switch eventType {
++	case "response.created", "response.in_progress", "response.queued", "response.output_item.added", "response.content_part.added", "response.reasoning_summary_part.added":
++	default:
++		return false
++	}
++	var event map[string]any
++	if common.UnmarshalJsonStr(data, &event) != nil {
++		return false
++	}
++	switch eventType {
++	case "response.output_item.added":
++		return responsesEmptyOutputItem(event["item"])
++	case "response.content_part.added", "response.reasoning_summary_part.added":
++		return responsesEmptyTextPart(event["part"])
++	default:
++		if event["response"] == nil {
++			return true
++		}
++		response, ok := event["response"].(map[string]any)
++		return ok && responsesZeroValue(response["usage"]) && responsesEmptyOutput(response["output"])
++	}
++}
++
++func responsesFailureHasWork(data string) bool {
++	var raw map[string]any
++	if common.UnmarshalJsonStr(data, &raw) != nil {
++		return true
++	}
++	if raw["response"] == nil {
++		return false
++	}
++	response, ok := raw["response"].(map[string]any)
++	// A provider may report detail-only usage or new billable fields that the
++	// shared DTO does not retain. Only an explicitly empty usage is replayable.
++	return !ok || !responsesZeroValue(response["usage"]) || !responsesEmptyOutput(response["output"])
++}
++
++func responsesEmptyOutput(value any) bool {
++	if value == nil {
++		return true
++	}
++	items, ok := value.([]any)
++	if !ok {
++		return false
++	}
++	for _, item := range items {
++		if !responsesEmptyOutputItem(item) {
++			return false
++		}
++	}
++	return true
++}
++
++// Inspect raw fields: the shared DTO does not retain encrypted_content and
++// future item extensions. Unknown populated fields must prevent replay.
++func responsesEmptyOutputItem(value any) bool {
++	item, ok := value.(map[string]any)
++	if !ok || (item["type"] != "message" && item["type"] != "reasoning") {
++		return false
++	}
++	for key, value := range item {
++		switch key {
++		case "id", "type", "role", "phase":
++		case "status":
++			if value != nil && value != "" && value != "in_progress" {
++				return false
++			}
++		case "content", "summary":
++			if value == nil {
++				continue
++			}
++			parts, ok := value.([]any)
++			if !ok {
++				return false
++			}
++			for _, part := range parts {
++				if !responsesEmptyTextPart(part) {
++					return false
++				}
++			}
++		case "encrypted_content":
++			if value != nil && value != "" {
++				return false
++			}
++		default:
++			if value != nil {
++				return false
++			}
++		}
++	}
++	return true
++}
++
++func responsesEmptyTextPart(value any) bool {
++	part, ok := value.(map[string]any)
++	if !ok || (part["type"] != "output_text" && part["type"] != "summary_text" && part["type"] != "reasoning_text") {
++		return false
++	}
++	for key, value := range part {
++		switch key {
++		case "type":
++		case "text":
++			if value != nil && value != "" {
++				return false
++			}
++		case "annotations", "logprobs":
++			if value != nil {
++				values, ok := value.([]any)
++				if !ok || len(values) > 0 {
++					return false
++				}
++			}
++		default:
++			if value != nil {
++				return false
++			}
++		}
++	}
++	return true
++}
++
++func responsesZeroValue(value any) bool {
++	switch value := value.(type) {
++	case nil:
++		return true
++	case float64:
++		return value == 0
++	case map[string]any:
++		for _, field := range value {
++			if !responsesZeroValue(field) {
++				return false
++			}
++		}
++		return true
++	default:
++		return false
++	}
++}
++
++// responsesStreamFailure classifies protocol failures, independently of the
++// successful HTTP handshake. Only explicit transient capacity errors can replay.
++func responsesStreamFailure(event dto.ResponsesStreamResponse) (*types.NewAPIError, bool) {
++	var upstreamError *types.OpenAIError
++	if event.Response != nil {
++		upstreamError = event.Response.GetOpenAIError()
++	}
++	if upstreamError == nil {
++		upstreamError = dto.GetOpenAIError(event.Error)
++	}
++	responseStatus := ""
++	if event.Response != nil && len(event.Response.Status) > 0 {
++		_ = common.Unmarshal(event.Response.Status, &responseStatus)
++	}
++	failed := event.Type == "response.failed" || event.Type == "response.error" || event.Type == "error" || responseStatus == "failed"
++	if upstreamError == nil && !failed {
++		return nil, false
++	}
++	if upstreamError == nil {
++		upstreamError = &types.OpenAIError{Code: event.Code, Message: event.Message, Param: event.Param}
++	}
++	if upstreamError.Message == "" {
++		upstreamError.Message = "upstream response failed"
++	}
++	code := strings.ToLower(fmt.Sprint(upstreamError.Code))
++	capacity := code == "model_at_capacity" || code == "server_is_overloaded" || code == "server_overloaded" || code == "slow_down" || code == "overloaded_error" || code == "rate_limit_exceeded"
++	// Some compatible providers omit error.code. Do not override a specific
++	// request/auth/policy error based on its message.
++	if code == "" || code == "<nil>" {
++		message := strings.ToLower(upstreamError.Message)
++		capacity = strings.Contains(message, "selected model is at capacity") || strings.Contains(message, "our servers are currently overloaded")
++	}
++	if capacity {
++		return types.WithOpenAIError(*upstreamError, http.StatusServiceUnavailable), true
++	}
++	return types.WithOpenAIError(*upstreamError, http.StatusBadGateway, types.ErrOptionWithSkipRetry()), false
+ }
+diff --git a/relay/common/relay_info.go b/relay/common/relay_info.go
+index cc8bce53c..453b0528f 100644
+--- a/relay/common/relay_info.go
++++ b/relay/common/relay_info.go
+@@ -192,6 +192,9 @@ type RelayInfo struct {
+ 	FinalRequestRelayFormat types.RelayFormat
+ 
+ 	StreamStatus *StreamStatus
++	// Distinguishes a protocol failure from a successful HTTP 200 for affinity.
++	ResponsesStreamError     *types.NewAPIError
++	ResponsesCapacityFailure bool
+ 
+ 	// convOptions caches the converter settings snapshot (see ConvOptions).
+ 	convOptions *convmeta.Options
+diff --git a/relay/common/stream_status.go b/relay/common/stream_status.go
+index 4734b2640..f10cd901d 100644
+--- a/relay/common/stream_status.go
++++ b/relay/common/stream_status.go
+@@ -10,15 +10,16 @@ import (
+ type StreamEndReason string
+ 
+ const (
+-	StreamEndReasonNone        StreamEndReason = ""
+-	StreamEndReasonDone        StreamEndReason = "done"
+-	StreamEndReasonTimeout     StreamEndReason = "timeout"
+-	StreamEndReasonClientGone  StreamEndReason = "client_gone"
+-	StreamEndReasonScannerErr  StreamEndReason = "scanner_error"
+-	StreamEndReasonHandlerStop StreamEndReason = "handler_stop"
+-	StreamEndReasonEOF         StreamEndReason = "eof"
+-	StreamEndReasonPanic       StreamEndReason = "panic"
+-	StreamEndReasonPingFail    StreamEndReason = "ping_fail"
++	StreamEndReasonNone          StreamEndReason = ""
++	StreamEndReasonDone          StreamEndReason = "done"
++	StreamEndReasonTimeout       StreamEndReason = "timeout"
++	StreamEndReasonClientGone    StreamEndReason = "client_gone"
++	StreamEndReasonScannerErr    StreamEndReason = "scanner_error"
++	StreamEndReasonHandlerStop   StreamEndReason = "handler_stop"
++	StreamEndReasonEOF           StreamEndReason = "eof"
++	StreamEndReasonPanic         StreamEndReason = "panic"
++	StreamEndReasonPingFail      StreamEndReason = "ping_fail"
++	StreamEndReasonUpstreamError StreamEndReason = "upstream_error"
+ )
+ 
+ const maxStreamErrorEntries = 20
+@@ -67,6 +68,21 @@ func (s *StreamStatus) RecordError(msg string) {
+ 	}
+ }
+ 
++// SetUpstreamError is called after the scanner has joined its workers. A
++// protocol failure takes precedence over the transport EOF that followed it.
++func (s *StreamStatus) SetUpstreamError(err error) {
++	if s == nil || err == nil {
++		return
++	}
++	if s.IsNormalEnd() || s.EndReason == StreamEndReasonNone {
++		s.EndReason = StreamEndReasonUpstreamError
++		s.EndError = err
++	}
++	if !s.HasErrors() {
++		s.RecordError(err.Error())
++	}
++}
++
+ func (s *StreamStatus) HasErrors() bool {
+ 	if s == nil {
+ 		return false
+diff --git a/relay/helper/stream_scanner.go b/relay/helper/stream_scanner.go
+index e620469ae..bf66a0982 100644
+--- a/relay/helper/stream_scanner.go
++++ b/relay/helper/stream_scanner.go
+@@ -80,7 +80,17 @@ func ExtendWriteDeadline(c *gin.Context) {
+ 	_ = http.NewResponseController(c.Writer).SetWriteDeadline(time.Now().Add(streamWriteTimeout))
+ }
+ 
+-func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, dataHandler func(data string, sr *StreamResult)) {
++type StreamScannerOptions struct {
++	// Responses may inspect an initial failure before committing HTTP 200.
++	DeferHeaders bool
++}
++
++func StartEventStream(c *gin.Context, resp *http.Response) {
++	copyCodexSSEHeaders(c, resp)
++	SetEventStreamHeaders(c)
++}
++
++func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, dataHandler func(data string, sr *StreamResult), options ...StreamScannerOptions) {
+ 
+ 	if resp == nil || dataHandler == nil {
+ 		return
+@@ -88,6 +98,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
+ 
+ 	// 无条件新建 StreamStatus
+ 	info.StreamStatus = relaycommon.NewStreamStatus()
++	deferHeaders := len(options) > 0 && options[0].DeferHeaders
+ 
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 
+@@ -147,8 +158,16 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
+ 	defer cleanup()
+ 
+ 	scanner.Split(bufio.ScanLines)
+-	copyCodexSSEHeaders(c, resp)
+-	SetEventStreamHeaders(c)
++	if !deferHeaders {
++		StartEventStream(c, resp)
++	}
++	// Repeated lifecycle events must not keep an uncommitted response alive forever.
++	var preludeDeadline <-chan time.Time
++	if deferHeaders {
++		preludeTimer := time.NewTimer(streamingTimeout)
++		defer preludeTimer.Stop()
++		preludeDeadline = preludeTimer.C
++	}
+ 
+ 	ctx = context.WithValue(ctx, "stop_chan", stopChan)
+ 
+@@ -178,6 +197,9 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
+ 					func() {
+ 						writeMutex.Lock()
+ 						defer writeMutex.Unlock()
++						if deferHeaders && !c.Writer.Written() {
++							return
++						}
+ 						ExtendWriteDeadline(c)
+ 						err = PingData(c)
+ 					}()
+@@ -296,15 +318,30 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
+ 	})
+ 
+ 	// 主循环等待完成或超时
+-	select {
+-	case <-ticker.C:
+-		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, nil)
+-	case <-stopChan:
+-		// EndReason already set by the goroutine that triggered stopChan
+-	case <-c.Request.Context().Done():
+-		// 客户端断开：立即 cleanup 关闭上游 resp.Body，解除 scanner 阻塞并让上游停止生成，
+-		// 避免为已放弃的请求继续消费上游 token。
+-		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Request.Context().Err())
++waitForStream:
++	for {
++		select {
++		case <-ticker.C:
++			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, nil)
++			break waitForStream
++		case <-preludeDeadline:
++			preludeDeadline = nil
++			writeMutex.Lock()
++			committed := c.Writer.Written()
++			writeMutex.Unlock()
++			if !committed {
++				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, nil)
++				break waitForStream
++			}
++		case <-stopChan:
++			// EndReason already set by the goroutine that triggered stopChan
++			break waitForStream
++		case <-c.Request.Context().Done():
++			// 客户端断开：立即 cleanup 关闭上游 resp.Body，解除 scanner 阻塞并让上游停止生成，
++			// 避免为已放弃的请求继续消费上游 token。
++			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Request.Context().Err())
++			break waitForStream
++		}
+ 	}
+ 
+ 	cleanup()
+diff --git a/relay/responses_handler.go b/relay/responses_handler.go
+index 698f6eef6..1c0b8d7cb 100644
+--- a/relay/responses_handler.go
++++ b/relay/responses_handler.go
+@@ -20,6 +20,8 @@ import (
+ )
+ 
+ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.NewAPIError) {
++	info.ResponsesStreamError = nil
++	info.ResponsesCapacityFailure = false
+ 	info.InitChannelMeta(c)
+ 	if info.RelayMode == relayconstant.RelayModeResponsesCompact &&
+ 		!common.SupportsResponsesCompact(info.ChannelType, info.ApiType) {
+@@ -142,6 +144,13 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
+ 
+ 	usage, newAPIError := adaptor.DoResponse(c, httpResp, info)
+ 	if newAPIError != nil {
++		// A partial/billed response is never replayed. Preserve real or existing
++		// estimated usage and let the billing session settle once before returning.
++		// Upstream usage remains billable if the client disconnects before the
++		// first write. PostTextConsumeQuota ignores unbilled failed streams.
++		if usageDto, ok := usage.(*dto.Usage); ok && usageDto != nil {
++			service.PostTextConsumeQuota(c, info, usageDto, nil)
++		}
+ 		// reset status code 重置状态码
+ 		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
+ 		return newAPIError
+diff --git a/relaykit/dto/openai_response.go b/relaykit/dto/openai_response.go
+index f50724124..93be6d8fa 100644
+--- a/relaykit/dto/openai_response.go
++++ b/relaykit/dto/openai_response.go
+@@ -549,6 +549,7 @@ const (
+ type ResponsesStreamResponse struct {
+ 	Type            string                   `json:"type"`
+ 	Response        *OpenAIResponsesResponse `json:"response,omitempty"`
++	Error           any                      `json:"error,omitempty"`
+ 	Code            string                   `json:"code,omitempty"`
+ 	Message         string                   `json:"message,omitempty"`
+ 	Param           string                   `json:"param,omitempty"`
+diff --git a/service/channel_select.go b/service/channel_select.go
+index 62cf916b0..2a2ef5cda 100644
+--- a/service/channel_select.go
++++ b/service/channel_select.go
+@@ -2,6 +2,7 @@ package service
+ 
+ import (
+ 	"errors"
++	"strconv"
+ 
+ 	"github.com/QuantumNous/new-api/common"
+ 	"github.com/QuantumNous/new-api/constant"
+@@ -137,6 +138,20 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string,
+ 	selectGroup := param.TokenGroup
+ 	userGroup := common.GetContextKeyString(param.Ctx, constant.ContextKeyUserGroup)
+ 	filters := GetChannelConstraints(param.Ctx).Filters
++	capacityRetry := common.GetContextKeyBool(param.Ctx, constant.ContextKeyResponsesCapacityRetried)
++	selectionRetry := param.GetRetry()
++	if capacityRetry {
++		var excluded []int
++		for _, value := range param.Ctx.GetStringSlice("use_channel") {
++			if id, err := strconv.Atoi(value); err == nil {
++				excluded = append(excluded, id)
++			}
++		}
++		filters = append(append([]dto.ChannelFilter(nil), filters...), dto.ChannelFilter{Kind: dto.FilterExcludeChannels, ExcludedChannelIDs: excluded})
++		// Exclusion already advances the candidate set. Incrementing its priority
++		// index as well would skip the next available tier.
++		selectionRetry = 0
++	}
+ 
+ 	if param.TokenGroup == "auto" {
+ 		autoGroups := GetRequestAutoGroups(param.Ctx, userGroup)
+@@ -159,7 +174,7 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string,
+ 			autoGroup := autoGroups[i]
+ 			// Calculate priorityRetry for current group
+ 			// 计算当前分组的 priorityRetry
+-			priorityRetry := param.GetRetry()
++			priorityRetry := selectionRetry
+ 			// If moved to a new group, reset priorityRetry and update startRetryIndex
+ 			// 如果切换到新分组，重置 priorityRetry 并更新 startRetryIndex
+ 			if i > startGroupIndex {
+@@ -213,7 +228,7 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string,
+ 		channel, err = model.GetRandomSatisfiedChannel(
+ 			param.TokenGroup,
+ 			param.ModelName,
+-			param.GetRetry(),
++			selectionRetry,
+ 			filters,
+ 		)
+ 		if err != nil {
+diff --git a/service/log_info_generate.go b/service/log_info_generate.go
+index bf2e58d07..4387e226e 100644
+--- a/service/log_info_generate.go
++++ b/service/log_info_generate.go
+@@ -73,6 +73,10 @@ func AppendRelayLogAdminInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo,
+ 	}
+ 	other.SetAdmin("use_channel", ctx.GetStringSlice("use_channel"))
+ 	if relayInfo != nil {
++		if relayInfo.ResponsesStreamError != nil {
++			other.SetAdmin("upstream_http_status", 200)
++			appendStreamStatus(relayInfo, other)
++		}
+ 		if billingModel := relayInfo.GetBillingModelName(); billingModel != "" && billingModel != relayInfo.OriginModelName {
+ 			other.SetAdmin("billing_model", billingModel)
+ 		}
+diff --git a/service/text_quota.go b/service/text_quota.go
+index 543ebb000..b445ad1a4 100644
+--- a/service/text_quota.go
++++ b/service/text_quota.go
+@@ -398,13 +398,17 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
+ 	if usage == nil {
+ 		extraContent = append(extraContent, "上游无计费信息")
+ 	}
++	adminRejectReason := common.GetContextKeyString(ctx, constant.ContextKeyAdminRejectReason)
++	summary := calculateTextQuotaSummary(ctx, relayInfo, billingUsage)
++	if common.GetContextKeyBool(ctx, constant.ContextKeyResponsesStreamFailed) && !summary.hasBillableUsage() {
++		// The relay records the failure and refunds the precharge. Do not also
++		// log an empty consumption; real token or tool usage still settles below.
++		return
++	}
+ 	if originUsage != nil {
+ 		ObserveChannelAffinityUsageCacheByRelayFormat(ctx, billingUsage, relayInfo.GetFinalRequestRelayFormat())
+ 	}
+ 
+-	adminRejectReason := common.GetContextKeyString(ctx, constant.ContextKeyAdminRejectReason)
+-	summary := calculateTextQuotaSummary(ctx, relayInfo, billingUsage)
+-
+ 	var tieredResult *billingexpr.TieredResult
+ 	var tieredTokens billingexpr.TokenParams
+ 	tieredBillingApplied := false

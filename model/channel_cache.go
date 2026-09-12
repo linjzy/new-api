@@ -307,3 +307,50 @@ func CacheUpdateChannel(channel *Channel) {
 	channelSyncLock.Unlock()
 	InvalidatePricingCache()
 }
+
+// cacheRecoveredChannelKey publishes a committed recovery while the caller owns
+// the channel's polling lock. It preserves the live cursor and restores routing
+// membership without reloading every channel and ability from the database.
+func cacheRecoveredChannelKey(channel *Channel) {
+	if !common.MemoryCacheEnabled {
+		return
+	}
+	channelSyncLock.Lock()
+	defer channelSyncLock.Unlock()
+	if channelsIDM == nil {
+		channelsIDM = make(map[int]*Channel)
+	}
+	if previous := channelsIDM[channel.Id]; previous != nil &&
+		previous.ChannelInfo.MultiKeyMode == constant.MultiKeyModePolling &&
+		channel.ChannelInfo.MultiKeyMode == constant.MultiKeyModePolling {
+		channel.ChannelInfo.MultiKeyPollingIndex = previous.ChannelInfo.MultiKeyPollingIndex
+	}
+	channel.Keys = channel.GetKeys()
+	channelsIDM[channel.Id] = channel
+	if group2model2channels == nil {
+		group2model2channels = make(map[string]map[string][]int)
+	}
+	for _, group := range strings.Split(channel.Group, ",") {
+		if group2model2channels[group] == nil {
+			group2model2channels[group] = make(map[string][]int)
+		}
+		for _, model := range channel.GetModels() {
+			ids := group2model2channels[group][model]
+			present := false
+			for _, id := range ids {
+				if id == channel.Id {
+					present = true
+					break
+				}
+			}
+			if present {
+				continue
+			}
+			ids = append(ids, channel.Id)
+			sort.SliceStable(ids, func(i, j int) bool {
+				return channelsIDM[ids[i]].GetPriority() > channelsIDM[ids[j]].GetPriority()
+			})
+			group2model2channels[group][model] = ids
+		}
+	}
+}
