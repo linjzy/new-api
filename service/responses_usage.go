@@ -110,6 +110,15 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 	return a.usage
 }
 
+// Usage exposes the accounting facts observed so far. Callers read it before
+// Finish to decide whether an upstream failure already produced billable work.
+func (a *ResponsesUsageAccumulator) Usage() *dto.Usage {
+	if a == nil || a.usage == nil {
+		return &dto.Usage{}
+	}
+	return a.usage
+}
+
 // ObserveResponsesOutcome records the protocol outcome of one Responses event
 // on the stream status for health classification. Only codes and types are
 // kept; messages never leave the event.

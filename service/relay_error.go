@@ -62,15 +62,35 @@ func ShouldRetryRelayError(c *gin.Context, openaiErr *types.NewAPIError, retryTi
 }
 
 func ProcessChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError, relayInfo *relaycommon.RelayInfo) {
+	ProcessChannelErrorForChannel(c, channelError, err, nil, relayInfo)
+}
+
+// ProcessChannelErrorForChannel is ProcessChannelError with the selected
+// channel in hand. Sequential multi-key fallback retires the failing key
+// synchronously and reports whether a key was retired, so the caller can pin
+// the next attempt to the same channel.
+func ProcessChannelErrorForChannel(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError, channel *model.Channel, relayInfo *relaycommon.RelayInfo) bool {
 	if err == nil {
-		return
+		return false
 	}
 	logger.LogError(c, fmt.Sprintf("channel error (channel #%d, status code: %d): %s", channelError.ChannelId, err.StatusCode, common.LocalLogPreview(err.MaskSensitiveErrorWithStatusCode())))
-	if ShouldDisableChannel(err) && channelError.AutoBan {
+	if channel != nil {
+		channelError.IsMultiKey = channel.ChannelInfo.IsMultiKey
+	}
+	sequentialKeyDisabled := false
+	if ShouldDisableChannelForChannel(channel, err) && channelError.AutoBan {
 		reason := err.MaskSensitiveErrorWithStatusCode()
-		gopool.Go(func() {
-			DisableChannel(channelError, reason)
-		})
+		if SequentialKeyAutoSkip(channel) {
+			sequentialKeyDisabled = DisableSequentialKey(
+				channelError,
+				common.GetContextKeyInt(c, constant.ContextKeyChannelMultiKeyIndex),
+				reason,
+			)
+		} else {
+			gopool.Go(func() {
+				DisableChannel(channelError, reason)
+			})
+		}
 	}
 
 	if constant.ErrorLogEnabled && types.IsRecordErrorLog(err) {
@@ -96,4 +116,5 @@ func ProcessChannelError(c *gin.Context, channelError types.ChannelError, err *t
 		useTimeSeconds := int(time.Since(startTime).Seconds())
 		model.RecordErrorLog(c, userId, channelError.ChannelId, modelName, tokenName, err.MaskSensitiveErrorWithStatusCode(), tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other)
 	}
+	return sequentialKeyDisabled
 }

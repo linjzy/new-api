@@ -8,14 +8,16 @@ import (
 )
 
 var filterEvalOrder = []dto.ChannelFilterKind{
+	dto.FilterExcludeChannels,
 	dto.FilterRequestPath,
 	dto.FilterTaskPluginIdentity,
 	dto.FilterResponsesWebSocket,
 }
 
 // ChannelSatisfiesFilters reports whether ch passes every filter.
-// On false, it returns the kind of the first violated filter (request_path
-// then task_plugin_identity) for error attribution.
+// On false, it returns the kind of the first violated filter (excluded channels,
+// request_path, task_plugin_identity, then responses_websocket) for error
+// attribution.
 func ChannelSatisfiesFilters(ch *Channel, modelName string, filters []dto.ChannelFilter) (bool, dto.ChannelFilterKind) {
 	if ch == nil {
 		return false, ""
@@ -89,6 +91,8 @@ func candidatePassesKindFilters(ch *Channel, exists bool, modelName string, kind
 
 func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilter) bool {
 	switch filter.Kind {
+	case dto.FilterExcludeChannels:
+		return !slices.Contains(filter.ExcludedChannelIDs, ch.Id)
 	case dto.FilterRequestPath:
 		if filter.RequestPath == "" {
 			return true

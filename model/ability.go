@@ -165,7 +165,8 @@ func GetChannel(
 
 // filterAbilitiesByConstraints applies the same ChannelSatisfiesFilters
 // predicate used by the memory-cache path. A failed channel lookup fails
-// closed when a task-plugin identity is required and fails open otherwise.
+// closed when channel exclusion or a task-plugin identity is required, and
+// fails open otherwise.
 func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters []dto.ChannelFilter) []Ability {
 	if len(abilities) == 0 {
 		return nil
@@ -183,6 +184,11 @@ func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters
 
 	var channels []*Channel
 	if err := DB.Where("id IN ?", channelIds).Find(&channels).Error; err != nil {
+		for _, filter := range filters {
+			if filter.Kind == dto.FilterExcludeChannels {
+				return nil
+			}
+		}
 		if identityFilterRequiresKey(filters) {
 			return nil
 		}
