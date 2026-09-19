@@ -69,7 +69,11 @@ func resolveChannelTestUserID(c *gin.Context) (int, error) {
 	return rootUser.Id, nil
 }
 
-func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool) testResult {
+func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool, keyIndexes ...*int) testResult {
+	var keyIndex *int
+	if len(keyIndexes) > 0 {
+		keyIndex = keyIndexes[0]
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -168,7 +172,12 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	group, _ := model.GetUserGroup(testUserID, false)
 	c.Set("group", group)
 
-	newAPIError := middleware.SetupContextForSelectedChannel(c, channel, testModel)
+	var newAPIError *types.NewAPIError
+	if keyIndex == nil {
+		newAPIError = middleware.SetupContextForSelectedChannel(c, channel, testModel)
+	} else {
+		newAPIError = middleware.SetupContextForAutoDisabledChannelTestKey(c, channel, testModel, *keyIndex)
+	}
 	if newAPIError != nil {
 		return testResult{
 			context:     c,
@@ -874,7 +883,7 @@ func TestChannel(c *gin.Context) {
 	if c.Request != nil {
 		requestCtx = c.Request.Context()
 	}
-	result := testChannel(requestCtx, channel, testUserID, testModel, endpointType, isStream)
+	result := testChannel(requestCtx, channel, testUserID, testModel, endpointType, isStream, nil)
 	if result.localErr != nil {
 		resp := gin.H{
 			"success": false,
@@ -917,11 +926,58 @@ type channelTestSummary struct {
 	Enabled   int `json:"enabled"`
 }
 
-func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, testUserID int, allowDisable bool, disableThreshold int64) channelTestSummary {
+type channelKeyTestFunc func(context.Context, *model.Channel, int) testResult
+
+func testAutoDisabledChannelKeys(ctx context.Context, channel *model.Channel, testKey channelKeyTestFunc) channelTestSummary {
 	summary := channelTestSummary{}
+	if !common.AutomaticEnableChannelEnabled || channel == nil || channel.Status == common.ChannelStatusManuallyDisabled {
+		return summary
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	keys := channel.GetKeys()
+	for _, keyIndex := range channel.AutoDisabledKeyIndexes() {
+		if ctx.Err() != nil {
+			return summary
+		}
+		expectedKey := keys[keyIndex]
+		expectedDisabledTime := channel.ChannelInfo.MultiKeyDisabledTime[keyIndex]
+		result := testKey(ctx, channel, keyIndex)
+		if ctx.Err() != nil {
+			return summary
+		}
+
+		summary.Tested++
+		if result.localErr != nil || result.newAPIError != nil {
+			summary.Failed++
+			continue
+		}
+
+		summary.Succeeded++
+		if model.EnableAutoDisabledChannelKey(channel.Id, keyIndex, expectedKey, expectedDisabledTime) {
+			summary.Enabled++
+		}
+	}
+	return summary
+}
+
+func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, testUserID int, allowDisable bool, disableThreshold int64, recoveryModes ...bool) channelTestSummary {
+	recoveryOnly := len(recoveryModes) > 0 && recoveryModes[0]
+	summary := channelTestSummary{}
+	hasAutoDisabledKeys := len(channel.AutoDisabledKeyIndexes()) > 0
+	testKey := func(ctx context.Context, channel *model.Channel, keyIndex int) testResult {
+		return testChannel(ctx, channel, testUserID, "", "", shouldUseStreamForAutomaticChannelTest(channel), &keyIndex)
+	}
+	if common.AutomaticEnableChannelEnabled && hasAutoDisabledKeys &&
+		(recoveryOnly || channel.Status == common.ChannelStatusAutoDisabled) {
+		return testAutoDisabledChannelKeys(ctx, channel, testKey)
+	}
+
 	isChannelEnabled := channel.Status == common.ChannelStatusEnabled
 	tik := time.Now()
-	result := testChannel(ctx, channel, testUserID, "", "", shouldUseStreamForAutomaticChannelTest(channel))
+	result := testChannel(ctx, channel, testUserID, "", "", shouldUseStreamForAutomaticChannelTest(channel), nil)
 	milliseconds := time.Since(tik).Milliseconds()
 	if ctx.Err() != nil {
 		return summary
@@ -960,6 +1016,13 @@ func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, test
 	}
 
 	channel.UpdateResponseTime(milliseconds)
+	if common.AutomaticEnableChannelEnabled && hasAutoDisabledKeys {
+		recoverySummary := testAutoDisabledChannelKeys(ctx, channel, testKey)
+		summary.Tested += recoverySummary.Tested
+		summary.Succeeded += recoverySummary.Succeeded
+		summary.Failed += recoverySummary.Failed
+		summary.Enabled += recoverySummary.Enabled
+	}
 	return summary
 }
 
@@ -1059,7 +1122,8 @@ func runChannelTestWorkers(
 // performChannelTests runs channel health checks with the configured bounded
 // concurrency and honors cancellation when a system-task runner loses its
 // lease.
-func performChannelTests(ctx context.Context, channels []*model.Channel, testUserID int, allowDisable bool, concurrency int, report func(processed, total int)) channelTestSummary {
+func performChannelTests(ctx context.Context, channels []*model.Channel, testUserID int, allowDisable bool, concurrency int, report func(processed, total int), recoveryModes ...bool) channelTestSummary {
+	recoveryOnly := len(recoveryModes) > 0 && recoveryModes[0]
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1072,7 +1136,7 @@ func performChannelTests(ctx context.Context, channels []*model.Channel, testUse
 		channels,
 		concurrency,
 		func(ctx context.Context, channel *model.Channel) channelTestSummary {
-			return testChannelForHealthCheck(ctx, channel, testUserID, allowDisable, disableThreshold)
+			return testChannelForHealthCheck(ctx, channel, testUserID, allowDisable, disableThreshold, recoveryOnly)
 		},
 		report,
 	)
@@ -1100,8 +1164,9 @@ func runChannelTestTask(ctx context.Context, mode string, notify bool, report fu
 	}
 	selected := selectChannelsForAutomaticTest(channels, mode)
 	allowDisable := mode != operation_setting.ChannelTestModePassiveRecovery
+	recoveryOnly := mode == operation_setting.ChannelTestModePassiveRecovery
 	concurrency := operation_setting.GetMonitorSetting().ChannelTestConcurrency
-	summary := performChannelTests(ctx, selected, testUserID, allowDisable, concurrency, report)
+	summary := performChannelTests(ctx, selected, testUserID, allowDisable, concurrency, report, recoveryOnly)
 	if notify && (ctx == nil || ctx.Err() == nil) {
 		service.NotifyRootUser(dto.NotifyTypeChannelTest, "通道测试完成", "所有通道测试已完成")
 	}
@@ -1118,7 +1183,9 @@ func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*m
 			continue
 		}
 		if mode == operation_setting.ChannelTestModePassiveRecovery && channel.Status != common.ChannelStatusAutoDisabled {
-			continue
+			if !common.AutomaticEnableChannelEnabled || len(channel.AutoDisabledKeyIndexes()) == 0 {
+				continue
+			}
 		}
 		selected = append(selected, channel)
 	}
