@@ -16,7 +16,7 @@ index f1e158f..f63f964 100644
  
  	// ContextKeyAuditLogged marks that the current request has already recorded
 diff --git a/controller/relay.go b/controller/relay.go
-index b01b4b6..4b26c25 100644
+index cb1729b..455509e 100644
 --- a/controller/relay.go
 +++ b/controller/relay.go
 @@ -90,6 +90,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
@@ -80,7 +80,17 @@ index b01b4b6..4b26c25 100644
  
  		decision := service.DecideRelayRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry())
  		service.RecordPolicyFailure(c, channel.Id, newAPIError, decision)
-@@ -229,13 +251,18 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+@@ -225,11 +247,17 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+ 		)
+ 		sequentialKeyDisabled := processChannelErrorForChannel(c, *channelError, newAPIError, channelForError, relayInfo)
+ 
++		// Both channel failover and same-channel key rotation must stop once
++		// the response is committed or the client has cancelled the request.
++		if c.Writer.Written() || (c.Request != nil && c.Request.Context().Err() != nil) {
++			break
++		}
++
+ 		// A qualifying sequential-key failure retires only the used key and pins
  		// the next attempt to the same channel. Pinning suppresses the loop's next
  		// retry increment, so every enabled key is tried without consuming the
  		// normal channel retry budget.
@@ -89,17 +99,6 @@ index b01b4b6..4b26c25 100644
  			service.ShouldDisableChannelForChannel(channelForError, newAPIError) &&
  			sequentialKeyDisabled && sequentialKeyAvailable(channelForError.Id) {
  			retryParam.SetSequentialChannel(channelForError.Id)
- 			continue
- 		}
- 
-+		// A response already written to the client cannot be replaced, and a
-+		// cancelled client request must not be retried.
-+		if c.Writer.Written() || (c.Request != nil && c.Request.Context().Err() != nil) {
-+			break
-+		}
- 		if decision.Action != "retry" {
- 			break
- 		}
 diff --git a/dto/channel_constraints.go b/dto/channel_constraints.go
 index a1848bc..6baff44 100644
 --- a/dto/channel_constraints.go
@@ -825,10 +824,27 @@ index 8e86deb..51e0924 100644
  			other.SetAdmin("billing_model", billingModel)
  		}
 diff --git a/service/responses_usage.go b/service/responses_usage.go
-index cdf02e0..9bdeeb8 100644
+index cdf02e0..0f117e6 100644
 --- a/service/responses_usage.go
 +++ b/service/responses_usage.go
-@@ -110,6 +110,15 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
+@@ -34,13 +34,15 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse)
+ 	}
+ 	if event.Response != nil {
+ 		a.info.ObserveResponseModel(event.Response.Model)
++		// Usage may arrive before the terminal event or on an error envelope.
++		// Preserve it even when the final failure omits its accounting fields.
++		ApplyResponsesUsage(a.usage, event.Response.Usage)
+ 	}
+ 	a.started = true
+ 	ObserveResponsesOutcome(a.info, event)
+ 	switch event.Type {
+ 	case "response.completed", "response.done", "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
+ 		if event.Response != nil {
+-			ApplyResponsesUsage(a.usage, event.Response.Usage)
+ 			if a.outputText.Len() == 0 {
+ 				// Some upstreams carry the output only on the terminal event.
+ 				a.outputText.WriteString(relayconvert.ExtractOutputTextFromResponses(event.Response))
+@@ -110,6 +112,15 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
  	return a.usage
  }
  

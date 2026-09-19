@@ -19,10 +19,10 @@ if [[ "$MODE" != frontend ]]; then
     : "${CUSTOM_TEST_SQL_DSN:?disposable database DSN required}"
     GOWORK=off go test ./model -run '^TestCustomKeyRecovery' -count=1
   elif [[ "$MODE" == race ]]; then
-    GOWORK=off go test -race ./model ./relay/channel/openai ./service -run 'TestCustom(KeyRecovery|ResponsesCapacity|SequentialRetirement)' -count=1
+    GOWORK=off go test -race ./controller ./model ./relay/channel/openai ./service -run 'TestCustom(KeyRecovery|ResponsesCapacity|SequentialRetirement|SequentialRetry)' -count=1
   else
     GOWORK=off go -C relaykit build ./...
-    GOWORK=off go test ./relay ./relay/channel ./relay/channel/openai ./model ./service -run 'TestCustom|TestOaiResponses|TestUpdateChannelStatusPersistsMultiKeyState|TestNewTaskAPIRequestInheritsClientCancellation' -count=1
+    GOWORK=off go test ./controller ./relay ./relay/channel ./relay/channel/openai ./model ./service -run 'TestCustom|TestOaiResponses|TestResponsesUsage|TestApplyResponsesUsage|TestUpdateChannelStatusPersistsMultiKeyState|TestNewTaskAPIRequestInheritsClientCancellation' -count=1
   fi
 fi
 if [[ "$MODE" == frontend || "$MODE" == all ]]; then

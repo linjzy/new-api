@@ -169,7 +169,7 @@ index 1248853..6a04c36 100644
  		selected = append(selected, channel)
  	}
 diff --git a/controller/relay.go b/controller/relay.go
-index 1c42437..b01b4b6 100644
+index 1c42437..cb1729b 100644
 --- a/controller/relay.go
 +++ b/controller/relay.go
 @@ -155,7 +155,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
@@ -218,7 +218,7 @@ index 1c42437..b01b4b6 100644
  
  		if decision.Action != "retry" {
  			break
-@@ -260,6 +288,21 @@ var upgrader = websocket.Upgrader{
+@@ -260,6 +288,22 @@ var upgrader = websocket.Upgrader{
  }
  
  func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service.RetryParam) (*model.Channel, *types.NewAPIError) {
@@ -231,6 +231,7 @@ index 1c42437..b01b4b6 100644
 +			return nil, types.NewError(errors.New("sequential key channel changed mode"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 +		}
 +		info.PriceData.GroupRatioInfo = helper.HandleGroupRatio(c, info)
++		service.RequestPolicy(c).BeginAttempt(channel, info.UsingGroup)
 +		if newAPIError := middleware.SetupContextForSelectedChannel(c, channel, info.OriginModelName); newAPIError != nil {
 +			return nil, newAPIError
 +		}
@@ -240,7 +241,7 @@ index 1c42437..b01b4b6 100644
  	if info.ChannelMeta == nil {
  		autoBan := c.GetBool("auto_ban")
  		autoBanInt := 1
-@@ -293,10 +336,33 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
+@@ -293,10 +337,33 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
  	return channel, nil
  }
  
@@ -274,7 +275,7 @@ index 1c42437..b01b4b6 100644
  func RelayMidjourney(c *gin.Context) {
  	policy := service.RequestPolicy(c)
  	defer func() {
-@@ -498,7 +564,7 @@ func executeTaskSubmissionWith(
+@@ -498,7 +565,7 @@ func executeTaskSubmissionWith(
  		Retry:       common.GetPointer(0),
  	}
  
@@ -283,7 +284,7 @@ index 1c42437..b01b4b6 100644
  		stage = "select_channel"
  		if requestErr := c.Request.Context().Err(); requestErr != nil {
  			diagnostics.cancelled("before_attempt", retryParam.GetRetry()+1)
-@@ -508,9 +574,21 @@ func executeTaskSubmissionWith(
+@@ -508,9 +575,21 @@ func executeTaskSubmissionWith(
  		var channel *model.Channel
  
  		if lockedCh, ok := relayInfo.LockedChannel.(*model.Channel); ok && lockedCh != nil {
@@ -307,7 +308,7 @@ index 1c42437..b01b4b6 100644
  				if setupErr := middleware.SetupContextForSelectedChannel(c, channel, relayInfo.OriginModelName); setupErr != nil {
  					taskErr = service.TaskErrorWrapperLocal(setupErr.Err, "setup_locked_channel_failed", http.StatusInternalServerError)
  					break
-@@ -556,16 +634,24 @@ func executeTaskSubmissionWith(
+@@ -556,16 +635,24 @@ func executeTaskSubmissionWith(
  		relayInfo.LastError = taskAPIError
  		decision := decideTaskRetry(c, taskErr, common.RetryTimes-retryParam.GetRetry())
  		service.RecordPolicyFailure(c, channel.Id, taskAPIError, decision)
@@ -338,7 +339,7 @@ index 1c42437..b01b4b6 100644
  		if !willRetry {
  			break
  		}
-@@ -739,6 +825,20 @@ func respondTaskSubmissionError(c *gin.Context, taskErr *taskdto.TaskError) {
+@@ -739,6 +826,20 @@ func respondTaskSubmissionError(c *gin.Context, taskErr *taskdto.TaskError) {
  	respondTaskError(c, taskErr)
  }
  

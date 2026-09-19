@@ -53,6 +53,21 @@ func TestCustomResponsesCapacityBoundaries(t *testing.T) {
 			skipRetry: true,
 		},
 		{
+			name: "usage from an earlier event survives a failure without usage",
+			body: "data: {\"type\":\"response.in_progress\",\"response\":{\"status\":\"in_progress\",\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"total_tokens\":12}}}\n\n" +
+				"data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"output\":[],\"usage\":null,\"error\":{\"code\":\"model_at_capacity\",\"message\":\"capacity\"}}}\n\n",
+			written:   true,
+			tokens:    12,
+			skipRetry: true,
+		},
+		{
+			name:      "response error envelope preserves its reported usage",
+			body:      "data: {\"type\":\"response.error\",\"response\":{\"status\":\"failed\",\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"total_tokens\":12},\"error\":{\"code\":\"model_at_capacity\",\"message\":\"capacity\"}}}\n\n",
+			written:   true,
+			tokens:    12,
+			skipRetry: true,
+		},
+		{
 			name:            "disconnect during header setup leaves known billable usage with unwritten response",
 			body:            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"total_tokens\":12},\"error\":{\"code\":\"model_at_capacity\",\"message\":\"capacity\"}}}\n\n",
 			cancelAtHeaders: true,

@@ -66,15 +66,17 @@ func TestCustomResponsesSettlesUsageBeforeFirstClientWrite(t *testing.T) {
 	require.NoError(t, db.Create(&model.User{Id: 1, Username: "custom-billing", Quota: 1000}).Error)
 	require.NoError(t, db.Create(&model.Channel{Id: 1, Name: "custom-billing", Status: common.ChannelStatusEnabled}).Error)
 	for _, tc := range []struct {
-		name, usage string
-		billed      bool
+		name, usage, prelude string
+		billed               bool
 	}{
-		{"known usage survives disconnect", `{"input_tokens":10,"output_tokens":2,"total_tokens":12}`, true},
-		{"unbilled capacity failure keeps precharge refundable", `null`, false},
+		{name: "known usage survives disconnect", usage: `{"input_tokens":10,"output_tokens":2,"total_tokens":12}`, billed: true},
+		{name: "earlier usage settles when failure omits usage", usage: `null`, prelude: "data: {\"type\":\"response.in_progress\",\"response\":{\"status\":\"in_progress\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"total_tokens\":12}}}\n\n", billed: true},
+		{name: "unbilled capacity failure keeps precharge refundable", usage: `null`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte(tc.prelude))
 				_, _ = w.Write([]byte(`data: {"type":"response.failed","response":{"status":"failed","output":[],"usage":` + tc.usage + `,"error":{"code":"model_at_capacity","message":"capacity"}}}` + "\n\n"))
 			}))
 			defer upstream.Close()
@@ -95,7 +97,7 @@ func TestCustomResponsesSettlesUsageBeforeFirstClientWrite(t *testing.T) {
 				Request: &dto.OpenAIResponsesRequest{Model: "custom-model", Stream: &stream}, Billing: bill,
 				PriceData: hosttypes.PriceData{ModelRatio: 1, CompletionRatio: 1, GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: 1}},
 			}
-			w.ready = func() bool { return info.ResponsesCapacityFailure }
+			w.ready = func() bool { return info.StreamStatus != nil }
 			apiErr := ResponsesHelper(c, info)
 			require.NotNil(t, apiErr)
 			assert.False(t, c.Writer.Written())

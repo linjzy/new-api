@@ -30,7 +30,7 @@ cp -R .linjzy ../port/ && cd ../port
 bash .linjzy/bin/prepare-release.sh . "$TAG" "$(git rev-parse HEAD)" custom/port   # 失败时保留部分应用结果和 .rej
 ```
 
-修好后重新生成对应补丁并提交到本仓库。补丁已验证适用于 rc.34、rc.35。
+修好后重新生成对应补丁并提交到本仓库。当前补丁基于 rc.38；更换上游版本后必须重新验证。
 `main` 的其余内容是上游 tag 的快照，只为方便阅读；需要时 `git merge <tag>` 同步。
 
 ## 本地验证
