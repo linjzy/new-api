@@ -20,7 +20,7 @@ on:
         default: false
         type: boolean
       extended_checks:
-        description: Also verify MySQL compatibility and the concurrency race detector
+        description: Also run the concurrency race detector
         default: false
         type: boolean
 
@@ -65,7 +65,7 @@ jobs:
           extended="$EXTENDED"
           if [[ "$GITHUB_EVENT_NAME" == schedule ]] ||
              { [[ -n "$BEFORE" && "$BEFORE" != 0000000000000000000000000000000000000000 ]] &&
-               ! git diff --quiet "$BEFORE" HEAD -- .linjzy/patches/sequential-key-mode.patch .linjzy/patches/responses-capacity-retry.patch .linjzy/tests/go .linjzy/bin/prepare-release.py; }; then
+               ! git diff --quiet "$BEFORE" HEAD -- .linjzy/patches/responses-capacity-retry.patch .linjzy/tests/go .linjzy/bin/prepare-release.py; }; then
             extended=true
           fi
           {
@@ -101,7 +101,7 @@ jobs:
           proof="$(bash .linjzy/bin/registry-digest.sh "$PROOF")"
           full="$(bash .linjzy/bin/registry-digest.sh "$PROOF_FULL")"
           echo "exists=$([[ -n "$digest" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
-          # A full validation (MySQL and race) also satisfies a regular one.
+          # A full validation (race) also satisfies a regular one.
           echo "verified=$([[ -n "$digest" && ( "$digest" == "$proof" || "$digest" == "$full" ) ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
       - name: Prepare exact source and current verification bundle
@@ -146,38 +146,16 @@ jobs:
             go.sum
             relaykit/go.sum
 
-      - name: Verify relay, settlement, sequential keys and deployment contract
+      - name: Verify relay, settlement, capacity retry and deployment contract
         if: steps.registry.outputs.verified != 'true'
         run: |
           set -Eeuo pipefail
           bash "$RUNNER_TEMP/current-custom/bin/verify-release.sh" "$PWD" go
           python3 -m unittest discover -s "$RUNNER_TEMP/current-custom/tests" -p 'test_*.py'
 
-      - name: Verify PostgreSQL key recovery
-        if: steps.registry.outputs.verified != 'true'
-        env:
-          CUSTOM_TEST_SQL_DRIVER: postgres
-          CUSTOM_TEST_SQL_DSN: host=127.0.0.1 port=55432 user=newapi password=ci-only dbname=newapi_test sslmode=disable
-        run: |
-          set -Eeuo pipefail
-          docker run -d --name custom-postgres -p 127.0.0.1:55432:5432 -e POSTGRES_USER=newapi -e POSTGRES_PASSWORD=ci-only -e POSTGRES_DB=newapi_test --health-cmd='pg_isready -U newapi -d newapi_test' --health-interval=1s --health-retries=30 postgres:15-alpine
-          # shellcheck disable=SC2016
-          timeout 45 bash -c 'until [[ "$(docker inspect --format "{{.State.Health.Status}}" custom-postgres)" == healthy ]]; do sleep 1; done'
-          bash "$RUNNER_TEMP/current-custom/bin/verify-release.sh" "$PWD" database
-
-      - name: Verify changed backend concurrency and MySQL compatibility
+      - name: Verify changed backend concurrency
         if: steps.registry.outputs.verified != 'true' && steps.plan.outputs.extended == 'true'
-        env:
-          CUSTOM_TEST_SQL_DRIVER: mysql
-          CUSTOM_TEST_SQL_DSN: newapi:ci-only@tcp(127.0.0.1:53306)/newapi_test?charset=utf8mb4&parseTime=True&loc=UTC
-        run: |
-          set -Eeuo pipefail
-          docker run -d --name custom-mysql -p 127.0.0.1:53306:3306 -e MYSQL_ROOT_PASSWORD=ci-only -e MYSQL_USER=newapi -e MYSQL_PASSWORD=ci-only -e MYSQL_DATABASE=newapi_test --health-cmd='mysqladmin ping -h 127.0.0.1 -pci-only --silent' --health-interval=1s --health-retries=60 mysql:8.4
-          # shellcheck disable=SC2016
-          timeout 90 bash -c 'until [[ "$(docker inspect --format "{{.State.Health.Status}}" custom-mysql)" == healthy ]]; do sleep 1; done'
-          bash "$RUNNER_TEMP/current-custom/bin/verify-release.sh" "$PWD" database
-          unset CUSTOM_TEST_SQL_DSN CUSTOM_TEST_SQL_DRIVER
-          bash "$RUNNER_TEMP/current-custom/bin/verify-release.sh" "$PWD" race
+        run: bash "$RUNNER_TEMP/current-custom/bin/verify-release.sh" "$PWD" race
 
       - name: Install pinned frontend runner
         if: steps.registry.outputs.verified != 'true'

@@ -5,7 +5,7 @@ import hashlib
 import subprocess
 from pathlib import Path
 
-PATCHES = ("usage-logs-auto-refresh.patch", "sequential-key-mode.patch", "responses-capacity-retry.patch")
+PATCHES = ("usage-logs-auto-refresh.patch", "responses-capacity-retry.patch")
 
 def prepare(source, release, upstream, source_ref):
     actual = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip()

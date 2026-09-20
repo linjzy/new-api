@@ -9,20 +9,17 @@ else
   FRONTEND="$SOURCE_DIR/web"
 fi
 case "$MODE" in
-  go|database|race|frontend|all) ;;
+  go|race|frontend|all) ;;
   *) printf 'unknown verification mode: %s\n' "$MODE" >&2; exit 1 ;;
 esac
 if [[ "$MODE" != frontend ]]; then
   cp -R "$BUNDLE_DIR/tests/go/." "$SOURCE_DIR/"
   cd "$SOURCE_DIR"
-  if [[ "$MODE" == database ]]; then
-    : "${CUSTOM_TEST_SQL_DSN:?disposable database DSN required}"
-    GOWORK=off go test ./model -run '^TestCustomKeyRecovery' -count=1
-  elif [[ "$MODE" == race ]]; then
-    GOWORK=off go test -race ./controller ./model ./relay/channel/openai ./service -run 'TestCustom(KeyRecovery|ResponsesCapacity|SequentialRetirement|SequentialRetry)' -count=1
+  if [[ "$MODE" == race ]]; then
+    GOWORK=off go test -race ./relay ./relay/channel ./relay/channel/openai -run 'TestCustom|TestOaiResponses|TestNewTaskAPIRequestInheritsClientCancellation' -count=1
   else
     GOWORK=off go -C relaykit build ./...
-    GOWORK=off go test ./controller ./relay ./relay/channel ./relay/channel/openai ./model ./service -run 'TestCustom|TestOaiResponses|TestResponsesUsage|TestApplyResponsesUsage|TestUpdateChannelStatusPersistsMultiKeyState|TestNewTaskAPIRequestInheritsClientCancellation' -count=1
+    GOWORK=off go test ./controller ./relay ./relay/channel ./relay/channel/openai ./model ./service -run 'TestCustom|TestOaiResponses|TestResponsesUsage|TestApplyResponsesUsage|TestNewTaskAPIRequestInheritsClientCancellation' -count=1
   fi
 fi
 if [[ "$MODE" == frontend || "$MODE" == all ]]; then

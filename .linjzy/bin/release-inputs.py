@@ -4,7 +4,7 @@ import argparse
 import hashlib
 from pathlib import Path
 
-PATCHES = ("usage-logs-auto-refresh.patch", "sequential-key-mode.patch", "responses-capacity-retry.patch")
+PATCHES = ("usage-logs-auto-refresh.patch", "responses-capacity-retry.patch")
 
 def digest_files(root, files):
     digest = hashlib.sha256()
