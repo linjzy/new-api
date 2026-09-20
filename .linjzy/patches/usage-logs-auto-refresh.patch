@@ -1,5 +1,5 @@
 diff --git a/web/src/features/usage-logs/api.ts b/web/src/features/usage-logs/api.ts
-index 793010b..bcc1ccc 100644
+index 793010be4..bcc1ccc7e 100644
 --- a/web/src/features/usage-logs/api.ts
 +++ b/web/src/features/usage-logs/api.ts
 @@ -35,6 +35,13 @@ import type {
@@ -35,7 +35,7 @@ index 793010b..bcc1ccc 100644
  }
  
 diff --git a/web/src/features/usage-logs/components/common-logs-stats.tsx b/web/src/features/usage-logs/components/common-logs-stats.tsx
-index 91b82af..06f671a 100644
+index 91b82af7d..06f671af6 100644
 --- a/web/src/features/usage-logs/components/common-logs-stats.tsx
 +++ b/web/src/features/usage-logs/components/common-logs-stats.tsx
 @@ -18,7 +18,9 @@ For commercial licensing, please contact support@quantumnous.com
@@ -113,7 +113,7 @@ index 91b82af..06f671a 100644
      return (
        <div className='flex items-center gap-2'>
 diff --git a/web/src/features/usage-logs/components/dialogs/details-dialog.tsx b/web/src/features/usage-logs/components/dialogs/details-dialog.tsx
-index 7e5b863..ef25954 100644
+index 3172244c9..d8dc600e9 100644
 --- a/web/src/features/usage-logs/components/dialogs/details-dialog.tsx
 +++ b/web/src/features/usage-logs/components/dialogs/details-dialog.tsx
 @@ -479,6 +479,17 @@ export function DetailsDialog(props: DetailsDialogProps) {
@@ -192,7 +192,7 @@ index 7e5b863..ef25954 100644
          )}
  
 diff --git a/web/src/features/usage-logs/components/usage-logs-provider.tsx b/web/src/features/usage-logs/components/usage-logs-provider.tsx
-index 930634c..77689c7 100644
+index 930634c4e..77689c785 100644
 --- a/web/src/features/usage-logs/components/usage-logs-provider.tsx
 +++ b/web/src/features/usage-logs/components/usage-logs-provider.tsx
 @@ -46,6 +46,8 @@ interface UsageLogsContextValue {
@@ -222,14 +222,15 @@ index 930634c..77689c7 100644
          setViewScope,
        }}
 diff --git a/web/src/features/usage-logs/components/usage-logs-table.tsx b/web/src/features/usage-logs/components/usage-logs-table.tsx
-index a12a067..40b093c 100644
+index c4d520e83..7e428e8fd 100644
 --- a/web/src/features/usage-logs/components/usage-logs-table.tsx
 +++ b/web/src/features/usage-logs/components/usage-logs-table.tsx
-@@ -18,8 +18,14 @@ For commercial licensing, please contact support@quantumnous.com
+@@ -18,9 +18,14 @@ For commercial licensing, please contact support@quantumnous.com
  */
  import { useQuery } from '@tanstack/react-query'
  import { getRouteApi } from '@tanstack/react-router'
 -import type { ColumnDef } from '@tanstack/react-table'
+-import { useCallback } from 'react'
 +import type {
 +  ColumnDef,
 +  OnChangeFn,
@@ -241,10 +242,10 @@ index a12a067..40b093c 100644
  
  import {
    DataTablePage,
-@@ -41,6 +47,10 @@ import {
-   LOG_TYPE_ALL_VALUE,
+@@ -43,6 +48,10 @@ import {
    LOG_TYPE_ENUM,
  } from '../constants'
+ import { shouldShowBillingSource } from '../lib/billing-source'
 +import {
 +  getUsageLogsRefetchInterval,
 +  USAGE_LOGS_AUTO_REFRESH_ERROR_TOAST_ID,
@@ -252,7 +253,7 @@ index a12a067..40b093c 100644
  import { useColumnsByCategory } from '../lib/columns'
  import { parseLogOther } from '../lib/format'
  import { fetchLogsByCategory } from '../lib/utils'
-@@ -48,7 +58,11 @@ import type { LogCategory } from '../types'
+@@ -50,7 +59,11 @@ import type { LogCategory } from '../types'
  import { CommonLogsFilterBar } from './common-logs-filter-bar'
  import { TaskLogsFilterBar } from './task-logs-filter-bar'
  import { UsageLogsMobileList } from './usage-logs-mobile-card'
@@ -265,7 +266,7 @@ index a12a067..40b093c 100644
  
  const route = getRouteApi('/_authenticated/usage-logs/$section')
  
-@@ -89,6 +103,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
+@@ -95,6 +108,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
      isRootView: isRoot,
      viewAccess,
    } = useLogsViewScope()
@@ -273,7 +274,7 @@ index a12a067..40b093c 100644
    const isMobile = useMediaQuery('(max-width: 640px)')
    const searchParams = route.useSearch()
    const userId = useAuthStore((state) => state.auth.user?.id)
-@@ -146,7 +161,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
+@@ -160,7 +174,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
      ],
    })
  
@@ -282,7 +283,7 @@ index a12a067..40b093c 100644
      queryKey: [
        'logs',
        logCategory,
-@@ -182,8 +197,36 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
+@@ -196,8 +210,36 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
        }
        return undefined
      },
@@ -319,7 +320,7 @@ index a12a067..40b093c 100644
    const logs = data?.items || []
    const columns = useColumnsByCategory(
      logCategory,
-@@ -203,7 +246,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
+@@ -217,7 +259,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
      ),
      pagination,
      enableRowSelection: false,
@@ -329,7 +330,7 @@ index a12a067..40b093c 100644
      manualPagination: true,
      manualFiltering: true,
 diff --git a/web/src/features/usage-logs/constants.ts b/web/src/features/usage-logs/constants.ts
-index 95f2647..39994e7 100644
+index 95f2647ce..39994e784 100644
 --- a/web/src/features/usage-logs/constants.ts
 +++ b/web/src/features/usage-logs/constants.ts
 @@ -44,6 +44,9 @@ export const DEFAULT_LOGS_DATA = {
@@ -343,7 +344,7 @@ index 95f2647..39994e7 100644
  // Log Type Enum
  // ============================================================================
 diff --git a/web/src/features/usage-logs/index.tsx b/web/src/features/usage-logs/index.tsx
-index b0f911b..8ab57ef 100644
+index b0f911b71..8ab57ef05 100644
 --- a/web/src/features/usage-logs/index.tsx
 +++ b/web/src/features/usage-logs/index.tsx
 @@ -16,12 +16,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
@@ -445,7 +446,7 @@ index b0f911b..8ab57ef 100644
            <div className='flex h-full min-h-0 flex-col gap-4'>
 diff --git a/web/src/features/usage-logs/lib/auto-refresh.ts b/web/src/features/usage-logs/lib/auto-refresh.ts
 new file mode 100644
-index 0000000..40d8486
+index 000000000..40d8486b9
 --- /dev/null
 +++ b/web/src/features/usage-logs/lib/auto-refresh.ts
 @@ -0,0 +1,35 @@
