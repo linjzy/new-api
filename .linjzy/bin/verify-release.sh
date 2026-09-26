@@ -13,6 +13,13 @@ case "$MODE" in
   *) printf 'unknown verification mode: %s\n' "$MODE" >&2; exit 1 ;;
 esac
 if [[ "$MODE" != frontend ]]; then
+  if [[ "$(uname -s)" == Linux ]]; then
+    codex_bin_dir="${RUNNER_TEMP:-/tmp}/newapi-astra-iq-cli"
+    if [[ "$("$codex_bin_dir/codex" --version 2>/dev/null || true)" != 'codex-cli 0.157.1' ]]; then
+      bash "$SOURCE_DIR/scripts/install-astra-iq-codex.sh" "$codex_bin_dir"
+    fi
+    export PATH="$codex_bin_dir:$PATH"
+  fi
   cp -R "$BUNDLE_DIR/tests/go/." "$SOURCE_DIR/"
   cd "$SOURCE_DIR"
   if [[ "$MODE" == race ]]; then

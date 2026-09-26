@@ -25,6 +25,10 @@ raise SystemExit(0 if payload.get("success") is True else 1)
 }
 
 VERSION_OUTPUT="$(docker run --rm "$IMAGE_REF" --version 2>&1)"
+[[ "$(docker run --rm --entrypoint codex "$IMAGE_REF" --version)" == 'codex-cli 0.157.1' ]] || {
+  echo 'official Codex CLI is missing or has an unexpected version' >&2
+  exit 1
+}
 [[ "$VERSION_OUTPUT" == *"$RELEASE_TAG"* ]] || {
   printf 'image version mismatch: expected %s, got %s\n' \
     "$RELEASE_TAG" "$VERSION_OUTPUT" >&2
