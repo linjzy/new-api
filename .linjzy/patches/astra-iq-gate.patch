@@ -22,10 +22,10 @@ index 399a2ab8..bd554f66 100644
  WORKDIR /data
 diff --git a/controller/astra_iq.go b/controller/astra_iq.go
 new file mode 100644
-index 00000000..861b0329
+index 00000000..069917bb
 --- /dev/null
 +++ b/controller/astra_iq.go
-@@ -0,0 +1,353 @@
+@@ -0,0 +1,372 @@
 +package controller
 +
 +import (
@@ -55,6 +55,8 @@ index 00000000..861b0329
 +请只输出最终答案的一个整数，不要输出解释、分析过程或其他内容。`
 +
 +var astraIQAnswerPattern = regexp.MustCompile(`^(?:(?:答案|最少|至少)(?:是|为)?[:：]?\s*)?21(?:\s*(?:个|颗)(?:糖果)?)?[。.!！]?$`)
++
++var astraIQEmptyAnswer = errors.New("empty_answer")
 +
 +func setAstraIQPrompt(request dto.Request, prompt string) error {
 +	switch r := request.(type) {
@@ -109,6 +111,7 @@ index 00000000..861b0329
 +	text := strings.TrimSpace(string(body))
 +	if strings.HasPrefix(text, "data:") || strings.HasPrefix(text, "event:") {
 +		var content strings.Builder
++		var completedItems strings.Builder
 +		completed := false
 +		var responseAnswer string
 +		for line := range strings.SplitSeq(text, "\n") {
@@ -127,8 +130,24 @@ index 00000000..861b0329
 +			if (event.Get("error").Exists() && event.Get("error").Type != gjson.Null) || event.Get("type").String() == "error" || event.Get("type").String() == "response.failed" || event.Get("type").String() == "response.incomplete" {
 +				return "", errors.New("upstream_error")
 +			}
++			if event.Get("type").String() == "response.output_item.done" {
++				item := event.Get("item")
++				if item.Get("type").String() == "message" && item.Get("role").String() == "assistant" && item.Get("status").String() == "completed" && item.Get("phase").String() != "commentary" {
++					for _, part := range item.Get("content").Array() {
++						if part.Get("type").String() == "output_text" {
++							completedItems.WriteString(part.Get("text").String())
++						}
++					}
++				}
++			}
 +			if event.Get("type").String() == "response.completed" {
 +				answer, err := astraIQAnswer([]byte(event.Get("response").Raw))
++				// Some Responses providers omit output from response.completed.
++				// A completed assistant item is authoritative only after the
++				// response itself has completed successfully; deltas never pass.
++				if errors.Is(err, astraIQEmptyAnswer) && strings.TrimSpace(completedItems.String()) != "" {
++					answer, err = strings.TrimSpace(completedItems.String()), nil
++				}
 +				if err != nil {
 +					return "", err
 +				}
@@ -156,7 +175,7 @@ index 00000000..861b0329
 +			return responseAnswer, nil
 +		}
 +		if strings.TrimSpace(content.String()) == "" {
-+			return "", errors.New("empty_answer")
++			return "", astraIQEmptyAnswer
 +		}
 +		return strings.TrimSpace(content.String()), nil
 +	}
@@ -174,7 +193,7 @@ index 00000000..861b0329
 +		}
 +		answer := choice.Get("message.content")
 +		if answer.Type != gjson.String || strings.TrimSpace(answer.String()) == "" {
-+			return "", errors.New("empty_answer")
++			return "", astraIQEmptyAnswer
 +		}
 +		return strings.TrimSpace(answer.String()), nil
 +	}
@@ -193,7 +212,7 @@ index 00000000..861b0329
 +		}
 +	}
 +	if strings.TrimSpace(answer.String()) == "" {
-+		return "", errors.New("empty_answer")
++		return "", astraIQEmptyAnswer
 +	}
 +	return strings.TrimSpace(answer.String()), nil
 +}
@@ -553,10 +572,10 @@ index 00000000..cbe99ab7
 +}
 diff --git a/controller/astra_iq_test.go b/controller/astra_iq_test.go
 new file mode 100644
-index 00000000..51a79932
+index 00000000..d69843c2
 --- /dev/null
 +++ b/controller/astra_iq_test.go
-@@ -0,0 +1,313 @@
+@@ -0,0 +1,318 @@
 +package controller
 +
 +import (
@@ -609,6 +628,9 @@ index 00000000..51a79932
 +		{"error stream", "data: {\"error\":{\"message\":\"21\"}}\n", false, true},
 +		{"completed responses stream", "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"error\":null,\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"21\"}]}]}}\n\n", true, false},
 +		{"responses error without error object", "event: error\ndata: {\"type\":\"error\",\"message\":\"21\"}\n\n", false, true},
++		{"completed with final message event and empty output", "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"final_answer\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"21\"}]}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n", true, false},
++		{"final message without completed response", "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"21\"}]}}\n\n", false, true},
++		{"commentary cannot substitute final answer", "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"commentary\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"21\"}]}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n", false, true},
 +	} {
 +		t.Run(tc.name, func(t *testing.T) {
 +			answer, err := astraIQAnswer([]byte(tc.body))
@@ -779,7 +801,9 @@ index 00000000..51a79932
 +		fmt.Fprint(w, "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_test\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n")
 +		fmt.Fprintf(w, "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_test\",\"output_index\":0,\"content_index\":0,\"delta\":%q}\n\n", answer)
 +		fmt.Fprintf(w, "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_test\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":%q,\"annotations\":[]}]}}\n\n", answer)
-+		fmt.Fprintf(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"test\",\"status\":\"completed\",\"model\":\"gpt-6-astra\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":%q}]}],\"usage\":{\"input_tokens\":100,\"output_tokens\":1,\"total_tokens\":101}}}\n\n", answer)
++		// The deployed upstream sometimes leaves output empty in the terminal
++		// event after emitting the full assistant message in output_item.done.
++		fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"test\",\"status\":\"completed\",\"model\":\"gpt-6-astra\",\"output\":[],\"usage\":{\"input_tokens\":100,\"output_tokens\":1,\"total_tokens\":101}}}\n\n")
 +	}))
 +	defer upstream.Close()
 +	ch := &model.Channel{Id: 901, Type: constant.ChannelTypeOpenAI, Key: "correct\nwrong", BaseURL: &upstream.URL, Models: model.AstraIQModel, Group: "default", Status: common.ChannelStatusEnabled, ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeySize: 2}}
