@@ -16,7 +16,7 @@ if [[ "$MODE" != frontend ]]; then
   cp -R "$BUNDLE_DIR/tests/go/." "$SOURCE_DIR/"
   cd "$SOURCE_DIR"
   if [[ "$MODE" == race ]]; then
-    GOWORK=off go test -race ./controller ./relay ./relay/channel ./relay/channel/openai -run 'TestCustom|TestOaiResponses|TestNewTaskAPIRequestInheritsClientCancellation' -count=1
+    GOWORK=off go test -race ./controller ./service ./relay ./relay/channel ./relay/channel/openai -run 'TestCustom|TestOaiResponses|TestNewTaskAPIRequestInheritsClientCancellation' -count=1
   else
     GOWORK=off go -C relaykit build ./...
     GOWORK=off go test -v ./controller ./relay ./relay/channel ./relay/channel/openai ./model ./service -run 'TestCustom|TestOaiResponses|TestResponsesUsage|TestApplyResponsesUsage|TestNewTaskAPIRequestInheritsClientCancellation' -count=1

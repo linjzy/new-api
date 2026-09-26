@@ -1,9 +1,9 @@
 diff --git a/controller/astra_iq.go b/controller/astra_iq.go
 new file mode 100644
-index 00000000..3aee87d9
+index 00000000..7c08c9b7
 --- /dev/null
 +++ b/controller/astra_iq.go
-@@ -0,0 +1,297 @@
+@@ -0,0 +1,298 @@
 +package controller
 +
 +import (
@@ -222,6 +222,7 @@ index 00000000..3aee87d9
 +func (astraIQTestHandler) Enabled() bool           { return model.AstraIQEnabled() }
 +func (astraIQTestHandler) Interval() time.Duration { return model.AstraIQInterval }
 +func (astraIQTestHandler) NewPayload() any         { return nil }
++func (astraIQTestHandler) ScheduleFromStart() bool { return true }
 +
 +func (astraIQTestHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
 +	userID, err := resolveChannelTestUserID(nil)
@@ -833,6 +834,89 @@ index 2d59b039..8dd41de8 100644
  	{method: http.MethodGet, path: "/", permission: authz.ChannelRead, handler: controller.GetAllChannels},
  	{method: http.MethodGet, path: "/search", permission: authz.ChannelRead, handler: controller.SearchChannels},
  	{method: http.MethodGet, path: "/models", permission: authz.ChannelRead, handler: controller.ChannelListModels},
+diff --git a/service/system_task.go b/service/system_task.go
+index b7182aef..e19ed05d 100644
+--- a/service/system_task.go
++++ b/service/system_task.go
+@@ -46,6 +46,12 @@ type ScheduledSystemTaskHandler interface {
+ 	NewPayload() any
+ }
+ 
++// Optional for probes whose cadence must include execution time. Existing
++// scheduled handlers continue waiting their interval after completion.
++type startIntervalSystemTaskHandler interface {
++	ScheduleFromStart() bool
++}
++
+ var (
+ 	systemTaskHandlersMu sync.RWMutex
+ 	systemTaskHandlers   = map[string]SystemTaskHandler{}
+@@ -284,7 +290,11 @@ func runSystemTaskScheduler() {
+ 			if latest.Status == model.SystemTaskStatusPending || latest.Status == model.SystemTaskStatusRunning {
+ 				continue // an active row already exists
+ 			}
+-			if now-latest.UpdatedAt < int64(scheduled.Interval().Seconds()) {
++			lastRun := latest.UpdatedAt
++			if anchored, ok := scheduled.(startIntervalSystemTaskHandler); ok && anchored.ScheduleFromStart() {
++				lastRun = latest.CreatedAt
++			}
++			if now-lastRun < int64(scheduled.Interval().Seconds()) {
+ 				continue // not due yet
+ 			}
+ 		}
+diff --git a/service/system_task_test.go b/service/system_task_test.go
+index baaf9142..f9b04b64 100644
+--- a/service/system_task_test.go
++++ b/service/system_task_test.go
+@@ -31,10 +31,11 @@ func withSystemTaskRegistry(t *testing.T, handlers ...SystemTaskHandler) {
+ }
+ 
+ type stubScheduledHandler struct {
+-	taskType string
+-	enabled  bool
+-	interval time.Duration
+-	onRun    func(ctx context.Context, task *model.SystemTask, runnerID string)
++	taskType  string
++	enabled   bool
++	interval  time.Duration
++	fromStart bool
++	onRun     func(ctx context.Context, task *model.SystemTask, runnerID string)
+ }
+ 
+ type stubSystemTaskRunResult struct {
+@@ -54,6 +55,32 @@ func (h *stubScheduledHandler) Run(ctx context.Context, task *model.SystemTask,
+ func (h *stubScheduledHandler) Enabled() bool           { return h.enabled }
+ func (h *stubScheduledHandler) Interval() time.Duration { return h.interval }
+ func (h *stubScheduledHandler) NewPayload() any         { return nil }
++func (h *stubScheduledHandler) ScheduleFromStart() bool { return h.fromStart }
++
++func TestCustomAstraIQSchedulerIncludesProbeDuration(t *testing.T) {
++	for _, fromStart := range []bool{false, true} {
++		t.Run(map[bool]string{false: "existing completion cadence", true: "IQ start cadence"}[fromStart], func(t *testing.T) {
++			truncate(t)
++			handler := &stubScheduledHandler{taskType: model.AstraIQTaskType, enabled: true, interval: model.AstraIQInterval, fromStart: fromStart}
++			withSystemTaskRegistry(t, handler)
++			task, err := model.CreateSystemTask(handler.taskType, nil, nil)
++			require.NoError(t, err)
++			_, claimed, err := model.ClaimSystemTask(task.ID, handler.taskType, "iq-runner", common.GetTimestamp()+60)
++			require.NoError(t, err)
++			require.True(t, claimed)
++			require.NoError(t, model.FinishSystemTask(task.TaskID, "iq-runner", model.SystemTaskStatusSucceeded, nil, ""))
++			require.NoError(t, model.DB.Model(&model.SystemTask{}).Where("id = ?", task.ID).Update("created_at", common.GetTimestamp()-int64(model.AstraIQInterval.Seconds())).Error)
++			runSystemTaskScheduler()
++			expected := int64(1)
++			if fromStart {
++				expected = 2
++			}
++			assert.Equal(t, expected, countSystemTasks(t, handler.taskType))
++			runSystemTaskScheduler()
++			assert.Equal(t, expected, countSystemTasks(t, handler.taskType), "never overlap active probes")
++		})
++	}
++}
+ 
+ func countSystemTasks(t *testing.T, taskType string) int64 {
+ 	t.Helper()
 diff --git a/web/src/features/channels/components/__tests__/astra-iq-status.test.tsx b/web/src/features/channels/components/__tests__/astra-iq-status.test.tsx
 new file mode 100644
 index 00000000..c6782069
