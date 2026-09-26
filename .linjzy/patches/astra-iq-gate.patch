@@ -22,10 +22,10 @@ index 399a2ab8..bd554f66 100644
  WORKDIR /data
 diff --git a/controller/astra_iq.go b/controller/astra_iq.go
 new file mode 100644
-index 00000000..bba2e040
+index 00000000..f46f8ec3
 --- /dev/null
 +++ b/controller/astra_iq.go
-@@ -0,0 +1,468 @@
+@@ -0,0 +1,494 @@
 +package controller
 +
 +import (
@@ -221,6 +221,7 @@ index 00000000..bba2e040
 +func probeAstraIQChannel(ctx context.Context, ch *model.Channel, userID int) model.AstraIQResult {
 +	started := time.Now()
 +	result := model.AstraIQResult{Status: "error", Detail: "no_enabled_keys"}
++	result.Sample.StartedAt = started.Unix()
 +	result.Sample.Endpoint = "/v1/responses"
 +	result.Sample.Client = model.AstraIQClient
 +	if !model.ChannelEligibleForAstraIQ(ch) {
@@ -265,6 +266,25 @@ index 00000000..bba2e040
 +			if ctx.Err() != nil {
 +				result.Detail = "timeout"
 +			}
++			message := ""
++			if test.localErr != nil {
++				message = test.localErr.Error()
++			}
++			apiError := test.newAPIError
++			if apiError == nil {
++				_ = errors.As(test.localErr, &apiError)
++			}
++			if apiError != nil {
++				// Use the parsed error fields, not Error(), which can append the
++				// complete HTTP body and unrelated upstream request metadata.
++				upstream := apiError.ToOpenAIError()
++				message = upstream.Message
++				if upstream.Code != nil {
++					attempt.ErrorCode = astraIQSafeErrorText(fmt.Sprint(upstream.Code), &probe, 128)
++				}
++				attempt.ErrorType = astraIQSafeErrorText(upstream.Type, &probe, 128)
++			}
++			attempt.ErrorMessage = astraIQSafeErrorText(message, &probe, 2048)
 +			attempt.Detail = result.Detail
 +			result.Sample.Attempts = append(result.Sample.Attempts, attempt)
 +			break
@@ -436,6 +456,10 @@ index 00000000..bba2e040
 +		common.ApiError(c, err)
 +		return
 +	}
++	if !settings.Enabled {
++		common.ApiSuccess(c, gin.H{"enabled": false, "results": views})
++		return
++	}
 +	var channels []*model.Channel
 +	if err := model.DB.Find(&channels).Error; err != nil {
 +		common.ApiError(c, err)
@@ -457,7 +481,7 @@ index 00000000..bba2e040
 +			views[ch.Id] = model.AstraIQResultView(ch, results[ch.Id], settings)
 +		}
 +	}
-+	common.ApiSuccess(c, gin.H{"enabled": true, "results": views})
++	common.ApiSuccess(c, gin.H{"enabled": true, "interval_minutes": settings.IntervalMinutes, "server_time": common.GetTimestamp(), "results": views})
 +}
 +
 +func GetAstraIQSettings(c *gin.Context) {
@@ -471,6 +495,7 @@ index 00000000..bba2e040
 +
 +func UpdateAstraIQSettings(c *gin.Context) {
 +	var request struct {
++		Enabled         *bool  `json:"enabled" binding:"required"`
 +		StartTime       string `json:"start_time" binding:"required"`
 +		EndTime         string `json:"end_time" binding:"required"`
 +		IntervalMinutes int    `json:"interval_minutes" binding:"required"`
@@ -481,6 +506,7 @@ index 00000000..bba2e040
 +		return
 +	}
 +	settings := model.AstraIQSettings{
++		Enabled:   *request.Enabled,
 +		StartTime: request.StartTime, EndTime: request.EndTime,
 +		IntervalMinutes: request.IntervalMinutes, StopOnFailure: *request.StopOnFailure,
 +	}
@@ -496,10 +522,10 @@ index 00000000..bba2e040
 +}
 diff --git a/controller/astra_iq_codex.go b/controller/astra_iq_codex.go
 new file mode 100644
-index 00000000..cbe99ab7
+index 00000000..be606c0a
 --- /dev/null
 +++ b/controller/astra_iq_codex.go
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,207 @@
 +package controller
 +
 +import (
@@ -515,14 +541,38 @@ index 00000000..cbe99ab7
 +	"os"
 +	"os/exec"
 +	"path/filepath"
++	"regexp"
 +	"strings"
 +	"sync/atomic"
 +	"time"
 +
++	"github.com/QuantumNous/new-api/common"
 +	"github.com/QuantumNous/new-api/constant"
 +	"github.com/QuantumNous/new-api/model"
 +	"github.com/tidwall/gjson"
 +)
++
++var astraIQCredentialPattern = regexp.MustCompile(`(?i)(?:bearer\s+\S+|sk-[a-z0-9_-]+|eyJ[a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+|(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)["']?\s*[:=]\s*["']?[^\s,;"'}]+)`)
++
++// Diagnostic text is visible with channel-read permission. Redact configured
++// credentials before bounding it; never save raw bodies or CLI event envelopes.
++func astraIQSafeErrorText(message string, ch *model.Channel, limit int) string {
++	message, _, _ = strings.Cut(message, ", body:")
++	message = sanitizeFetchModelsError(errors.New(message), ch.Key).Error()
++	for _, value := range ch.GetHeaderOverride() {
++		if secret, ok := value.(string); ok && secret != "" {
++			message = sanitizeFetchModelsError(errors.New(message), secret).Error()
++		}
++	}
++	message = astraIQCredentialPattern.ReplaceAllString(message, "[REDACTED]")
++	message = common.MaskSensitiveInfo(message)
++	message = strings.Join(strings.Fields(message), " ")
++	runes := []rune(message)
++	if len(runes) > limit {
++		return string(runes[:limit]) + "…"
++	}
++	return message
++}
 +
 +// The real pinned Codex CLI originates every IQ request. Its single-use local
 +// proxy selects exactly this channel and keeps provider keys out of the child
@@ -601,7 +651,7 @@ index 00000000..cbe99ab7
 +	scanner := bufio.NewScanner(stdout)
 +	scanner.Buffer(make([]byte, 4096), 1<<20)
 +	completed, failed := false, false
-+	var answer string
++	var answer, failureMessage string
 +	for scanner.Scan() {
 +		event := gjson.ParseBytes(scanner.Bytes())
 +		switch event.Get("type").String() {
@@ -613,17 +663,25 @@ index 00000000..cbe99ab7
 +			completed = true
 +		case "turn.failed", "error":
 +			failed = true
++			failureMessage = event.Get("error.message").String()
++			if failureMessage == "" {
++				failureMessage = event.Get("message").String()
++			}
 +		}
 +	}
 +	if scanner.Err() != nil {
 +		_ = cmd.Process.Kill()
 +	}
 +	cliErr := cmd.Wait()
++	if failureMessage == "" && cliErr != nil {
++		failureMessage = cliErr.Error()
++	}
++	failureMessage = strings.ReplaceAll(failureMessage, proxyKey, "[REDACTED]")
 +	var result testResult
 +	select {
 +	case result = <-results:
 +	default:
-+		return testResult{localErr: errors.New("official client did not issue a probe"), iqAttempt: model.AstraIQAttempt{Detail: "official_client_failed"}}
++		return testResult{localErr: fmt.Errorf("official client did not issue a probe: %s", failureMessage), iqAttempt: model.AstraIQAttempt{Detail: "official_client_failed"}}
 +	}
 +	if result.localErr != nil || result.newAPIError != nil {
 +		if result.localErr != nil && strings.Contains(result.localErr.Error(), "only allows Codex official clients") {
@@ -633,7 +691,16 @@ index 00000000..cbe99ab7
 +	}
 +	expected, gradeErr := astraIQAnswer(result.responseBody)
 +	if cliErr != nil || scanner.Err() != nil || failed || !completed || gradeErr != nil || strings.TrimSpace(answer) != expected {
-+		result.localErr = errors.New("official client did not complete the model response")
++		if failureMessage == "" && gradeErr != nil {
++			failureMessage = gradeErr.Error()
++		}
++		if failureMessage == "" && scanner.Err() != nil {
++			failureMessage = scanner.Err().Error()
++		}
++		if failureMessage == "" {
++			failureMessage = "missing completion event or inconsistent final answer"
++		}
++		result.localErr = fmt.Errorf("official client did not complete the model response: %s", failureMessage)
 +		result.iqAttempt.Detail = "official_client_incomplete"
 +	}
 +	return result
@@ -668,10 +735,10 @@ index 00000000..cbe99ab7
 +}
 diff --git a/controller/astra_iq_test.go b/controller/astra_iq_test.go
 new file mode 100644
-index 00000000..2f9f192a
+index 00000000..d5d489b3
 --- /dev/null
 +++ b/controller/astra_iq_test.go
-@@ -0,0 +1,452 @@
+@@ -0,0 +1,510 @@
 +package controller
 +
 +import (
@@ -770,10 +837,16 @@ index 00000000..2f9f192a
 +				settings, err := model.GetAstraIQSettings()
 +				require.NoError(t, err)
 +				assert.Equal(t, model.DefaultAstraIQSettings(), settings)
++				legacy := model.Option{Key: "AstraIQSettings", Value: `{"start_time":"00:00","end_time":"00:00","interval_minutes":1,"stop_on_failure":true}`}
++				require.NoError(t, db.Create(&legacy).Error)
++				settings, err = model.GetAstraIQSettings()
++				require.NoError(t, err)
++				assert.True(t, settings.Enabled, "existing saved schedules remain enabled")
++				assert.Equal(t, 1, settings.IntervalMinutes)
 +				engine := gin.New()
 +				engine.GET("/settings", GetAstraIQSettings)
 +				engine.PUT("/settings", UpdateAstraIQSettings)
-+				valid := `{"start_time":"22:00","end_time":"06:30","interval_minutes":17,"stop_on_failure":false}`
++				valid := `{"enabled":true,"start_time":"22:00","end_time":"06:30","interval_minutes":17,"stop_on_failure":false}`
 +				w := httptest.NewRecorder()
 +				engine.ServeHTTP(w, httptest.NewRequest(http.MethodPut, "/settings", strings.NewReader(valid)))
 +				require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -875,12 +948,21 @@ index 00000000..2f9f192a
 +					require.NotNil(t, selected)
 +					assert.Equal(t, 202, selected.Id, "retain the latest result between scheduled checks")
 +					settings := model.DefaultAstraIQSettings()
-+					settings.StopOnFailure = false
++					settings.Enabled = false
 +					require.NoError(t, model.SaveAstraIQSettings(settings))
 +					selected, err = model.GetRandomSatisfiedChannel("default", model.AstraIQModel, 0, nil)
 +					require.NoError(t, err)
 +					require.NotNil(t, selected)
-+					assert.Equal(t, 201, selected.Id, "saving the switch must immediately affect cached routing")
++					assert.Equal(t, 201, selected.Id, "disabling checks must immediately restore cached routing")
++					assert.True(t, model.AstraIQAllowsChannel(&channels[0], model.AstraIQModel))
++					w := httptest.NewRecorder()
++					c, _ := gin.CreateTestContext(w)
++					GetAstraIQStatus(c)
++					require.Equal(t, http.StatusOK, w.Code)
++					assert.False(t, gjson.GetBytes(w.Body.Bytes(), "data.enabled").Bool())
++					assert.Equal(t, "{}", gjson.GetBytes(w.Body.Bytes(), "data.results").Raw)
++					settings.Enabled, settings.StopOnFailure = true, false
++					require.NoError(t, model.SaveAstraIQSettings(settings))
 +					assert.True(t, model.AstraIQAllowsChannel(&channels[0], model.AstraIQModel))
 +					require.NoError(t, model.SaveAstraIQSettings(model.DefaultAstraIQSettings()))
 +					require.NoError(t, model.SaveAstraIQResult(&channels[0], model.AstraIQResult{Status: "pass", CheckedAt: common.GetTimestamp()}))
@@ -990,6 +1072,16 @@ index 00000000..2f9f192a
 +			fmt.Fprint(w, `{"error":{"message":"This account only allows Codex official clients","type":"forbidden_error"}}`)
 +			return
 +		}
++		if r.Header.Get("Authorization") == "Bearer fixture-http-secret" {
++			w.WriteHeader(http.StatusBadGateway)
++			fmt.Fprint(w, `{"error":{"message":"Upstream access forbidden. Authorization: Bearer fixture-http-secret","type":"upstream_error","code":"access_denied"},"private_metadata":"never-persist-this-body"}`)
++			return
++		}
++		if r.Header.Get("Authorization") == "Bearer fixture-stream-secret" {
++			w.Header().Set("Content-Type", "text/event-stream")
++			fmt.Fprint(w, "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"rate_limit_error\",\"code\":\"usage_limit_reached\",\"message\":\"The usage limit has been reached. api_key=fixture-stream-secret\"}}}\n\n")
++			return
++		}
 +		answer := "21"
 +		if r.Header.Get("Authorization") == "Bearer wrong" {
 +			answer = "22"
@@ -1034,6 +1126,35 @@ index 00000000..2f9f192a
 +	require.Len(t, result.Sample.Attempts, 1)
 +	assert.Equal(t, http.StatusForbidden, result.Sample.Attempts[0].HTTPStatus)
 +	assert.Empty(t, result.Sample.Attempts[0].Response)
++	assert.Equal(t, "This account only allows Codex official clients", result.Sample.Attempts[0].ErrorMessage)
++	for _, tc := range []struct {
++		key, code, message string
++		httpStatus         int
++	}{
++		{"fixture-http-secret", "access_denied", "Upstream access forbidden", 502},
++		{"fixture-stream-secret", "usage_limit_reached", "The usage limit has been reached", 200},
++	} {
++		ch.Key = tc.key
++		result = probeAstraIQChannel(context.Background(), ch, user.Id)
++		require.Equal(t, "error", result.Status)
++		require.Len(t, result.Sample.Attempts, 1)
++		attempt := result.Sample.Attempts[0]
++		assert.Equal(t, tc.httpStatus, attempt.HTTPStatus)
++		assert.Equal(t, tc.code, attempt.ErrorCode)
++		assert.Contains(t, attempt.ErrorMessage, tc.message)
++		encoded, err := common.Marshal(attempt)
++		require.NoError(t, err)
++		assert.NotContains(t, string(encoded), tc.key)
++		assert.NotContains(t, string(encoded), "never-persist-this-body")
++	}
++	settings := model.DefaultAstraIQSettings()
++	settings.Enabled = false
++	require.NoError(t, model.SaveAstraIQSettings(settings))
++	before := len(seen)
++	assert.Equal(t, "pending", probeAstraIQChannel(context.Background(), ch, user.Id).Status)
++	assert.Len(t, seen, before, "the total switch must prevent upstream calls")
++	require.NoError(t, model.SaveAstraIQSettings(model.DefaultAstraIQSettings()))
++	ch.Key = "blocked"
 +
 +	// The local bridge never accepts an unauthenticated call or replays its
 +	// one-time credential, including after the upstream denies the first call.
@@ -1068,7 +1189,7 @@ index 00000000..2f9f192a
 +	db := modelManagementDB(t, "sqlite", "")
 +	require.NoError(t, db.AutoMigrate(&model.AstraIQResult{}))
 +	ch := &model.Channel{Id: 908, Key: "private-key", Models: model.AstraIQModel}
-+	first := model.AstraIQResult{Status: "fail", CheckedAt: 100, Answer: "22", LatencyMS: 1234, Sample: model.AstraIQSample{Endpoint: "/v1/responses", Attempts: []model.AstraIQAttempt{{KeyIndex: 1, Status: "fail", Response: "22", PromptTokens: common.GetPointer(100)}}}}
++	first := model.AstraIQResult{Status: "error", CheckedAt: 100, LatencyMS: 1234, Sample: model.AstraIQSample{Endpoint: "/v1/responses", Attempts: []model.AstraIQAttempt{{KeyIndex: 1, Status: "error", ErrorMessage: "The service is temporarily unavailable.", ErrorCode: "service_unavailable", ErrorType: "upstream_error", HTTPStatus: 200}}}}
 +	require.NoError(t, model.SaveAstraIQResult(ch, first))
 +	require.NoError(t, model.SaveAstraIQResult(ch, model.AstraIQResult{Status: "pass", CheckedAt: 200, Answer: "21"}))
 +	rows, err := model.GetAstraIQResults([]int{ch.Id})
@@ -1086,7 +1207,8 @@ index 00000000..2f9f192a
 +		assert.NotContains(t, w.Body.String(), "private-key")
 +		assert.NotContains(t, w.Body.String(), "fingerprint")
 +		if tc.at == "100" {
-+			assert.Equal(t, "22", gjson.GetBytes(w.Body.Bytes(), "data.sample.attempts.0.response").String())
++			assert.Equal(t, "The service is temporarily unavailable.", gjson.GetBytes(w.Body.Bytes(), "data.sample.attempts.0.error_message").String())
++			assert.Equal(t, "service_unavailable", gjson.GetBytes(w.Body.Bytes(), "data.sample.attempts.0.error_code").String())
 +			assert.Equal(t, astraIQQuestion, gjson.GetBytes(w.Body.Bytes(), "data.question").String())
 +			assert.Equal(t, "medium", gjson.GetBytes(w.Body.Bytes(), "data.reasoning_effort").String())
 +		}
@@ -1116,16 +1238,19 @@ index 00000000..2f9f192a
 +		{"all day does not reset at midnight", "00:00", "00:00", "2026-09-27T00:01:00+08:00", "2026-09-26T23:59:00+08:00", 5, true, false},
 +	} {
 +		t.Run(tc.name, func(t *testing.T) {
-+			settings := model.AstraIQSettings{StartTime: tc.start, EndTime: tc.end, IntervalMinutes: tc.interval, StopOnFailure: true}
++			settings := model.AstraIQSettings{Enabled: true, StartTime: tc.start, EndTime: tc.end, IntervalMinutes: tc.interval, StopOnFailure: true}
 +			require.NoError(t, settings.Validate())
 +			assert.Equal(t, tc.active, settings.Active(time.Unix(stamp(tc.now), 0)))
 +			assert.Equal(t, tc.due, settings.Due(stamp(tc.now), stamp(tc.last)))
 +			assert.Equal(t, tc.active, settings.Due(stamp(tc.now), 0), "first check obeys the window")
++			settings.Enabled = false
++			assert.False(t, settings.Due(stamp(tc.now), 0))
++			assert.False(t, settings.Active(time.Unix(stamp(tc.now), 0)))
 +		})
 +	}
 +}
 diff --git a/controller/channel-test.go b/controller/channel-test.go
-index 1248853a..46c28c81 100644
+index 1248853a..33a077dd 100644
 --- a/controller/channel-test.go
 +++ b/controller/channel-test.go
 @@ -20,6 +20,7 @@ import (
@@ -1232,15 +1357,44 @@ index 1248853a..46c28c81 100644
  	requestBody := bytes.NewBuffer(jsonData)
  	c.Request.Body = io.NopCloser(bytes.NewBuffer(jsonData))
  	resp, err := adaptor.DoRequest(c, info, requestBody)
-@@ -460,6 +509,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+@@ -442,8 +491,10 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+ 		}
+ 	}
+ 	var httpResp *http.Response
++	attempt := model.AstraIQAttempt{}
+ 	if resp != nil {
+ 		httpResp = resp.(*http.Response)
++		attempt.HTTPStatus = httpResp.StatusCode
+ 		if httpResp.StatusCode != http.StatusOK {
+ 			err := service.RelayErrorHandler(c.Request.Context(), httpResp, true)
+ 			common.SysError(fmt.Sprintf(
+@@ -460,15 +511,21 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
  				context:     c,
  				localErr:    err,
  				newAPIError: types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError),
-+				iqAttempt:   model.AstraIQAttempt{HTTPStatus: httpResp.StatusCode},
++				iqAttempt:   attempt,
  			}
  		}
  	}
-@@ -480,7 +530,8 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+ 	usageA, respErr := adaptor.DoResponse(c, httpResp, info)
++	if isStream && info.HasSendResponse() {
++		firstTokenMS := info.FirstResponseTime.Sub(info.StartTime).Milliseconds()
++		attempt.FirstTokenMS = &firstTokenMS
++	}
+ 	if respErr != nil {
+ 		return testResult{
+ 			context:     c,
+ 			localErr:    respErr,
+ 			newAPIError: respErr,
++			iqAttempt:   attempt,
+ 		}
+ 	}
+ 	usage, usageErr := coerceTestUsage(usageA, isStream, info.GetEstimatePromptTokens())
+@@ -477,15 +534,18 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+ 			context:     c,
+ 			localErr:    usageErr,
+ 			newAPIError: types.NewOpenAIError(usageErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError),
++			iqAttempt:   attempt,
  		}
  	}
  	result := w.Result()
@@ -1250,15 +1404,25 @@ index 1248853a..46c28c81 100644
  	if err != nil {
  		return testResult{
  			context:     c,
-@@ -516,10 +567,17 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+ 			localErr:    err,
+ 			newAPIError: types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError),
++			iqAttempt:   attempt,
+ 		}
+ 	}
+ 	if bodyErr := validateTestResponseBody(respBody, isStream); bodyErr != nil {
+@@ -493,6 +553,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+ 			context:     c,
+ 			localErr:    bodyErr,
+ 			newAPIError: types.NewOpenAIError(bodyErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError),
++			iqAttempt:   attempt,
+ 		}
+ 	}
+ 	info.SetEstimatePromptTokens(usage.PromptTokens)
+@@ -516,10 +577,13 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
  		Other:            other,
  	})
  	common.SysLog(fmt.Sprintf("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
-+	attempt := model.AstraIQAttempt{HTTPStatus: http.StatusOK, PromptTokens: &usage.PromptTokens, CompletionTokens: &usage.CompletionTokens}
-+	if isStream && info.HasSendResponse() {
-+		firstTokenMS := info.FirstResponseTime.Sub(info.StartTime).Milliseconds()
-+		attempt.FirstTokenMS = &firstTokenMS
-+	}
++	attempt.PromptTokens, attempt.CompletionTokens = &usage.PromptTokens, &usage.CompletionTokens
  	return testResult{
 -		context:     c,
 -		localErr:    nil,
@@ -1299,10 +1463,10 @@ index b86c442d..abf4fd1b 100644
  				return nil
 diff --git a/model/astra_iq.go b/model/astra_iq.go
 new file mode 100644
-index 00000000..4c487c99
+index 00000000..574eab01
 --- /dev/null
 +++ b/model/astra_iq.go
-@@ -0,0 +1,272 @@
+@@ -0,0 +1,276 @@
 +package model
 +
 +import (
@@ -1345,6 +1509,7 @@ index 00000000..4c487c99
 +type AstraIQSample struct {
 +	Status    string           `json:"status"`
 +	CheckedAt int64            `json:"checked_at"`
++	StartedAt int64            `json:"started_at,omitempty"`
 +	Answer    string           `json:"answer,omitempty"`
 +	Detail    string           `json:"detail,omitempty"`
 +	LatencyMS int64            `json:"latency_ms,omitempty"`
@@ -1353,13 +1518,16 @@ index 00000000..4c487c99
 +	Attempts  []AstraIQAttempt `json:"attempts,omitempty"`
 +}
 +
-+// Store only the assistant's answer and safe request metrics, never request
++// Store the assistant's answer, sanitized errors and safe metrics, never request
 +// headers, credentials, reasoning content or raw upstream error bodies.
 +type AstraIQAttempt struct {
 +	KeyIndex         int    `json:"key_index"`
 +	Status           string `json:"status"`
 +	Response         string `json:"response,omitempty"`
 +	Detail           string `json:"detail,omitempty"`
++	ErrorMessage     string `json:"error_message,omitempty"`
++	ErrorCode        string `json:"error_code,omitempty"`
++	ErrorType        string `json:"error_type,omitempty"`
 +	LatencyMS        int64  `json:"latency_ms"`
 +	FirstTokenMS     *int64 `json:"first_token_ms"`
 +	PromptTokens     *int   `json:"prompt_tokens"`
@@ -1420,7 +1588,7 @@ index 00000000..4c487c99
 +	// No result (including cleared history or changed credentials) is allowed.
 +	// Only an actual failure blocks calls, and it remains in force outside the
 +	// check window until a new pass, deletion, or disabling this setting.
-+	return !settings.StopOnFailure || !r.applicable(ch) || (r.Status != "fail" && r.Status != "error")
++	return !settings.Enabled || !settings.StopOnFailure || !r.applicable(ch) || (r.Status != "fail" && r.Status != "error")
 +}
 +
 +// Read shared storage at selection time so a failed probe takes effect on every
@@ -1451,7 +1619,7 @@ index 00000000..4c487c99
 +	if err != nil {
 +		return false
 +	}
-+	if !settings.StopOnFailure {
++	if !settings.Enabled || !settings.StopOnFailure {
 +		return true
 +	}
 +	results, err := GetAstraIQResults([]int{ch.Id})
@@ -1466,7 +1634,7 @@ index 00000000..4c487c99
 +	if err != nil {
 +		return nil
 +	}
-+	if !settings.StopOnFailure {
++	if !settings.Enabled || !settings.StopOnFailure {
 +		return ids
 +	}
 +	results, err := GetAstraIQResults(ids)
@@ -1577,10 +1745,10 @@ index 00000000..4c487c99
 +}
 diff --git a/model/astra_iq_settings.go b/model/astra_iq_settings.go
 new file mode 100644
-index 00000000..910e3a0c
+index 00000000..d9aafe51
 --- /dev/null
 +++ b/model/astra_iq_settings.go
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,99 @@
 +package model
 +
 +import (
@@ -1597,6 +1765,7 @@ index 00000000..910e3a0c
 +var astraIQTimezone = time.FixedZone("Asia/Shanghai", 8*60*60)
 +
 +type AstraIQSettings struct {
++	Enabled         bool   `json:"enabled"`
 +	StartTime       string `json:"start_time"`
 +	EndTime         string `json:"end_time"`
 +	IntervalMinutes int    `json:"interval_minutes"`
@@ -1604,7 +1773,7 @@ index 00000000..910e3a0c
 +}
 +
 +func DefaultAstraIQSettings() AstraIQSettings {
-+	return AstraIQSettings{StartTime: "00:00", EndTime: "00:00", IntervalMinutes: 5, StopOnFailure: true}
++	return AstraIQSettings{Enabled: true, StartTime: "00:00", EndTime: "00:00", IntervalMinutes: 5, StopOnFailure: true}
 +}
 +
 +func (s AstraIQSettings) Validate() error {
@@ -1640,12 +1809,12 @@ index 00000000..910e3a0c
 +
 +func (s AstraIQSettings) Active(now time.Time) bool {
 +	_, active := s.window(now)
-+	return active
++	return s.Enabled && active
 +}
 +
 +func (s AstraIQSettings) Due(now, lastRun int64) bool {
 +	start, active := s.window(time.Unix(now, 0))
-+	return active && (lastRun == 0 || (s.StartTime != s.EndTime && lastRun < start.Unix()) || now-lastRun >= int64(s.IntervalMinutes)*60)
++	return s.Enabled && active && (lastRun == 0 || (s.StartTime != s.EndTime && lastRun < start.Unix()) || now-lastRun >= int64(s.IntervalMinutes)*60)
 +}
 +
 +// A single shared database value makes all four fields atomic and immediately
@@ -1950,10 +2119,10 @@ index baaf9142..44adcc05 100644
  	t.Helper()
 diff --git a/web/src/features/channels/components/__tests__/astra-iq-status.test.tsx b/web/src/features/channels/components/__tests__/astra-iq-status.test.tsx
 new file mode 100644
-index 00000000..fe75eded
+index 00000000..8b088ee2
 --- /dev/null
 +++ b/web/src/features/channels/components/__tests__/astra-iq-status.test.tsx
-@@ -0,0 +1,444 @@
+@@ -0,0 +1,534 @@
 +/*
 +Copyright (C) 2023-2026 QuantumNous
 +
@@ -1974,6 +2143,7 @@ index 00000000..fe75eded
 +*/
 +import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 +import {
++  act,
 +  fireEvent,
 +  render,
 +  screen,
@@ -2011,6 +2181,8 @@ index 00000000..fe75eded
 +]
 +const statusData: AstraIQStatusData = {
 +  enabled: true,
++  interval_minutes: 1,
++  server_time: 200,
 +  results: {
 +    '2': {
 +      status: 'pass',
@@ -2081,6 +2253,9 @@ index 00000000..fe75eded
 +    expect.objectContaining({ signal: expect.any(AbortSignal) })
 +  )
 +  expect(within(dialog).getByText('22')).toBeVisible()
++  expect(within(dialog).getByRole('alert')).toHaveTextContent(
++    'Expected 21, received 22.'
++  )
 +  expect(within(dialog).getByText('medium')).toBeVisible()
 +  expect(within(dialog).getByText('/v1/responses')).toBeVisible()
 +  expect(within(dialog).getByText('Codex CLI 0.157.1')).toBeVisible()
@@ -2260,6 +2435,7 @@ index 00000000..fe75eded
 +})
 +
 +const defaultSettings = {
++  enabled: true,
 +  start_time: '00:00',
 +  end_time: '00:00',
 +  interval_minutes: 5,
@@ -2279,7 +2455,7 @@ index 00000000..fe75eded
 +  return client
 +}
 +
-+it('loads, saves all four settings and reloads the saved values on reopen', async () => {
++it('saves the total switch and schedule and reloads their values on reopen', async () => {
 +  let saved = { ...defaultSettings }
 +  const get = vi
 +    .spyOn(api, 'get')
@@ -2300,11 +2476,13 @@ index 00000000..fe75eded
 +    target: { value: '17' },
 +  })
 +  await userEvent.click(screen.getByRole('switch', { name: 'Stop on failure' }))
++  await userEvent.click(screen.getByRole('switch', { name: 'Enable checks' }))
 +  await userEvent.click(screen.getByRole('button', { name: 'Save' }))
 +  await waitFor(() =>
 +    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
 +  )
 +  expect(put).toHaveBeenCalledWith('/api/channel/astra_iq/settings', {
++    enabled: false,
 +    start_time: '22:00',
 +    end_time: '06:30',
 +    interval_minutes: 17,
@@ -2317,7 +2495,12 @@ index 00000000..fe75eded
 +  expect(await screen.findByLabelText('Check start time')).toHaveValue('22:00')
 +  expect(screen.getByLabelText('End Time')).toHaveValue('06:30')
 +  expect(screen.getByLabelText('Interval (minutes)')).toHaveValue(17)
-+  expect(screen.getByRole('switch')).not.toBeChecked()
++  expect(
++    screen.getByRole('switch', { name: 'Stop on failure' })
++  ).not.toBeChecked()
++  expect(
++    screen.getByRole('switch', { name: 'Enable checks' })
++  ).not.toBeChecked()
 +  expect(get).toHaveBeenCalledTimes(2)
 +})
 +
@@ -2393,17 +2576,93 @@ index 00000000..fe75eded
 +  await openSettings()
 +  expect(await screen.findByLabelText('Interval (minutes)')).toBeDisabled()
 +  expect(screen.getByLabelText('Check start time')).toBeDisabled()
-+  expect(screen.getByRole('switch')).toHaveAttribute('aria-disabled', 'true')
-+  await userEvent.click(screen.getByRole('switch'))
-+  expect(screen.getByRole('switch')).toBeChecked()
++  expect(
++    screen.getByRole('switch', { name: 'Stop on failure' })
++  ).toHaveAttribute('aria-disabled', 'true')
++  await userEvent.click(screen.getByRole('switch', { name: 'Stop on failure' }))
++  expect(screen.getByRole('switch', { name: 'Stop on failure' })).toBeChecked()
 +  expect(screen.queryByRole('button', { name: 'Save' })).not.toBeInTheDocument()
++})
++
++it.each([true, false])(
++  'shows saved error details or an honest legacy fallback (saved=%s)',
++  async (saved) => {
++    vi.spyOn(api, 'get').mockResolvedValue({
++      data: {
++        success: true,
++        data: {
++          ...detail,
++          sample: {
++            status: 'error',
++            checked_at: 100,
++            detail: 'request_failed',
++            attempts: [
++              {
++                key_index: 1,
++                status: 'error',
++                detail: 'request_failed',
++                latency_ms: 1700,
++                http_status: 200,
++                ...(saved
++                  ? {
++                      error_message: 'The usage limit has been reached.',
++                      error_code: 'usage_limit_reached',
++                      error_type: 'rate_limit_error',
++                    }
++                  : {}),
++              },
++            ],
++          },
++        },
++      },
++    })
++    renderStatus()
++    await userEvent.click(
++      screen.getByRole('button', { name: /Astra IQ wrong answer/ })
++    )
++    const alert = await screen.findByRole('alert')
++    expect(alert).toHaveTextContent('HTTP 200')
++    if (saved) {
++      expect(alert).toHaveTextContent('The usage limit has been reached.')
++      expect(alert).toHaveTextContent('usage_limit_reached')
++      expect(alert).toHaveTextContent('rate_limit_error')
++    } else {
++      expect(alert).toHaveTextContent(
++        'This older check has no saved error details.'
++      )
++    }
++  }
++)
++
++it('leaves skipped intervals blank and hides the timeline when checks are off', async () => {
++  const client = renderStatus()
++  const timeline = screen.getByRole('group')
++  const buttons = within(timeline).getAllByRole('button')
++  // The records at 100 and 200 seconds leave the 120–179 interval empty.
++  expect(buttons[0].nextElementSibling?.tagName).toBe('SPAN')
++  expect(buttons[0].nextElementSibling?.nextElementSibling).toBe(buttons[1])
++  await act(async () =>
++    client.setQueryData(['channels', 'astra-iq'], {
++      ...statusData,
++      enabled: false,
++    })
++  )
++  await waitFor(() =>
++    expect(screen.queryByRole('group')).not.toBeInTheDocument()
++  )
++  await act(async () =>
++    client.setQueryData(['channels', 'astra-iq'], statusData)
++  )
++  expect(
++    within(await screen.findByRole('group')).getAllByRole('button')
++  ).toHaveLength(2)
 +})
 diff --git a/web/src/features/channels/components/astra-iq-settings.tsx b/web/src/features/channels/components/astra-iq-settings.tsx
 new file mode 100644
-index 00000000..f98530ba
+index 00000000..cd540101
 --- /dev/null
 +++ b/web/src/features/channels/components/astra-iq-settings.tsx
-@@ -0,0 +1,289 @@
+@@ -0,0 +1,316 @@
 +/*
 +Copyright (C) 2023-2026 QuantumNous
 +
@@ -2463,6 +2722,7 @@ index 00000000..f98530ba
 +  .string()
 +  .regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Use HH:mm for check times')
 +const settingsSchema = z.object({
++  enabled: z.boolean(),
 +  start_time: timeSchema,
 +  end_time: timeSchema,
 +  interval_minutes: z
@@ -2612,6 +2872,32 @@ index 00000000..f98530ba
 +        className='space-y-5'
 +        onSubmit={form.handleSubmit(props.onSave)}
 +      >
++        <FormField
++          control={form.control}
++          name='enabled'
++          render={({ field }) => (
++            <FormItem className='flex items-center justify-between gap-4 rounded-lg border p-3'>
++              <div className='space-y-1'>
++                <FormLabel>{t('Enable checks')}</FormLabel>
++                <FormDescription>
++                  {t(
++                    'When off, checks stop and results do not block calls. History is kept.'
++                  )}
++                </FormDescription>
++              </div>
++              <FormControl>
++                <Switch
++                  name={field.name}
++                  checked={field.value}
++                  onCheckedChange={field.onChange}
++                  onBlur={field.onBlur}
++                  ref={field.ref}
++                  disabled={props.disabled}
++                />
++              </FormControl>
++            </FormItem>
++          )}
++        />
 +        <div className='grid grid-cols-2 gap-4'>
 +          {(['start_time', 'end_time'] as const).map((name) => (
 +            <FormField
@@ -2695,10 +2981,10 @@ index 00000000..f98530ba
 +}
 diff --git a/web/src/features/channels/components/astra-iq-status.tsx b/web/src/features/channels/components/astra-iq-status.tsx
 new file mode 100644
-index 00000000..e7a30fcb
+index 00000000..0fa19ed0
 --- /dev/null
 +++ b/web/src/features/channels/components/astra-iq-status.tsx
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,143 @@
 +/*
 +Copyright (C) 2023-2026 QuantumNous
 +
@@ -2734,6 +3020,7 @@ index 00000000..e7a30fcb
 +
 +import {
 +  astraIQStatusLabel,
++  astraIQTimeline,
 +  type AstraIQStatusData,
 +  type IQSample,
 +} from '../lib/astra-iq'
@@ -2770,10 +3057,11 @@ index 00000000..e7a30fcb
 +  if (query.data?.enabled === false) return null
 +  const result = query.data?.results[String(props.channelId)]
 +  const history = query.isError ? [] : (result?.history?.slice(-24) ?? [])
-+  const samples: (IQSample | null)[] = [
-+    ...Array<null>(24 - history.length).fill(null),
-+    ...history,
-+  ]
++  const samples = astraIQTimeline(
++    history,
++    query.data?.interval_minutes ?? 5,
++    query.data?.server_time ?? Date.now() / 1000
++  )
 +  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
 +  let state = t(astraIQStatusLabel(result?.status ?? 'pending'))
 +  if (props.channelEnabled === false) state = t('Astra IQ disabled channel')
@@ -2784,6 +3072,7 @@ index 00000000..e7a30fcb
 +      <div
 +        className='flex h-5 min-w-0 flex-1 items-center gap-0.5'
 +        role='group'
++        data-slot='astra-iq-timeline'
 +        aria-label={`${t('Astra IQ')}: ${state}`}
 +      >
 +        {samples.map((sample, index) => {
@@ -2792,7 +3081,7 @@ index 00000000..e7a30fcb
 +              <span
 +                key={`empty-${24 - index}`}
 +                aria-hidden='true'
-+                className='bg-muted-foreground/12 h-3.5 min-w-0 flex-1 rounded-[3px] ring-1 ring-black/3 ring-inset dark:ring-white/4'
++                className='h-3.5 min-w-0 flex-1'
 +              />
 +            )
 +          }
@@ -2840,7 +3129,7 @@ index 00000000..e7a30fcb
 +  )
 +}
 diff --git a/web/src/features/channels/components/channel-card.tsx b/web/src/features/channels/components/channel-card.tsx
-index 3f0b3d4c..be9f3235 100644
+index 3f0b3d4c..23cdae6f 100644
 --- a/web/src/features/channels/components/channel-card.tsx
 +++ b/web/src/features/channels/components/channel-card.tsx
 @@ -22,10 +22,12 @@ import { useTranslation } from 'react-i18next'
@@ -2910,13 +3199,13 @@ index 3f0b3d4c..be9f3235 100644
 -        {/* Groups retain their compact, full-width footer. */}
 -        <div className='min-w-0'>
 +        {/* Checks share the group row without adding to the card height. */}
-+        <div className='mt-auto flex min-w-0 items-center gap-3'>
++        <div className='group/channel-footer mt-auto flex min-w-0 items-center gap-3'>
            {groups.length > 0 ? (
 -            <div className='-ml-1.5 flex min-w-0 flex-wrap gap-1'>
 +            <div
 +              className={cn(
 +                '-ml-1.5 flex min-w-0 flex-wrap gap-1',
-+                showAstraIQ && 'max-w-2/5 flex-nowrap'
++                'group-has-data-[slot=astra-iq-timeline]/channel-footer:max-w-2/5 group-has-data-[slot=astra-iq-timeline]/channel-footer:flex-nowrap'
 +              )}
 +            >
                {groups.map((g) => (
@@ -2950,10 +3239,10 @@ index 2d28e45c..a2bab719 100644
          collapsibleOnMobile: true,
 diff --git a/web/src/features/channels/components/dialogs/astra-iq-detail-dialog.tsx b/web/src/features/channels/components/dialogs/astra-iq-detail-dialog.tsx
 new file mode 100644
-index 00000000..7331bcfd
+index 00000000..2f848dcc
 --- /dev/null
 +++ b/web/src/features/channels/components/dialogs/astra-iq-detail-dialog.tsx
-@@ -0,0 +1,362 @@
+@@ -0,0 +1,425 @@
 +/*
 +Copyright (C) 2023-2026 QuantumNous
 +
@@ -2980,6 +3269,7 @@ index 00000000..7331bcfd
 +import { Dialog } from '@/components/dialog'
 +import { ErrorState } from '@/components/error-state'
 +import { LoadingState } from '@/components/loading-state'
++import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 +import { Button } from '@/components/ui/button'
 +import { toIntlLocale } from '@/i18n/languages'
 +import {
@@ -2997,7 +3287,11 @@ index 00000000..7331bcfd
 +import { cn } from '@/lib/utils'
 +import { useAuthStore } from '@/stores/auth-store'
 +
-+import { astraIQStatusLabel, type IQSample } from '../../lib/astra-iq'
++import {
++  astraIQStatusLabel,
++  type IQAttempt,
++  type IQSample,
++} from '../../lib/astra-iq'
 +
 +export type IQCheckDetail = {
 +  sample: IQSample
@@ -3008,6 +3302,70 @@ index 00000000..7331bcfd
 +}
 +
 +type Props = { channelId: number; sample: IQSample; onClose: () => void }
++
++function CheckFailure(props: {
++  attempt: Partial<IQAttempt>
++  expected: string
++}) {
++  const { t } = useTranslation()
++  const attempt = props.attempt
++  if (attempt.status !== 'fail' && attempt.status !== 'error') return null
++  let message = attempt.error_message
++  if (attempt.status === 'fail') {
++    message = t('Expected {{expected}}, received {{actual}}.', {
++      expected: props.expected,
++      actual: attempt.response || '—',
++    })
++  } else if (!message) {
++    const reasons: Record<string, string> = {
++      timeout: t('The check exceeded its time limit.'),
++      official_client_rejected: t(
++        'Upstream rejected the official Codex client.'
++      ),
++      official_client_unavailable: t(
++        'The official Codex client could not be started.'
++      ),
++      official_client_failed: t(
++        'The official Codex client did not send a request.'
++      ),
++      official_client_incomplete: t(
++        'The official Codex client did not receive a complete response.'
++      ),
++      empty_answer: t('The upstream response contained no final answer.'),
++      incomplete_response: t('The upstream response ended before completion.'),
++      no_enabled_keys: t('This channel has no enabled keys.'),
++    }
++    message =
++      reasons[attempt.detail || ''] ||
++      t('The request failed. This older check has no saved error details.')
++  }
++  return (
++    <Alert variant='destructive' className='space-y-2 p-4'>
++      <AlertTitle>{t('Failure reason')}</AlertTitle>
++      <AlertDescription className='space-y-2'>
++        <p className='break-words whitespace-pre-wrap'>{message}</p>
++        <div className='flex flex-wrap gap-x-4 gap-y-1 font-mono text-xs break-all'>
++          {attempt.http_status ? <span>HTTP {attempt.http_status}</span> : null}
++          {attempt.error_code && (
++            <span>
++              {t('Error code')}: {attempt.error_code}
++            </span>
++          )}
++          {attempt.error_type && (
++            <span>
++              {t('Error type')}: {attempt.error_type}
++            </span>
++          )}
++          {!attempt.error_code && attempt.detail && (
++            <span>
++              {t('Error code')}: {attempt.detail}
++            </span>
++          )}
++        </div>
++      </AlertDescription>
++    </Alert>
++  )
++}
 +
 +export function AstraIQDetailDialog(props: Props) {
 +  const { t, i18n } = useTranslation()
@@ -3192,6 +3550,19 @@ index 00000000..7331bcfd
 +                )}
 +              </div>
 +            </div>
++            <CheckFailure
++              attempt={
++                attempts.find(
++                  (attempt) =>
++                    attempt.status === 'fail' || attempt.status === 'error'
++                ) || {
++                  status: sample.status,
++                  detail: sample.detail,
++                  response: sample.answer,
++                }
++              }
++              expected={detail.expected_answer}
++            />
 +            <section className='space-y-2.5'>
 +              <div className='flex flex-wrap items-center justify-between gap-2'>
 +                <h3 className='text-sm font-medium'>
@@ -3249,25 +3620,6 @@ index 00000000..7331bcfd
 +                  ) : (
 +                    <p className='text-muted-foreground text-sm'>
 +                      {t('No completed model response')}
-+                    </p>
-+                  )}
-+                  {attempt.detail && (
-+                    <p className='text-muted-foreground text-xs'>
-+                      {t(astraIQStatusLabel(attempt.status))}
-+                      {attempt.http_status
-+                        ? ` · HTTP ${attempt.http_status}`
-+                        : ''}
-+                      {attempt.detail === 'timeout'
-+                        ? ` · ${t('Request timeout')}`
-+                        : ''}
-+                      {attempt.detail === 'official_client_rejected'
-+                        ? ` · ${t('Upstream rejected the official Codex client.')}`
-+                        : ''}
-+                      {attempt.detail === 'official_client_unavailable' ||
-+                      attempt.detail === 'official_client_failed' ||
-+                      attempt.detail === 'official_client_incomplete'
-+                        ? ` · ${t('Official Codex client did not complete this check.')}`
-+                        : ''}
 +                    </p>
 +                  )}
 +                </div>
@@ -3342,10 +3694,10 @@ index a34d037f..25df9888 100644
          <SectionPageLayout.Actions>
 diff --git a/web/src/features/channels/lib/astra-iq.ts b/web/src/features/channels/lib/astra-iq.ts
 new file mode 100644
-index 00000000..ade3f5f6
+index 00000000..f2c0543c
 --- /dev/null
 +++ b/web/src/features/channels/lib/astra-iq.ts
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,94 @@
 +/*
 +Copyright (C) 2023-2026 QuantumNous
 +
@@ -3369,6 +3721,9 @@ index 00000000..ade3f5f6
 +  status: string
 +  response?: string
 +  detail?: string
++  error_message?: string
++  error_code?: string
++  error_type?: string
 +  latency_ms: number
 +  first_token_ms: number | null
 +  prompt_tokens: number | null
@@ -3378,6 +3733,7 @@ index 00000000..ade3f5f6
 +export type IQSample = {
 +  status: string
 +  checked_at: number
++  started_at?: number
 +  answer?: string
 +  detail?: string
 +  latency_ms?: number
@@ -3387,6 +3743,8 @@ index 00000000..ade3f5f6
 +}
 +export type AstraIQStatusData = {
 +  enabled: boolean
++  interval_minutes?: number
++  server_time?: number
 +  results: Record<
 +    string,
 +    {
@@ -3401,6 +3759,32 @@ index 00000000..ade3f5f6
 +  >
 +}
 +
++// Keep real time gaps, including pauses and deleted results. A slow check
++// belongs to the interval when it started, not the later completion interval.
++export function astraIQTimeline(
++  history: IQSample[],
++  intervalMinutes: number,
++  now: number
++): (IQSample | null)[] {
++  const interval = Math.max(1, intervalMinutes) * 60
++  const firstSlot = Math.floor(now / interval) - 23
++  const slots = Array<IQSample | null>(24).fill(null)
++  for (const sample of history) {
++    const started =
++      sample.started_at ||
++      sample.checked_at - Math.floor((sample.latency_ms || 0) / 1000)
++    const index = Math.floor(started / interval) - firstSlot
++    if (
++      index >= 0 &&
++      index < slots.length &&
++      (!slots[index] || sample.checked_at > slots[index].checked_at)
++    ) {
++      slots[index] = sample
++    }
++  }
++  return slots
++}
++
 +export function astraIQStatusLabel(status: string) {
 +  if (status === 'pass') return 'Astra IQ passed'
 +  if (status === 'fail') return 'Astra IQ wrong answer'
@@ -3409,7 +3793,7 @@ index 00000000..ade3f5f6
 +  return 'Astra IQ pending'
 +}
 diff --git a/web/src/i18n/locales/en.json b/web/src/i18n/locales/en.json
-index 8ce9da22..a9ab4907 100644
+index 8ce9da22..52c81bc1 100644
 --- a/web/src/i18n/locales/en.json
 +++ b/web/src/i18n/locales/en.json
 @@ -2618,7 +2618,7 @@
@@ -3421,7 +3805,7 @@ index 8ce9da22..a9ab4907 100644
      "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.",
      "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment",
      "For private deployments, format: https://fastgpt.run/api/openapi": "For private deployments, format: https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,51 @@
+@@ -6777,6 +6777,64 @@
      "Zhipu": "Zhipu",
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V4",
@@ -3471,11 +3855,24 @@ index 8ce9da22..a9ab4907 100644
 +    "Check interval must be an integer from 1 to 1440": "Check interval must be an integer from 1 to 1440",
 +    "Invalid check settings": "Invalid check settings",
 +    "This permanently deletes this check. If it is the latest result, calls are allowed until the next check.": "This permanently deletes this check. If it is the latest result, calls are allowed until the next check.",
-+    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "This permanently deletes all check results for this channel. Calls are allowed until the next check."
++    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "This permanently deletes all check results for this channel. Calls are allowed until the next check.",
++    "Enable checks": "Enable checks",
++    "When off, checks stop and results do not block calls. History is kept.": "When off, checks stop and results do not block calls. History is kept.",
++    "Expected {{expected}}, received {{actual}}.": "Expected {{expected}}, received {{actual}}.",
++    "Error code": "Error code",
++    "Error type": "Error type",
++    "The check exceeded its time limit.": "The check exceeded its time limit.",
++    "The official Codex client could not be started.": "The official Codex client could not be started.",
++    "The official Codex client did not send a request.": "The official Codex client did not send a request.",
++    "The official Codex client did not receive a complete response.": "The official Codex client did not receive a complete response.",
++    "The upstream response contained no final answer.": "The upstream response contained no final answer.",
++    "The upstream response ended before completion.": "The upstream response ended before completion.",
++    "This channel has no enabled keys.": "This channel has no enabled keys.",
++    "The request failed. This older check has no saved error details.": "The request failed. This older check has no saved error details."
    }
  }
 diff --git a/web/src/i18n/locales/fr.json b/web/src/i18n/locales/fr.json
-index a239f206..8d375326 100644
+index a239f206..bbbaaa21 100644
 --- a/web/src/i18n/locales/fr.json
 +++ b/web/src/i18n/locales/fr.json
 @@ -2618,7 +2618,7 @@
@@ -3487,7 +3884,7 @@ index a239f206..8d375326 100644
      "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "Pour les canaux personnalisés avancés, ceci ne s’applique qu’aux routes /v1/responses sans conversion de protocole.",
      "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "Pour les canaux ajoutés après le 10 mai 2025, pas besoin de supprimer \".\" des noms de modèles lors du déploiement",
      "For private deployments, format: https://fastgpt.run/api/openapi": "Pour les déploiements privés, format : https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,51 @@
+@@ -6777,6 +6777,64 @@
      "Zhipu": "Zhipu",
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V4",
@@ -3537,11 +3934,24 @@ index a239f206..8d375326 100644
 +    "Check interval must be an integer from 1 to 1440": "L’intervalle doit être un entier entre 1 et 1440",
 +    "Invalid check settings": "Réglages des tests invalides",
 +    "This permanently deletes this check. If it is the latest result, calls are allowed until the next check.": "Ce résultat sera supprimé définitivement. Si c’est le plus récent, les appels seront autorisés jusqu’au prochain test.",
-+    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "Tous les résultats de ce canal seront supprimés définitivement. Les appels seront autorisés jusqu’au prochain test."
++    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "Tous les résultats de ce canal seront supprimés définitivement. Les appels seront autorisés jusqu’au prochain test.",
++    "Enable checks": "Activer les tests",
++    "When off, checks stop and results do not block calls. History is kept.": "Désactivé : les tests cessent et les résultats ne bloquent plus les appels. L’historique est conservé.",
++    "Expected {{expected}}, received {{actual}}.": "Réponse attendue : {{expected}}, reçue : {{actual}}.",
++    "Error code": "Code d’erreur",
++    "Error type": "Type d’erreur",
++    "The check exceeded its time limit.": "Le test a dépassé le délai.",
++    "The official Codex client could not be started.": "Impossible de démarrer le client officiel Codex.",
++    "The official Codex client did not send a request.": "Le client officiel Codex n’a envoyé aucune requête.",
++    "The official Codex client did not receive a complete response.": "Le client officiel Codex n’a pas reçu de réponse complète.",
++    "The upstream response contained no final answer.": "La réponse amont ne contient pas de réponse finale.",
++    "The upstream response ended before completion.": "La réponse amont s’est interrompue avant la fin.",
++    "This channel has no enabled keys.": "Ce canal n’a aucune clé activée.",
++    "The request failed. This older check has no saved error details.": "La requête a échoué. Aucun détail d’erreur n’a été enregistré pour cet ancien test."
    }
  }
 diff --git a/web/src/i18n/locales/ja.json b/web/src/i18n/locales/ja.json
-index e3e09261..43685dc6 100644
+index e3e09261..bdf0b470 100644
 --- a/web/src/i18n/locales/ja.json
 +++ b/web/src/i18n/locales/ja.json
 @@ -2618,7 +2618,7 @@
@@ -3553,7 +3963,7 @@ index e3e09261..43685dc6 100644
      "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "高度なカスタムチャネルでは、プロトコル変換を行わない /v1/responses ルートにのみ適用されます。",
      "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "2025 年 5 月 10 日以降に追加されたチャネルの場合、デプロイ時にモデル名から「.」を削除する必要はありません",
      "For private deployments, format: https://fastgpt.run/api/openapi": "プライベートデプロイメントの場合、形式: https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,51 @@
+@@ -6777,6 +6777,64 @@
      "Zhipu": "Zhipu",
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V 4",
@@ -3603,11 +4013,24 @@ index e3e09261..43685dc6 100644
 +    "Check interval must be an integer from 1 to 1440": "間隔は 1～1440 の整数で入力してください",
 +    "Invalid check settings": "検査設定が無効です",
 +    "This permanently deletes this check. If it is the latest result, calls are allowed until the next check.": "この検査結果を完全に削除します。最新の結果の場合、次の検査まで呼び出しを許可します。",
-+    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "このチャネルの全検査結果を完全に削除します。次の検査まで呼び出しを許可します。"
++    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "このチャネルの全検査結果を完全に削除します。次の検査まで呼び出しを許可します。",
++    "Enable checks": "検査を有効化",
++    "When off, checks stop and results do not block calls. History is kept.": "オフにすると検査を停止し、結果による呼び出し制限を解除します。履歴は保持します。",
++    "Expected {{expected}}, received {{actual}}.": "期待する答えは {{expected}}、実際の答えは {{actual}} です。",
++    "Error code": "エラーコード",
++    "Error type": "エラー種別",
++    "The check exceeded its time limit.": "検査の制限時間を超えました。",
++    "The official Codex client could not be started.": "Codex 公式クライアントを起動できませんでした。",
++    "The official Codex client did not send a request.": "Codex 公式クライアントがリクエストを送信しませんでした。",
++    "The official Codex client did not receive a complete response.": "Codex 公式クライアントが完全な応答を受信できませんでした。",
++    "The upstream response contained no final answer.": "上流の応答に最終回答がありません。",
++    "The upstream response ended before completion.": "上流の応答が完了前に終了しました。",
++    "This channel has no enabled keys.": "このチャネルに有効なキーがありません。",
++    "The request failed. This older check has no saved error details.": "リクエストに失敗しました。この古い検査にはエラー詳細が保存されていません。"
    }
  }
 diff --git a/web/src/i18n/locales/ru.json b/web/src/i18n/locales/ru.json
-index af18b036..832d18a9 100644
+index af18b036..3dee51ea 100644
 --- a/web/src/i18n/locales/ru.json
 +++ b/web/src/i18n/locales/ru.json
 @@ -2618,7 +2618,7 @@
@@ -3619,7 +4042,7 @@ index af18b036..832d18a9 100644
      "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "Для расширенных пользовательских каналов это действует только для маршрутов /v1/responses без преобразования протокола.",
      "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "Для каналов, добавленных после 10 мая 2025 г., не нужно удалять \".\" из имён моделей при развёртывании",
      "For private deployments, format: https://fastgpt.run/api/openapi": "Для частных развертываний, формат: https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,51 @@
+@@ -6777,6 +6777,64 @@
      "Zhipu": "Zhipu",
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V4",
@@ -3669,11 +4092,24 @@ index af18b036..832d18a9 100644
 +    "Check interval must be an integer from 1 to 1440": "Интервал должен быть целым числом от 1 до 1440",
 +    "Invalid check settings": "Неверные настройки проверок",
 +    "This permanently deletes this check. If it is the latest result, calls are allowed until the next check.": "Этот результат будет удалён навсегда. Если он последний, вызовы будут разрешены до следующей проверки.",
-+    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "Все результаты этого канала будут удалены навсегда. Вызовы будут разрешены до следующей проверки."
++    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "Все результаты этого канала будут удалены навсегда. Вызовы будут разрешены до следующей проверки.",
++    "Enable checks": "Включить проверки",
++    "When off, checks stop and results do not block calls. History is kept.": "При отключении проверки прекращаются, результаты не блокируют вызовы. История сохраняется.",
++    "Expected {{expected}}, received {{actual}}.": "Ожидалось {{expected}}, получено {{actual}}.",
++    "Error code": "Код ошибки",
++    "Error type": "Тип ошибки",
++    "The check exceeded its time limit.": "Время проверки истекло.",
++    "The official Codex client could not be started.": "Не удалось запустить официальный клиент Codex.",
++    "The official Codex client did not send a request.": "Официальный клиент Codex не отправил запрос.",
++    "The official Codex client did not receive a complete response.": "Официальный клиент Codex не получил полный ответ.",
++    "The upstream response contained no final answer.": "Ответ сервера не содержит итогового ответа.",
++    "The upstream response ended before completion.": "Ответ сервера оборвался до завершения.",
++    "This channel has no enabled keys.": "У этого канала нет включённых ключей.",
++    "The request failed. This older check has no saved error details.": "Запрос не выполнен. Для этой старой проверки подробности ошибки не сохранены."
    }
  }
 diff --git a/web/src/i18n/locales/vi.json b/web/src/i18n/locales/vi.json
-index c7d3e719..0ef4802b 100644
+index c7d3e719..90c92276 100644
 --- a/web/src/i18n/locales/vi.json
 +++ b/web/src/i18n/locales/vi.json
 @@ -2618,7 +2618,7 @@
@@ -3685,7 +4121,7 @@ index c7d3e719..0ef4802b 100644
      "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "Với kênh tùy chỉnh nâng cao, thiết lập này chỉ áp dụng cho các route /v1/responses không chuyển đổi giao thức.",
      "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "Đối với các kênh được thêm sau ngày 10 tháng 5 năm 2025, không cần loại bỏ \".\" khỏi tên mô hình trong quá trình triển khai",
      "For private deployments, format: https://fastgpt.run/api/openapi": "Đối với các triển khai riêng tư, định dạng: https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,51 @@
+@@ -6777,6 +6777,64 @@
      "Zhipu": "Zhipu",
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V4",
@@ -3735,11 +4171,24 @@ index c7d3e719..0ef4802b 100644
 +    "Check interval must be an integer from 1 to 1440": "Khoảng cách phải là số nguyên từ 1 đến 1440",
 +    "Invalid check settings": "Cài đặt kiểm tra không hợp lệ",
 +    "This permanently deletes this check. If it is the latest result, calls are allowed until the next check.": "Xóa vĩnh viễn kết quả này. Nếu là kết quả mới nhất, cho phép gọi đến lần kiểm tra tiếp theo.",
-+    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "Xóa vĩnh viễn mọi kết quả của kênh này. Cho phép gọi đến lần kiểm tra tiếp theo."
++    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "Xóa vĩnh viễn mọi kết quả của kênh này. Cho phép gọi đến lần kiểm tra tiếp theo.",
++    "Enable checks": "Bật kiểm tra",
++    "When off, checks stop and results do not block calls. History is kept.": "Khi tắt, dừng kiểm tra và kết quả không chặn lệnh gọi. Giữ lại lịch sử.",
++    "Expected {{expected}}, received {{actual}}.": "Đáp án dự kiến {{expected}}, nhận được {{actual}}.",
++    "Error code": "Mã lỗi",
++    "Error type": "Loại lỗi",
++    "The check exceeded its time limit.": "Kiểm tra vượt quá thời hạn.",
++    "The official Codex client could not be started.": "Không khởi động được ứng dụng Codex chính thức.",
++    "The official Codex client did not send a request.": "Ứng dụng Codex chính thức chưa gửi yêu cầu.",
++    "The official Codex client did not receive a complete response.": "Ứng dụng Codex chính thức chưa nhận phản hồi đầy đủ.",
++    "The upstream response contained no final answer.": "Phản hồi từ nguồn không có đáp án cuối cùng.",
++    "The upstream response ended before completion.": "Phản hồi từ nguồn kết thúc trước khi hoàn tất.",
++    "This channel has no enabled keys.": "Kênh này không có khóa đang bật.",
++    "The request failed. This older check has no saved error details.": "Yêu cầu thất bại. Lần kiểm tra cũ này không lưu chi tiết lỗi."
    }
  }
 diff --git a/web/src/i18n/locales/zh-TW.json b/web/src/i18n/locales/zh-TW.json
-index 3eca7eea..70ea76f1 100644
+index 3eca7eea..b6844bef 100644
 --- a/web/src/i18n/locales/zh-TW.json
 +++ b/web/src/i18n/locales/zh-TW.json
 @@ -2618,7 +2618,7 @@
@@ -3751,7 +4200,7 @@ index 3eca7eea..70ea76f1 100644
      "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "進階自訂渠道僅對 /v1/responses 且不做協定轉換的路由生效。",
      "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "對於 2025 年 5 月 10 日之後新增的渠道，在部署時無需從模型名稱中移除 \".\"",
      "For private deployments, format: https://fastgpt.run/api/openapi": "對於私有部署，格式為：https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,51 @@
+@@ -6777,6 +6777,64 @@
      "Zhipu": "智譜",
      "Zhipu GLM": "智譜GLM",
      "Zhipu V4": "智譜 V4",
@@ -3801,11 +4250,24 @@ index 3eca7eea..70ea76f1 100644
 +    "Check interval must be an integer from 1 to 1440": "間隔須為 1～1440 的整數",
 +    "Invalid check settings": "檢測設定無效",
 +    "This permanently deletes this check. If it is the latest result, calls are allowed until the next check.": "此次檢測結果將被永久刪除。如果這是最新結果，下次檢測前允許呼叫。",
-+    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "此渠道的全部檢測結果將被永久刪除，下次檢測前允許呼叫。"
++    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "此渠道的全部檢測結果將被永久刪除，下次檢測前允許呼叫。",
++    "Enable checks": "啟用檢測",
++    "When off, checks stop and results do not block calls. History is kept.": "關閉後停止檢測，檢測結果不再限制呼叫，保留歷史記錄。",
++    "Expected {{expected}}, received {{actual}}.": "預期答案為 {{expected}}，實際返回 {{actual}}。",
++    "Error code": "錯誤碼",
++    "Error type": "錯誤類型",
++    "The check exceeded its time limit.": "檢測超過時限。",
++    "The official Codex client could not be started.": "無法啟動 Codex 官方用戶端。",
++    "The official Codex client did not send a request.": "Codex 官方用戶端未發出請求。",
++    "The official Codex client did not receive a complete response.": "Codex 官方用戶端未收到完整回應。",
++    "The upstream response contained no final answer.": "上游回應中沒有最終答案。",
++    "The upstream response ended before completion.": "上游回應未完成就已結束。",
++    "This channel has no enabled keys.": "此渠道沒有已啟用的金鑰。",
++    "The request failed. This older check has no saved error details.": "請求失敗。這條舊記錄未儲存具體錯誤詳情。"
    }
  }
 diff --git a/web/src/i18n/locales/zh.json b/web/src/i18n/locales/zh.json
-index 23de155c..eec37c0f 100644
+index 23de155c..33cde2e8 100644
 --- a/web/src/i18n/locales/zh.json
 +++ b/web/src/i18n/locales/zh.json
 @@ -2618,7 +2618,7 @@
@@ -3817,7 +4279,7 @@ index 23de155c..eec37c0f 100644
      "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "高级自定义渠道仅对 /v1/responses 且不做协议转换的路由生效。",
      "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "对于 2025 年 5 月 10 日之后添加的渠道，在部署时无需从模型名称中移除 \".\"",
      "For private deployments, format: https://fastgpt.run/api/openapi": "对于私有部署，格式为：https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,51 @@
+@@ -6777,6 +6777,64 @@
      "Zhipu": "智谱",
      "Zhipu GLM": "智谱GLM",
      "Zhipu V4": "智谱 V4",
@@ -3867,6 +4329,19 @@ index 23de155c..eec37c0f 100644
 +    "Check interval must be an integer from 1 to 1440": "间隔须为 1～1440 的整数",
 +    "Invalid check settings": "检测设置无效",
 +    "This permanently deletes this check. If it is the latest result, calls are allowed until the next check.": "此次检测结果将被永久删除。如果这是最新结果，下次检测前允许调用。",
-+    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "此渠道的全部检测结果将被永久删除，下次检测前允许调用。"
++    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "此渠道的全部检测结果将被永久删除，下次检测前允许调用。",
++    "Enable checks": "启用检测",
++    "When off, checks stop and results do not block calls. History is kept.": "关闭后停止检测，检测结果不再限制调用，保留历史记录。",
++    "Expected {{expected}}, received {{actual}}.": "预期答案为 {{expected}}，实际返回 {{actual}}。",
++    "Error code": "错误码",
++    "Error type": "错误类型",
++    "The check exceeded its time limit.": "检测超过时限。",
++    "The official Codex client could not be started.": "无法启动 Codex 官方客户端。",
++    "The official Codex client did not send a request.": "Codex 官方客户端未发出请求。",
++    "The official Codex client did not receive a complete response.": "Codex 官方客户端未收到完整响应。",
++    "The upstream response contained no final answer.": "上游响应中没有最终答案。",
++    "The upstream response ended before completion.": "上游响应未完成就已结束。",
++    "This channel has no enabled keys.": "此渠道没有已启用的密钥。",
++    "The request failed. This older check has no saved error details.": "请求失败。这条旧记录未保存具体错误详情。"
    }
  }
