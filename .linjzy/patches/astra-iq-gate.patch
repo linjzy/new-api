@@ -381,16 +381,17 @@ index 00000000..861b0329
 +}
 diff --git a/controller/astra_iq_codex.go b/controller/astra_iq_codex.go
 new file mode 100644
-index 00000000..bf197726
+index 00000000..cbe99ab7
 --- /dev/null
 +++ b/controller/astra_iq_codex.go
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,166 @@
 +package controller
 +
 +import (
 +	"bufio"
 +	"context"
 +	"crypto/rand"
++	"crypto/subtle"
 +	"errors"
 +	"fmt"
 +	"io"
@@ -433,30 +434,7 @@ index 00000000..bf197726
 +	}
 +	proxyKey := rand.Text()
 +	results := make(chan testResult, 1)
-+	var used atomic.Bool
-+	server := &http.Server{ReadHeaderTimeout: 5 * time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-+		if r.Method != http.MethodPost || r.URL.Path != "/v1/responses" || r.Header.Get("Authorization") != "Bearer "+proxyKey {
-+			http.Error(w, "invalid probe request", http.StatusForbidden)
-+			return
-+		}
-+		if !used.CompareAndSwap(false, true) {
-+			http.Error(w, "only one inference is allowed per check", http.StatusTooManyRequests)
-+			return
-+		}
-+		r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
-+		result := testChannelWithClientRequest(ctx, ch, userID, model.AstraIQModel, string(constant.EndpointTypeOpenAIResponse), true, astraIQQuestion, r)
-+		results <- result
-+		if result.localErr != nil || result.newAPIError != nil {
-+			status := result.iqAttempt.HTTPStatus
-+			if status < 400 {
-+				status = http.StatusBadGateway
-+			}
-+			http.Error(w, "channel probe failed", status)
-+			return
-+		}
-+		w.Header().Set("Content-Type", "text/event-stream")
-+		_, _ = w.Write(result.responseBody)
-+	})}
++	server := &http.Server{ReadHeaderTimeout: 5 * time.Second, Handler: astraIQProxyHandler(ctx, ch, userID, proxyKey, results)}
 +	defer server.Close()
 +	go func() { _ = server.Serve(listener) }()
 +	config := fmt.Sprintf(`model = "gpt-6-astra"
@@ -545,12 +523,40 @@ index 00000000..bf197726
 +	}
 +	return result
 +}
++
++// astraIQProxyHandler admits one authenticated Responses call for one channel.
++func astraIQProxyHandler(ctx context.Context, ch *model.Channel, userID int, proxyKey string, results chan<- testResult) http.Handler {
++	var used atomic.Bool
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Method != http.MethodPost || r.URL.Path != "/v1/responses" || subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+proxyKey)) != 1 {
++			http.Error(w, "invalid probe request", http.StatusForbidden)
++			return
++		}
++		if !used.CompareAndSwap(false, true) {
++			http.Error(w, "only one inference is allowed per check", http.StatusTooManyRequests)
++			return
++		}
++		r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
++		result := testChannelWithClientRequest(ctx, ch, userID, model.AstraIQModel, string(constant.EndpointTypeOpenAIResponse), true, astraIQQuestion, r)
++		results <- result
++		if result.localErr != nil || result.newAPIError != nil {
++			status := result.iqAttempt.HTTPStatus
++			if status < 400 {
++				status = http.StatusBadGateway
++			}
++			http.Error(w, "channel probe failed", status)
++			return
++		}
++		w.Header().Set("Content-Type", "text/event-stream")
++		_, _ = w.Write(result.responseBody)
++	})
++}
 diff --git a/controller/astra_iq_test.go b/controller/astra_iq_test.go
 new file mode 100644
-index 00000000..e8da3e5c
+index 00000000..51a79932
 --- /dev/null
 +++ b/controller/astra_iq_test.go
-@@ -0,0 +1,285 @@
+@@ -0,0 +1,313 @@
 +package controller
 +
 +import (
@@ -806,6 +812,34 @@ index 00000000..e8da3e5c
 +	require.Len(t, result.Sample.Attempts, 1)
 +	assert.Equal(t, http.StatusForbidden, result.Sample.Attempts[0].HTTPStatus)
 +	assert.Empty(t, result.Sample.Attempts[0].Response)
++
++	// The local bridge never accepts an unauthenticated call or replays its
++	// one-time credential, including after the upstream denies the first call.
++	proxyResults := make(chan testResult, 1)
++	proxy := astraIQProxyHandler(context.Background(), ch, user.Id, "one-time-test-key", proxyResults)
++	for _, request := range []struct{ method, path, token string }{
++		{http.MethodPost, "/v1/responses", ""},
++		{http.MethodPost, "/v1/responses", "wrong-key"},
++		{http.MethodGet, "/v1/responses", "one-time-test-key"},
++		{http.MethodPost, "/v1/chat/completions", "one-time-test-key"},
++	} {
++		r := httptest.NewRequest(request.method, request.path, nil)
++		r.Header.Set("Authorization", "Bearer "+request.token)
++		w := httptest.NewRecorder()
++		proxy.ServeHTTP(w, r)
++		assert.Equal(t, http.StatusForbidden, w.Code)
++		assert.Empty(t, proxyResults)
++	}
++	for _, expectedStatus := range []int{http.StatusForbidden, http.StatusTooManyRequests} {
++		r := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-6-astra","input":[{"role":"user","content":"最少取出多少个糖果"}],"reasoning":{"effort":"medium"},"stream":true}`))
++		r.Header.Set("Authorization", "Bearer one-time-test-key")
++		r.Header.Set("User-Agent", "codex-test-boundary")
++		r.Header.Set("originator", "test-boundary")
++		w := httptest.NewRecorder()
++		proxy.ServeHTTP(w, r)
++		assert.Equal(t, expectedStatus, w.Code)
++	}
++	assert.Len(t, proxyResults, 1)
 +}
 +
 +func TestCustomAstraIQHistoryDetails(t *testing.T) {
