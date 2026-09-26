@@ -1,0 +1,1298 @@
+diff --git a/controller/astra_iq.go b/controller/astra_iq.go
+new file mode 100644
+index 00000000..3aee87d9
+--- /dev/null
++++ b/controller/astra_iq.go
+@@ -0,0 +1,297 @@
++package controller
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"regexp"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/QuantumNous/new-api/model"
++	"github.com/QuantumNous/new-api/relaykit/dto"
++	"github.com/gin-gonic/gin"
++	"github.com/samber/lo"
++	"github.com/tidwall/gjson"
++)
++
++const astraIQQuestion = `在一个黑色的袋子里放有三种口味的糖果，每种糖果有两种不同的形状（圆形和五角星形，不同的形状靠手感可以分辨）。现已知不同口味的糖和不同形状的数量统计如下表。参赛者需要在活动前决定摸出的糖果数目，那么，最少取出多少个糖果才能保证手中同时拥有不同形状的苹果味和桃子味的糖？（同时手中有圆形苹果味匹配五角星桃子味糖果，或者有圆形桃子味匹配五角星苹果味糖果都满足要求）
++苹果味 桃子味 西瓜味
++圆形 7 9 8
++五角星形 7 6 4
++
++请只输出最终答案的一个整数，不要输出解释、分析过程或其他内容。`
++
++var astraIQAnswerPattern = regexp.MustCompile(`^(?:(?:答案|最少|至少)(?:是|为)?[:：]?\s*)?21(?:\s*(?:个|颗)(?:糖果)?)?[。.!！]?$`)
++
++func setAstraIQPrompt(request dto.Request, prompt string) error {
++	switch r := request.(type) {
++	case *dto.GeneralOpenAIRequest:
++		r.ReasoningEffort = "medium"
++		r.Messages = []dto.Message{{Role: "user", Content: prompt}}
++		r.MaxTokens = nil
++		r.MaxCompletionTokens = lo.ToPtr(uint(2048))
++	case *dto.OpenAIResponsesRequest:
++		r.Reasoning = &dto.Reasoning{Effort: "medium"}
++		input, err := common.Marshal([]dto.Message{{Role: "user", Content: prompt}})
++		if err != nil {
++			return err
++		}
++		r.Input = input
++		r.MaxOutputTokens = lo.ToPtr(uint(2048))
++	default:
++		return errors.New("Astra IQ requires a chat or Responses endpoint")
++	}
++	return nil
++}
++
++// Apply after channel parameter overrides so a channel's high/low override
++// cannot silently change the benchmark. Ordinary requests never call this.
++func enforceAstraIQReasoning(body []byte) ([]byte, error) {
++	var request map[string]any
++	if err := common.Unmarshal(body, &request); err != nil {
++		return nil, err
++	}
++	if _, responses := request["input"]; responses {
++		reasoning, _ := request["reasoning"].(map[string]any)
++		if reasoning == nil {
++			reasoning = map[string]any{}
++		}
++		reasoning["effort"] = "medium"
++		request["reasoning"] = reasoning
++		delete(request, "reasoning_effort")
++	} else if _, chat := request["messages"]; chat {
++		request["reasoning_effort"] = "medium"
++		if reasoning, ok := request["reasoning"].(map[string]any); ok {
++			reasoning["effort"] = "medium"
++		}
++	} else {
++		return nil, errors.New("unsupported_iq_reasoning_protocol")
++	}
++	return common.Marshal(request)
++}
++
++// Grade only completed assistant output; never match numbers in reasoning,
++// usage, prompt echoes, tool calls, incomplete streams or error payloads.
++func astraIQAnswer(body []byte) (string, error) {
++	text := strings.TrimSpace(string(body))
++	if strings.HasPrefix(text, "data:") || strings.HasPrefix(text, "event:") {
++		var content strings.Builder
++		completed := false
++		var responseAnswer string
++		for line := range strings.SplitSeq(text, "\n") {
++			data, ok := strings.CutPrefix(strings.TrimSpace(line), "data:")
++			if !ok {
++				continue
++			}
++			data = strings.TrimSpace(data)
++			if data == "[DONE]" {
++				continue
++			}
++			if !gjson.Valid(data) {
++				return "", errors.New("invalid_stream")
++			}
++			event := gjson.Parse(data)
++			if (event.Get("error").Exists() && event.Get("error").Type != gjson.Null) || event.Get("type").String() == "error" || event.Get("type").String() == "response.failed" || event.Get("type").String() == "response.incomplete" {
++				return "", errors.New("upstream_error")
++			}
++			if event.Get("type").String() == "response.completed" {
++				answer, err := astraIQAnswer([]byte(event.Get("response").Raw))
++				if err != nil {
++					return "", err
++				}
++				responseAnswer, completed = answer, true
++			}
++			for _, choice := range event.Get("choices").Array() {
++				if choice.Get("index").Int() != 0 {
++					continue
++				}
++				if part := choice.Get("delta.content"); part.Type == gjson.String {
++					content.WriteString(part.String())
++				}
++				if finish := choice.Get("finish_reason").String(); finish != "" {
++					if finish != "stop" {
++						return "", errors.New("incomplete_answer")
++					}
++					completed = true
++				}
++			}
++		}
++		if !completed {
++			return "", errors.New("incomplete_stream")
++		}
++		if responseAnswer != "" {
++			return responseAnswer, nil
++		}
++		if strings.TrimSpace(content.String()) == "" {
++			return "", errors.New("empty_answer")
++		}
++		return strings.TrimSpace(content.String()), nil
++	}
++	if !gjson.Valid(text) {
++		return "", errors.New("invalid_response")
++	}
++	response := gjson.Parse(text)
++	if response.Get("error").Exists() && response.Get("error").Type != gjson.Null {
++		return "", errors.New("upstream_error")
++	}
++	if choices := response.Get("choices").Array(); len(choices) > 0 {
++		choice := choices[0]
++		if choice.Get("finish_reason").String() != "stop" {
++			return "", errors.New("incomplete_answer")
++		}
++		answer := choice.Get("message.content")
++		if answer.Type != gjson.String || strings.TrimSpace(answer.String()) == "" {
++			return "", errors.New("empty_answer")
++		}
++		return strings.TrimSpace(answer.String()), nil
++	}
++	if response.Get("status").String() != "completed" {
++		return "", errors.New("incomplete_response")
++	}
++	var answer strings.Builder
++	for _, item := range response.Get("output").Array() {
++		if item.Get("type").String() != "message" || item.Get("role").String() != "assistant" {
++			continue
++		}
++		for _, part := range item.Get("content").Array() {
++			if part.Get("type").String() == "output_text" {
++				answer.WriteString(part.Get("text").String())
++			}
++		}
++	}
++	if strings.TrimSpace(answer.String()) == "" {
++		return "", errors.New("empty_answer")
++	}
++	return strings.TrimSpace(answer.String()), nil
++}
++
++func probeAstraIQChannel(ctx context.Context, ch *model.Channel, userID int) model.AstraIQResult {
++	started := time.Now()
++	result := model.AstraIQResult{Status: "error", Detail: "no_enabled_keys"}
++	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
++	defer cancel()
++	keys := []string{ch.Key}
++	if ch.ChannelInfo.IsMultiKey {
++		keys = ch.GetKeys()
++	}
++	for index, key := range keys {
++		if ch.ChannelInfo.IsMultiKey {
++			if status, exists := ch.ChannelInfo.MultiKeyStatusList[index]; exists && status != common.ChannelStatusEnabled {
++				continue
++			}
++		}
++		// Probe every enabled key without advancing the production polling cursor.
++		probe := *ch
++		probe.Key, probe.Keys, probe.ChannelInfo = key, nil, model.ChannelInfo{}
++		test := testChannelWithPrompt(ctx, &probe, userID, model.AstraIQModel, "", shouldUseStreamForAutomaticChannelTest(&probe), astraIQQuestion)
++		if test.localErr != nil || test.newAPIError != nil {
++			result.Status, result.Detail = "error", "request_failed"
++			if ctx.Err() != nil {
++				result.Detail = "timeout"
++			}
++			break
++		}
++		answer, err := astraIQAnswer(test.responseBody)
++		if err != nil {
++			result.Status, result.Detail = "error", err.Error()
++			break
++		}
++		result.Answer = string([]rune(answer)[:min(len([]rune(answer)), 128)])
++		if !astraIQAnswerPattern.MatchString(strings.Trim(answer, "`* \r\n\t")) {
++			result.Status, result.Detail = "fail", "wrong_answer"
++			break
++		}
++		result.Status, result.Detail = "pass", ""
++	}
++	result.CheckedAt, result.LatencyMS = common.GetTimestamp(), time.Since(started).Milliseconds()
++	return result
++}
++
++type astraIQTestHandler struct{}
++
++func (astraIQTestHandler) Type() string            { return model.AstraIQTaskType }
++func (astraIQTestHandler) Enabled() bool           { return model.AstraIQEnabled() }
++func (astraIQTestHandler) Interval() time.Duration { return model.AstraIQInterval }
++func (astraIQTestHandler) NewPayload() any         { return nil }
++
++func (astraIQTestHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
++	userID, err := resolveChannelTestUserID(nil)
++	if err != nil {
++		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
++		return
++	}
++	var channels []*model.Channel
++	if err = model.DB.Find(&channels).Error; err != nil {
++		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
++		return
++	}
++	jobs := make(chan *model.Channel, len(channels))
++	for _, ch := range channels {
++		if model.ChannelSupportsAstraIQ(ch) {
++			jobs <- ch
++		}
++	}
++	close(jobs)
++	errs := make(chan error, len(channels))
++	var workers sync.WaitGroup
++	for range 3 {
++		workers.Go(func() {
++			for ch := range jobs {
++				if ctx.Err() != nil {
++					return
++				}
++				result := probeAstraIQChannel(ctx, ch, userID)
++				if ctx.Err() != nil {
++					return
++				}
++				if err := model.SaveAstraIQResult(ch, result); err != nil {
++					errs <- fmt.Errorf("save channel %d IQ result: %w", ch.Id, err)
++				}
++			}
++		})
++	}
++	workers.Wait()
++	close(errs)
++	for saveErr := range errs {
++		err = errors.Join(err, saveErr)
++	}
++	err = errors.Join(err, ctx.Err())
++	status := model.SystemTaskStatusSucceeded
++	if err != nil {
++		status = model.SystemTaskStatusFailed
++	}
++	finishSystemTaskHandler(task, runnerID, status, nil, err)
++}
++
++func GetAstraIQStatus(c *gin.Context) {
++	views := make(map[int]model.AstraIQView)
++	if !model.AstraIQEnabled() {
++		common.ApiSuccess(c, gin.H{"enabled": false, "results": views})
++		return
++	}
++	var channels []*model.Channel
++	if err := model.DB.Find(&channels).Error; err != nil {
++		common.ApiError(c, err)
++		return
++	}
++	ids := make([]int, 0, len(channels))
++	for _, ch := range channels {
++		if model.ChannelSupportsAstraIQ(ch) {
++			ids = append(ids, ch.Id)
++		}
++	}
++	results, err := model.GetAstraIQResults(ids)
++	if err != nil {
++		common.ApiError(c, err)
++		return
++	}
++	for _, ch := range channels {
++		if model.ChannelSupportsAstraIQ(ch) {
++			views[ch.Id] = model.AstraIQResultView(ch, results[ch.Id])
++		}
++	}
++	common.ApiSuccess(c, gin.H{"enabled": true, "results": views})
++}
+diff --git a/controller/astra_iq_test.go b/controller/astra_iq_test.go
+new file mode 100644
+index 00000000..473a7179
+--- /dev/null
++++ b/controller/astra_iq_test.go
+@@ -0,0 +1,192 @@
++package controller
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"testing"
++	"time"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/QuantumNous/new-api/constant"
++	hostdto "github.com/QuantumNous/new-api/dto"
++	"github.com/QuantumNous/new-api/model"
++	"github.com/QuantumNous/new-api/relaykit/dto"
++	"github.com/QuantumNous/new-api/service"
++	"github.com/QuantumNous/new-api/setting/ratio_setting"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"github.com/tidwall/gjson"
++)
++
++func TestCustomAstraIQGradesOnlyCompletedAssistantAnswers(t *testing.T) {
++	for _, tc := range []struct {
++		name, body      string
++		passed, invalid bool
++	}{
++		{"chat correct", `{"choices":[{"message":{"role":"assistant","content":"21"},"finish_reason":"stop"}]}`, true, false},
++		{"wrong", `{"choices":[{"message":{"content":"22"},"finish_reason":"stop"}]}`, false, false},
++		{"not substring", `{"choices":[{"message":{"content":"121"},"finish_reason":"stop"}]}`, false, false},
++		{"reasoning cannot pass", `{"choices":[{"message":{"content":"22","reasoning_content":"21"},"finish_reason":"stop"}]}`, false, false},
++		{"ambiguous answer", `{"choices":[{"message":{"content":"21或22"},"finish_reason":"stop"}]}`, false, false},
++		{"truncated", `{"choices":[{"message":{"content":"21"},"finish_reason":"length"}]}`, false, true},
++		{"refusal", `{"choices":[{"message":{"refusal":"21"},"finish_reason":"stop"}]}`, false, true},
++		{"responses correct", `{"status":"completed","output":[{"type":"reasoning","content":[]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"21"}]}]}`, true, false},
++		{"responses unfinished", `{"status":"incomplete","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"21"}]}]}`, false, true},
++		{"split chat stream", "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"2\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"1\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n", true, false},
++		{"cut stream", "data: {\"choices\":[{\"delta\":{\"content\":\"21\"}}]}\n", false, true},
++		{"error stream", "data: {\"error\":{\"message\":\"21\"}}\n", false, true},
++		{"completed responses stream", "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"error\":null,\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"21\"}]}]}}\n\n", true, false},
++		{"responses error without error object", "event: error\ndata: {\"type\":\"error\",\"message\":\"21\"}\n\n", false, true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			answer, err := astraIQAnswer([]byte(tc.body))
++			if tc.invalid {
++				require.Error(t, err)
++				return
++			}
++			require.NoError(t, err)
++			assert.Equal(t, tc.passed, astraIQAnswerPattern.MatchString(answer))
++		})
++	}
++}
++
++func TestCustomAstraIQForcesMediumAfterChannelOverrides(t *testing.T) {
++	for _, tc := range []struct{ body, path string }{
++		{`{"messages":[{"role":"user","content":"question"}],"reasoning_effort":"high"}`, "reasoning_effort"},
++		{`{"input":"question","reasoning":{"effort":"low","summary":"auto"}}`, "reasoning.effort"},
++	} {
++		encoded, err := enforceAstraIQReasoning([]byte(tc.body))
++		require.NoError(t, err)
++		assert.Equal(t, "medium", gjson.GetBytes(encoded, tc.path).String())
++	}
++	response := &dto.OpenAIResponsesRequest{}
++	require.NoError(t, setAstraIQPrompt(response, astraIQQuestion))
++	require.NotNil(t, response.Reasoning)
++	assert.Equal(t, "medium", response.Reasoning.Effort)
++	assert.NotContains(t, string(response.Input), "21")
++}
++
++func TestCustomAstraIQDatabaseAndRouting(t *testing.T) {
++	t.Setenv("ASTRA_IQ_ENABLED", "true")
++	for _, dialect := range []struct{ kind, env string }{{"sqlite", ""}, {"mysql", "TEST_MYSQL_DSN"}, {"postgres", "TEST_POSTGRES_DSN"}} {
++		t.Run(dialect.kind, func(t *testing.T) {
++			dsn := os.Getenv(dialect.env)
++			if dialect.env != "" && dsn == "" {
++				t.Skip(dialect.env + " not configured")
++			}
++			db := modelManagementDB(t, dialect.kind, dsn)
++			channels := []model.Channel{
++				{Id: 201, Name: "high priority", Type: 1, Key: "test-a", Status: common.ChannelStatusEnabled, Models: model.AstraIQModel + ",unrelated-model", Group: "default", Priority: common.GetPointer(int64(10))},
++				{Id: 202, Name: "fallback", Type: 1, Key: "test-b", Status: common.ChannelStatusEnabled, Models: model.AstraIQModel, Group: "default", Priority: common.GetPointer(int64(5))},
++			}
++			for i := range channels {
++				require.NoError(t, db.Create(&channels[i]).Error)
++				require.NoError(t, channels[i].AddAbilities(db))
++			}
++			// Upgrade representative pre-patch channel data. Repeated startup must
++			// preserve approvals/history and leave existing channels intact.
++			require.False(t, db.Migrator().HasTable(&model.AstraIQResult{}))
++			require.NoError(t, db.AutoMigrate(&model.AstraIQResult{}))
++			require.NoError(t, model.SaveAstraIQResult(&channels[0], model.AstraIQResult{Status: "pass", CheckedAt: common.GetTimestamp(), Answer: "21"}))
++			for range 2 {
++				require.NoError(t, db.AutoMigrate(&model.AstraIQResult{}))
++			}
++			var unchanged model.Channel
++			require.NoError(t, db.First(&unchanged, channels[0].Id).Error)
++			assert.Equal(t, "test-a", unchanged.Key)
++			assert.True(t, model.AstraIQAllowsChannel(&unchanged, model.AstraIQModel))
++			for _, cached := range []bool{false, true} {
++				t.Run(fmt.Sprintf("cache=%t", cached), func(t *testing.T) {
++					common.MemoryCacheEnabled = cached
++					model.InitChannelCache()
++					require.NoError(t, db.Where("channel_id IN ?", []int{201, 202}).Delete(&model.AstraIQResult{}).Error)
++					selected, err := model.GetRandomSatisfiedChannel("default", model.AstraIQModel, 0, nil)
++					require.NoError(t, err)
++					assert.Nil(t, selected, "untested channels must be blocked")
++					require.NoError(t, model.SaveAstraIQResult(&channels[1], model.AstraIQResult{Status: "pass", CheckedAt: common.GetTimestamp()}))
++					selected, err = model.GetRandomSatisfiedChannel("default", model.AstraIQModel, 0, nil)
++					require.NoError(t, err)
++					require.NotNil(t, selected)
++					assert.Equal(t, 202, selected.Id)
++					require.NoError(t, model.SaveAstraIQResult(&channels[0], model.AstraIQResult{Status: "pass", CheckedAt: common.GetTimestamp()}))
++					selected, err = model.GetRandomSatisfiedChannel("default", model.AstraIQModel, 0, nil)
++					require.NoError(t, err)
++					require.NotNil(t, selected)
++					assert.Equal(t, 201, selected.Id)
++					require.NoError(t, model.SaveAstraIQResult(&channels[0], model.AstraIQResult{Status: "fail", CheckedAt: common.GetTimestamp(), Answer: "22"}))
++					selected, err = model.GetRandomSatisfiedChannel("default", model.AstraIQModel, 0, nil)
++					require.NoError(t, err)
++					require.NotNil(t, selected)
++					assert.Equal(t, 202, selected.Id, "failure must apply without refreshing channel cache")
++					pinned := newPinRetryContext()
++					service.GetChannelConstraints(pinned).AddPin(hostdto.ChannelPin{ChannelId: 201, Source: hostdto.PinSourceToken, Rank: hostdto.PinRankToken, RetryMode: hostdto.PinRetrySingleAttempt})
++					_, _, pinErr := service.SelectChannelForRequest(pinned, model.AstraIQModel, &service.RetryParam{Ctx: pinned, ModelName: model.AstraIQModel, TokenGroup: "default", Retry: common.GetPointer(0)})
++					require.NotNil(t, pinErr)
++					assert.Equal(t, hostdto.ChannelFilterKind("astra_iq"), pinErr.FilterKind)
++					selected, err = model.GetRandomSatisfiedChannel("default", "unrelated-model", 0, nil)
++					require.NoError(t, err)
++					require.NotNil(t, selected)
++					assert.Equal(t, 201, selected.Id)
++					require.NoError(t, model.SaveAstraIQResult(&channels[1], model.AstraIQResult{Status: "pass", CheckedAt: common.GetTimestamp() - int64(model.AstraIQMaxAge/time.Second)}))
++					selected, err = model.GetRandomSatisfiedChannel("default", model.AstraIQModel, 0, nil)
++					require.NoError(t, err)
++					assert.Nil(t, selected, "expired pass cannot bypass gate")
++					require.NoError(t, model.SaveAstraIQResult(&channels[0], model.AstraIQResult{Status: "pass", CheckedAt: common.GetTimestamp()}))
++					assert.True(t, model.AstraIQAllowsChannel(&channels[0], model.AstraIQModel), "next correct probe restores routing")
++					changed := channels[0]
++					changed.Key = "replacement-key"
++					assert.False(t, model.AstraIQAllowsChannel(&changed, model.AstraIQModel))
++					rows, err := model.GetAstraIQResults([]int{201})
++					require.NoError(t, err)
++					view := model.AstraIQResultView(&channels[0], rows[201])
++					assert.InDelta(t, 66.6667, view.PassRate, 0.001)
++					encoded, err := common.Marshal(view)
++					require.NoError(t, err)
++					assert.NotContains(t, string(encoded), "fingerprint")
++					assert.NotContains(t, string(encoded), "test-a")
++				})
++			}
++		})
++	}
++}
++
++func TestCustomAstraIQProbeUsesQuestionAndChecksEveryEnabledKey(t *testing.T) {
++	db := modelManagementDB(t, "sqlite", "")
++	require.NoError(t, db.AutoMigrate(&model.Log{}))
++	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-6-astra":1}`))
++	user := model.User{Id: 777321, Username: "iq-probe-fixture", Role: common.RoleRootUser, Status: common.UserStatusEnabled, Group: "default"}
++	require.NoError(t, db.Create(&user).Error)
++	var seen []string
++	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		var request dto.GeneralOpenAIRequest
++		if err := common.DecodeJson(r.Body, &request); err != nil {
++			t.Error(err)
++			w.WriteHeader(400)
++			return
++		}
++		assert.Equal(t, model.AstraIQModel, request.Model)
++		assert.Equal(t, "medium", request.ReasoningEffort)
++		assert.Equal(t, astraIQQuestion, request.Messages[0].Content)
++		assert.NotContains(t, request.Messages[0].Content, "21", "answer must never be sent upstream")
++		seen = append(seen, r.Header.Get("Authorization"))
++		answer := "21"
++		if r.Header.Get("Authorization") == "Bearer wrong" {
++			answer = "22"
++		}
++		w.Header().Set("Content-Type", "application/json")
++		fmt.Fprintf(w, `{"id":"test","object":"chat.completion","model":"gpt-6-astra","choices":[{"index":0,"message":{"role":"assistant","content":%q},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":1,"total_tokens":101}}`, answer)
++	}))
++	defer upstream.Close()
++	ch := &model.Channel{Id: 901, Type: constant.ChannelTypeOpenAI, Key: "correct\nwrong", BaseURL: &upstream.URL, Models: model.AstraIQModel, Group: "default", Status: common.ChannelStatusEnabled, ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeySize: 2}}
++	result := probeAstraIQChannel(context.Background(), ch, user.Id)
++	assert.Equal(t, "fail", result.Status, result.Detail)
++	assert.Equal(t, "22", result.Answer)
++	assert.Equal(t, []string{"Bearer correct", "Bearer wrong"}, seen)
++	ch.ChannelInfo.MultiKeyStatusList = map[int]int{1: common.ChannelStatusAutoDisabled}
++	result = probeAstraIQChannel(context.Background(), ch, user.Id)
++	assert.Equal(t, "pass", result.Status, result.Detail)
++	assert.Equal(t, 0, ch.ChannelInfo.MultiKeyPollingIndex)
++}
+diff --git a/controller/channel-test.go b/controller/channel-test.go
+index 1248853a..0bc85dac 100644
+--- a/controller/channel-test.go
++++ b/controller/channel-test.go
+@@ -36,9 +36,10 @@ import (
+ )
+ 
+ type testResult struct {
+-	context     *gin.Context
+-	localErr    error
+-	newAPIError *types.NewAPIError
++	context      *gin.Context
++	localErr     error
++	newAPIError  *types.NewAPIError
++	responseBody []byte
+ }
+ 
+ func normalizeChannelTestEndpoint(channel *model.Channel, endpointType string) string {
+@@ -70,6 +71,10 @@ func resolveChannelTestUserID(c *gin.Context) (int, error) {
+ }
+ 
+ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool) testResult {
++	return testChannelWithPrompt(ctx, channel, testUserID, testModel, endpointType, isStream, "")
++}
++
++func testChannelWithPrompt(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool, prompt string) testResult {
+ 	if ctx == nil {
+ 		ctx = context.Background()
+ 	}
+@@ -228,6 +233,11 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+ 	}
+ 
+ 	request := buildTestRequest(testModel, endpointType, channel, isStream)
++	if prompt != "" {
++		if err := setAstraIQPrompt(request, prompt); err != nil {
++			return testResult{context: c, localErr: err}
++		}
++	}
+ 
+ 	info, err := relaycommon.GenRelayInfo(c, relayFormat, request, nil)
+ 
+@@ -431,6 +441,12 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+ 		}
+ 	}
+ 
++	if prompt != "" {
++		jsonData, err = enforceAstraIQReasoning(jsonData)
++		if err != nil {
++			return testResult{context: c, localErr: err}
++		}
++	}
+ 	requestBody := bytes.NewBuffer(jsonData)
+ 	c.Request.Body = io.NopCloser(bytes.NewBuffer(jsonData))
+ 	resp, err := adaptor.DoRequest(c, info, requestBody)
+@@ -480,7 +496,8 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+ 		}
+ 	}
+ 	result := w.Result()
+-	respBody, err := readTestResponseBody(result.Body, isStream)
++	// IQ grading needs the final event beyond the ordinary 8 KiB log preview.
++	respBody, err := readTestResponseBody(result.Body, isStream && prompt == "")
+ 	if err != nil {
+ 		return testResult{
+ 			context:     c,
+@@ -517,9 +534,10 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+ 	})
+ 	common.SysLog(fmt.Sprintf("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
+ 	return testResult{
+-		context:     c,
+-		localErr:    nil,
+-		newAPIError: nil,
++		context:      c,
++		localErr:     nil,
++		newAPIError:  nil,
++		responseBody: respBody,
+ 	}
+ }
+ 
+diff --git a/controller/system_task_handlers.go b/controller/system_task_handlers.go
+index c31059d1..cc6f68dc 100644
+--- a/controller/system_task_handlers.go
++++ b/controller/system_task_handlers.go
+@@ -18,6 +18,7 @@ import (
+ // instances and each run is recorded as one task row. Call this before
+ // service.StartSystemTaskRunner.
+ func RegisterScheduledSystemTasks() {
++	service.RegisterSystemTaskHandler(astraIQTestHandler{})
+ 	service.RegisterSystemTaskHandler(channelTestHandler{})
+ 	service.RegisterSystemTaskHandler(modelUpdateHandler{})
+ 	service.RegisterSystemTaskHandler(midjourneyPollHandler{})
+diff --git a/model/ability.go b/model/ability.go
+index b86c442d..abf4fd1b 100644
+--- a/model/ability.go
++++ b/model/ability.go
+@@ -184,6 +184,9 @@ func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters
+ 
+ 	var channels []*Channel
+ 	if err := DB.Where("id IN ?", channelIds).Find(&channels).Error; err != nil {
++		if AstraIQRequired(modelName) {
++			return nil
++		}
+ 		for _, filter := range filters {
+ 			if filter.Kind == dto.FilterExcludeChannels {
+ 				return nil
+diff --git a/model/astra_iq.go b/model/astra_iq.go
+new file mode 100644
+index 00000000..b64696bb
+--- /dev/null
++++ b/model/astra_iq.go
+@@ -0,0 +1,174 @@
++package model
++
++import (
++	"context"
++	"crypto/sha256"
++	"fmt"
++	"strings"
++	"time"
++
++	"github.com/QuantumNous/new-api/common"
++	"gorm.io/gorm/clause"
++)
++
++const (
++	AstraIQModel       = "gpt-6-astra"
++	AstraIQVersion     = "candy-21-medium-v1"
++	AstraIQTaskType    = "astra_iq_test"
++	AstraIQInterval    = 5 * time.Minute
++	AstraIQMaxAge      = 10 * time.Minute
++	AstraIQHistorySize = 24
++)
++
++// Separate storage prevents channel edits/imports from overwriting approval.
++type AstraIQResult struct {
++	ChannelID   int    `json:"channel_id" gorm:"primaryKey;autoIncrement:false"`
++	Status      string `json:"status" gorm:"type:varchar(16)"`
++	CheckedAt   int64  `json:"checked_at" gorm:"bigint"`
++	Version     string `json:"version" gorm:"type:varchar(64)"`
++	Fingerprint string `json:"-" gorm:"type:varchar(64)"`
++	Answer      string `json:"answer" gorm:"type:text"`
++	Detail      string `json:"detail" gorm:"type:varchar(128)"`
++	LatencyMS   int64  `json:"latency_ms" gorm:"bigint"`
++	HistoryJSON string `json:"-" gorm:"type:text"`
++}
++
++type AstraIQSample struct {
++	Status    string `json:"status"`
++	CheckedAt int64  `json:"checked_at"`
++}
++
++type AstraIQView struct {
++	AstraIQResult
++	Allowed  bool            `json:"allowed"`
++	PassRate float64         `json:"pass_rate"`
++	History  []AstraIQSample `json:"history"`
++}
++
++func AstraIQEnabled() bool {
++	return common.GetEnvOrDefaultBool("ASTRA_IQ_ENABLED", false)
++}
++
++func AstraIQRequired(modelName string) bool {
++	return AstraIQEnabled() && strings.TrimSpace(modelName) == AstraIQModel
++}
++
++func ChannelSupportsAstraIQ(ch *Channel) bool {
++	if ch == nil {
++		return false
++	}
++	for name := range strings.SplitSeq(ch.Models, ",") {
++		if strings.TrimSpace(name) == AstraIQModel {
++			return true
++		}
++	}
++	return false
++}
++
++// Never return this hash in the API. Credential/configuration changes require
++// another probe, including changes to the enabled multi-key set.
++func AstraIQFingerprint(ch *Channel) string {
++	data, err := common.Marshal([]any{ch.Type, ch.Key, ch.BaseURL, ch.OpenAIOrganization, ch.ModelMapping, ch.ParamOverride, ch.HeaderOverride, ch.Setting, ch.OtherSettings, ch.Other, ch.ChannelInfo.MultiKeyStatusList})
++	if err != nil {
++		return ""
++	}
++	return fmt.Sprintf("%x", sha256.Sum256(data))
++}
++
++func (r AstraIQResult) Allows(ch *Channel, now int64) bool {
++	return ch != nil && r.Status == "pass" && r.Version == AstraIQVersion &&
++		r.CheckedAt > 0 && now >= r.CheckedAt && now-r.CheckedAt < int64(AstraIQMaxAge/time.Second) &&
++		r.Fingerprint != "" && r.Fingerprint == AstraIQFingerprint(ch)
++}
++
++// Read shared storage at selection time so a failed probe takes effect on every
++// instance immediately, independently of the ordinary channel cache refresh.
++func GetAstraIQResults(ids []int) (map[int]AstraIQResult, error) {
++	results := make(map[int]AstraIQResult)
++	if len(ids) == 0 {
++		return results, nil
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	var rows []AstraIQResult
++	err := DB.WithContext(ctx).Where("channel_id IN ?", ids).Find(&rows).Error
++	for _, row := range rows {
++		results[row.ChannelID] = row
++	}
++	return results, err
++}
++
++func AstraIQAllowsChannel(ch *Channel, modelName string) bool {
++	if !AstraIQRequired(modelName) {
++		return true
++	}
++	if ch == nil {
++		return false
++	}
++	results, err := GetAstraIQResults([]int{ch.Id})
++	return err == nil && results[ch.Id].Allows(ch, common.GetTimestamp())
++}
++
++func filterAstraIQCandidateIDs(ids []int, modelName string) []int {
++	if !AstraIQRequired(modelName) {
++		return ids
++	}
++	results, err := GetAstraIQResults(ids)
++	if err != nil {
++		return nil
++	}
++	kept := make([]int, 0, len(ids))
++	for _, id := range ids {
++		if results[id].Allows(channelsIDM[id], common.GetTimestamp()) {
++			kept = append(kept, id)
++		}
++	}
++	return kept
++}
++
++func SaveAstraIQResult(ch *Channel, result AstraIQResult) error {
++	previous, err := GetAstraIQResults([]int{ch.Id})
++	if err != nil {
++		return err
++	}
++	var history []AstraIQSample
++	if old := previous[ch.Id]; old.Version == AstraIQVersion {
++		_ = common.UnmarshalJsonStr(old.HistoryJSON, &history)
++	}
++	history = append(history, AstraIQSample{Status: result.Status, CheckedAt: result.CheckedAt})
++	if len(history) > AstraIQHistorySize {
++		history = history[len(history)-AstraIQHistorySize:]
++	}
++	data, err := common.Marshal(history)
++	if err != nil {
++		return err
++	}
++	result.ChannelID = ch.Id
++	result.Version = AstraIQVersion
++	result.Fingerprint = AstraIQFingerprint(ch)
++	result.HistoryJSON = string(data)
++	return DB.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "channel_id"}}, UpdateAll: true}).Create(&result).Error
++}
++
++func AstraIQResultView(ch *Channel, r AstraIQResult) AstraIQView {
++	view := AstraIQView{AstraIQResult: r, History: []AstraIQSample{}}
++	view.ChannelID = ch.Id
++	view.Allowed = r.Allows(ch, common.GetTimestamp())
++	if view.Status == "" {
++		view.Status = "pending"
++	}
++	if r.Status == "pass" && !view.Allowed {
++		view.Status = "expired"
++	}
++	_ = common.UnmarshalJsonStr(r.HistoryJSON, &view.History)
++	passed := 0
++	for _, sample := range view.History {
++		if sample.Status == "pass" {
++			passed++
++		}
++	}
++	if len(view.History) > 0 {
++		view.PassRate = float64(passed) * 100 / float64(len(view.History))
++	}
++	return view
++}
+diff --git a/model/channel_constraint.go b/model/channel_constraint.go
+index 34121a7b..b8452657 100644
+--- a/model/channel_constraint.go
++++ b/model/channel_constraint.go
+@@ -22,6 +22,9 @@ func ChannelSatisfiesFilters(ch *Channel, modelName string, filters []dto.Channe
+ 	if ch == nil {
+ 		return false, ""
+ 	}
++	if !AstraIQAllowsChannel(ch, modelName) {
++		return false, "astra_iq"
++	}
+ 	for _, kind := range filterEvalOrder {
+ 		for _, filter := range filters {
+ 			if filter.Kind != kind {
+@@ -43,7 +46,10 @@ func filterCandidateIDs(ids []int, modelName string, filters []dto.ChannelFilter
+ 	if len(ids) == 0 {
+ 		return ids, ""
+ 	}
+-	kept = ids
++	kept = filterAstraIQCandidateIDs(ids, modelName)
++	if len(kept) == 0 {
++		return kept, "astra_iq"
++	}
+ 	for _, kind := range filterEvalOrder {
+ 		kindFilters := filtersByKind(filters, kind)
+ 		if len(kindFilters) == 0 {
+diff --git a/model/main.go b/model/main.go
+index 917d4e05..1aae158f 100644
+--- a/model/main.go
++++ b/model/main.go
+@@ -336,6 +336,7 @@ func migrateDB() error {
+ 
+ 	err := DB.AutoMigrate(
+ 		&Channel{},
++		&AstraIQResult{},
+ 		&Token{},
+ 		&User{},
+ 		&UserSession{},
+diff --git a/router/channel-router.go b/router/channel-router.go
+index 2d59b039..8dd41de8 100644
+--- a/router/channel-router.go
++++ b/router/channel-router.go
+@@ -37,6 +37,7 @@ func registerChannelRoutes(apiRouter *gin.RouterGroup) {
+ }
+ 
+ var channelPermissionRoutes = []permissionRoute{
++	{method: http.MethodGet, path: "/astra_iq", permission: authz.ChannelRead, handler: controller.GetAstraIQStatus},
+ 	{method: http.MethodGet, path: "/", permission: authz.ChannelRead, handler: controller.GetAllChannels},
+ 	{method: http.MethodGet, path: "/search", permission: authz.ChannelRead, handler: controller.SearchChannels},
+ 	{method: http.MethodGet, path: "/models", permission: authz.ChannelRead, handler: controller.ChannelListModels},
+diff --git a/web/src/features/channels/components/__tests__/astra-iq-status.test.tsx b/web/src/features/channels/components/__tests__/astra-iq-status.test.tsx
+new file mode 100644
+index 00000000..c6782069
+--- /dev/null
++++ b/web/src/features/channels/components/__tests__/astra-iq-status.test.tsx
+@@ -0,0 +1,131 @@
++/*
++Copyright (C) 2023-2026 QuantumNous
++
++This program is free software: you can redistribute it and/or modify
++it under the terms of the GNU Affero General Public License as
++published by the Free Software Foundation, either version 3 of the
++License, or (at your option) any later version.
++
++This program is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++GNU Affero General Public License for more details.
++
++You should have received a copy of the GNU Affero General Public License
++along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++For commercial licensing, please contact support@quantumnous.com
++*/
++import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
++import { render, screen, waitFor } from '@testing-library/react'
++import userEvent from '@testing-library/user-event'
++import { afterEach, expect, it, vi } from 'vitest'
++
++import { api } from '@/lib/api'
++
++import { AstraIQStatus, type AstraIQStatusData } from '../astra-iq-status'
++
++afterEach(() => vi.restoreAllMocks())
++
++function renderStatus(data?: AstraIQStatusData) {
++  const client = new QueryClient({
++    defaultOptions: { queries: { retry: false } },
++  })
++  if (data) client.setQueryData(['channels', 'astra-iq'], data)
++  const ui = render(
++    <QueryClientProvider client={client}>
++      <AstraIQStatus channelId={2} />
++    </QueryClientProvider>
++  )
++  return { client, ...ui }
++}
++
++it.each([
++  ['pass', true, 'Astra IQ passed'],
++  ['fail', false, 'Astra IQ wrong answer'],
++  ['error', false, 'Astra IQ request failed'],
++  ['expired', false, 'Astra IQ expired'],
++])(
++  'shows current %s status independently of historical pass rate',
++  (status, allowed, label) => {
++    renderStatus({
++      enabled: true,
++      results: {
++        '2': {
++          status,
++          allowed,
++          pass_rate: 50,
++          checked_at: 1000,
++          answer: '21',
++          detail: '',
++          history: [
++            { status: 'pass', checked_at: 999 },
++            { status: 'fail', checked_at: 1000 },
++          ],
++        },
++      },
++    })
++    expect(screen.getByText(label as string)).toBeVisible()
++    expect(screen.getByText('50%')).toBeVisible()
++    expect(screen.getByLabelText(new RegExp(label as string))).toHaveAttribute(
++      'tabindex',
++      '0'
++    )
++  }
++)
++
++it('shows untested as pending instead of displaying a passing result', () => {
++  renderStatus({ enabled: true, results: {} })
++  expect(screen.getByText('Astra IQ pending')).toBeVisible()
++  expect(screen.getByText('—')).toBeVisible()
++})
++
++it('hides the panel when the feature is switched off', () => {
++  renderStatus({ enabled: false, results: {} })
++  expect(screen.queryByText('Astra IQ')).not.toBeInTheDocument()
++})
++
++it('exposes the timeline legend and latest answer on keyboard focus', async () => {
++  renderStatus({
++    enabled: true,
++    results: {
++      '2': {
++        status: 'fail',
++        allowed: false,
++        pass_rate: 0,
++        checked_at: 1000,
++        answer: '22',
++        detail: 'wrong_answer',
++        history: [{ status: 'fail', checked_at: 1000 }],
++      },
++    },
++  })
++  await userEvent.tab()
++  expect(await screen.findByRole('tooltip')).toHaveTextContent(
++    'green passed, red wrong answer, amber error, gray untested'
++  )
++  expect(screen.getByRole('tooltip')).toHaveTextContent('Latest answer: 22')
++})
++
++it('does not keep showing an old passed status when refresh fails', async () => {
++  vi.spyOn(api, 'get').mockRejectedValue(new Error('offline'))
++  const { client } = renderStatus({
++    enabled: true,
++    results: {
++      '2': {
++        status: 'pass',
++        allowed: true,
++        pass_rate: 100,
++        checked_at: 1000,
++        answer: '21',
++        detail: '',
++        history: [{ status: 'pass', checked_at: 1000 }],
++      },
++    },
++  })
++  await client.invalidateQueries({ queryKey: ['channels', 'astra-iq'] })
++  await waitFor(() =>
++    expect(screen.getByText('Astra IQ status unavailable')).toBeVisible()
++  )
++  expect(screen.queryByText('Astra IQ passed')).not.toBeInTheDocument()
++})
+diff --git a/web/src/features/channels/components/astra-iq-status.tsx b/web/src/features/channels/components/astra-iq-status.tsx
+new file mode 100644
+index 00000000..f6760ec7
+--- /dev/null
++++ b/web/src/features/channels/components/astra-iq-status.tsx
+@@ -0,0 +1,154 @@
++/*
++Copyright (C) 2023-2026 QuantumNous
++
++This program is free software: you can redistribute it and/or modify
++it under the terms of the GNU Affero General Public License as
++published by the Free Software Foundation, either version 3 of the
++License, or (at your option) any later version.
++
++This program is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++GNU Affero General Public License for more details.
++
++You should have received a copy of the GNU Affero General Public License
++along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++For commercial licensing, please contact support@quantumnous.com
++*/
++import { useQuery } from '@tanstack/react-query'
++import { useTranslation } from 'react-i18next'
++
++import {
++  Tooltip,
++  TooltipContent,
++  TooltipTrigger,
++} from '@/components/ui/tooltip'
++import { toIntlLocale } from '@/i18n/languages'
++import { api } from '@/lib/api'
++import { formatNumber } from '@/lib/format'
++import { requireServerSuccess } from '@/lib/server-error-message'
++import { cn } from '@/lib/utils'
++
++type IQSample = { status: string; checked_at: number }
++export type AstraIQStatusData = {
++  enabled: boolean
++  results: Record<
++    string,
++    {
++      status: string
++      allowed: boolean
++      pass_rate: number
++      checked_at: number
++      answer: string
++      detail: string
++      history: IQSample[]
++    }
++  >
++}
++
++async function getAstraIQStatus(
++  signal: AbortSignal
++): Promise<AstraIQStatusData> {
++  const response = await api.get<{ success: boolean; data: AstraIQStatusData }>(
++    '/api/channel/astra_iq',
++    { signal }
++  )
++  return requireServerSuccess(response.data).data
++}
++
++// This is a history timeline, not a continuous progress indicator. Each segment
++// represents one probe; the existing Progress component cannot encode outcomes.
++export function AstraIQStatus(props: { channelId: number }) {
++  const { t, i18n } = useTranslation()
++  const query = useQuery({
++    queryKey: ['channels', 'astra-iq'],
++    queryFn: ({ signal }) => getAstraIQStatus(signal),
++    staleTime: 15_000,
++    refetchInterval: 30_000,
++    refetchIntervalInBackground: false,
++    meta: { errorToast: false },
++  })
++  if (query.data?.enabled === false) return null
++  const result = query.data?.results[String(props.channelId)]
++  const history = result?.history?.slice(-24) ?? []
++  const samples: (IQSample | null)[] = [
++    ...Array<null>(24 - history.length).fill(null),
++    ...history,
++  ]
++  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
++  let state = t('Astra IQ pending')
++  if (result?.status === 'pass' && result.allowed) state = t('Astra IQ passed')
++  if (result?.status === 'fail') state = t('Astra IQ wrong answer')
++  if (result?.status === 'error') state = t('Astra IQ request failed')
++  if (result?.status === 'expired') state = t('Astra IQ expired')
++  if (query.isError) state = t('Astra IQ status unavailable')
++  const rate =
++    history.length > 0 ? `${formatNumber(result?.pass_rate, locale)}%` : '—'
++
++  return (
++    <Tooltip>
++      <TooltipTrigger
++        render={<div tabIndex={0} />}
++        className='min-w-0 space-y-1.5 border-t pt-2'
++        aria-label={`${t('Astra IQ')}: ${state}; ${t('Recent pass rate')}: ${rate}`}
++      >
++        <div className='text-muted-foreground flex items-center justify-between gap-2 text-xs'>
++          <span>{t('Astra IQ')}</span>
++          <span className='font-mono text-sm tabular-nums'>{rate}</span>
++        </div>
++        <div className='flex h-5 gap-0.5' aria-hidden='true'>
++          {samples.map((sample, index) => (
++            <span
++              key={
++                sample
++                  ? String(sample.checked_at)
++                  : `empty-${24 - index}`
++              }
++              className={cn(
++                'h-full min-w-0 flex-1 rounded-full',
++                !sample && 'bg-muted-foreground/20',
++                sample?.status === 'pass' && 'bg-emerald-500',
++                sample?.status === 'fail' && 'bg-red-500',
++                sample?.status === 'error' && 'bg-amber-500'
++              )}
++            />
++          ))}
++        </div>
++        <p
++          className={cn(
++            'text-xs',
++            result?.allowed && !query.isError
++              ? 'text-emerald-700 dark:text-emerald-400'
++              : 'text-muted-foreground'
++          )}
++        >
++          {state}
++        </p>
++      </TooltipTrigger>
++      <TooltipContent role='tooltip' className='block max-w-xs space-y-1'>
++        <p>
++          {t(
++            'Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.'
++          )}
++        </p>
++        <p>
++          {t(
++            'Last 24 checks: green passed, red wrong answer, amber error, gray untested.'
++          )}
++        </p>
++        {result?.checked_at ? (
++          <p>
++            {t('Last Tested')}:{' '}
++            {new Date(result.checked_at * 1000).toLocaleString(locale)}
++          </p>
++        ) : null}
++        {result?.answer ? (
++          <p className='break-words'>
++            {t('Latest answer')}: {result.answer}
++          </p>
++        ) : null}
++      </TooltipContent>
++    </Tooltip>
++  )
++}
+diff --git a/web/src/features/channels/components/channel-card.tsx b/web/src/features/channels/components/channel-card.tsx
+index 3f0b3d4c..77373ba9 100644
+--- a/web/src/features/channels/components/channel-card.tsx
++++ b/web/src/features/channels/components/channel-card.tsx
+@@ -26,6 +26,7 @@ import { StatusBadgeTypeContext } from '@/components/status-badge'
+ import { CHANNEL_STATUS } from '../constants'
+ import { isTagAggregateRow, parseGroupsList } from '../lib'
+ import type { Channel } from '../types'
++import { AstraIQStatus } from './astra-iq-status'
+ import { ChannelRowActionsLayoutContext } from './channel-row-actions-context'
+ import { useChannels } from './channels-provider'
+ 
+@@ -149,6 +150,13 @@ function ChannelCardComponent({
+           </div>
+         </StatusBadgeTypeContext.Provider>
+ 
++        {!isTagRow &&
++          row.original.models
++            .split(',')
++            .some((name) => name.trim() === 'gpt-6-astra') && (
++            <AstraIQStatus channelId={row.original.id} />
++          )}
++
+         {/* Groups retain their compact, full-width footer. */}
+         <div className='min-w-0'>
+           {groups.length > 0 ? (
+diff --git a/web/src/i18n/locales/en.json b/web/src/i18n/locales/en.json
+index 8ce9da22..3259facd 100644
+--- a/web/src/i18n/locales/en.json
++++ b/web/src/i18n/locales/en.json
+@@ -1,4 +1,15 @@
+ {
++  "Astra IQ": "Astra IQ",
++  "Astra IQ pending": "Astra IQ pending",
++  "Astra IQ passed": "Astra IQ passed",
++  "Astra IQ wrong answer": "Astra IQ wrong answer",
++  "Astra IQ request failed": "Astra IQ request failed",
++  "Astra IQ expired": "Astra IQ expired",
++  "Astra IQ status unavailable": "Astra IQ status unavailable",
++  "Recent pass rate": "Recent pass rate",
++  "Latest answer": "Latest answer",
++  "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.": "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.",
++  "Last 24 checks: green passed, red wrong answer, amber error, gray untested.": "Last 24 checks: green passed, red wrong answer, amber error, gray untested.",
+   "translation": {
+     "360": "360",
+     "1000": "1000",
+diff --git a/web/src/i18n/locales/fr.json b/web/src/i18n/locales/fr.json
+index a239f206..cbf92051 100644
+--- a/web/src/i18n/locales/fr.json
++++ b/web/src/i18n/locales/fr.json
+@@ -1,4 +1,15 @@
+ {
++  "Astra IQ": "Astra IQ",
++  "Astra IQ pending": "Astra IQ pending",
++  "Astra IQ passed": "Astra IQ passed",
++  "Astra IQ wrong answer": "Astra IQ wrong answer",
++  "Astra IQ request failed": "Astra IQ request failed",
++  "Astra IQ expired": "Astra IQ expired",
++  "Astra IQ status unavailable": "Astra IQ status unavailable",
++  "Recent pass rate": "Recent pass rate",
++  "Latest answer": "Latest answer",
++  "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.": "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.",
++  "Last 24 checks: green passed, red wrong answer, amber error, gray untested.": "Last 24 checks: green passed, red wrong answer, amber error, gray untested.",
+   "translation": {
+     "360": "360",
+     "1000": "1000",
+diff --git a/web/src/i18n/locales/ja.json b/web/src/i18n/locales/ja.json
+index e3e09261..be0dacae 100644
+--- a/web/src/i18n/locales/ja.json
++++ b/web/src/i18n/locales/ja.json
+@@ -1,4 +1,15 @@
+ {
++  "Astra IQ": "Astra IQ",
++  "Astra IQ pending": "Astra IQ pending",
++  "Astra IQ passed": "Astra IQ passed",
++  "Astra IQ wrong answer": "Astra IQ wrong answer",
++  "Astra IQ request failed": "Astra IQ request failed",
++  "Astra IQ expired": "Astra IQ expired",
++  "Astra IQ status unavailable": "Astra IQ status unavailable",
++  "Recent pass rate": "Recent pass rate",
++  "Latest answer": "Latest answer",
++  "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.": "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.",
++  "Last 24 checks: green passed, red wrong answer, amber error, gray untested.": "Last 24 checks: green passed, red wrong answer, amber error, gray untested.",
+   "translation": {
+     "360": "360",
+     "1000": "1000",
+diff --git a/web/src/i18n/locales/ru.json b/web/src/i18n/locales/ru.json
+index af18b036..2bc1eebb 100644
+--- a/web/src/i18n/locales/ru.json
++++ b/web/src/i18n/locales/ru.json
+@@ -1,4 +1,15 @@
+ {
++  "Astra IQ": "Astra IQ",
++  "Astra IQ pending": "Astra IQ pending",
++  "Astra IQ passed": "Astra IQ passed",
++  "Astra IQ wrong answer": "Astra IQ wrong answer",
++  "Astra IQ request failed": "Astra IQ request failed",
++  "Astra IQ expired": "Astra IQ expired",
++  "Astra IQ status unavailable": "Astra IQ status unavailable",
++  "Recent pass rate": "Recent pass rate",
++  "Latest answer": "Latest answer",
++  "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.": "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.",
++  "Last 24 checks: green passed, red wrong answer, amber error, gray untested.": "Last 24 checks: green passed, red wrong answer, amber error, gray untested.",
+   "translation": {
+     "360": "360",
+     "1000": "1000",
+diff --git a/web/src/i18n/locales/vi.json b/web/src/i18n/locales/vi.json
+index c7d3e719..a38383c6 100644
+--- a/web/src/i18n/locales/vi.json
++++ b/web/src/i18n/locales/vi.json
+@@ -1,4 +1,15 @@
+ {
++  "Astra IQ": "Astra IQ",
++  "Astra IQ pending": "Astra IQ pending",
++  "Astra IQ passed": "Astra IQ passed",
++  "Astra IQ wrong answer": "Astra IQ wrong answer",
++  "Astra IQ request failed": "Astra IQ request failed",
++  "Astra IQ expired": "Astra IQ expired",
++  "Astra IQ status unavailable": "Astra IQ status unavailable",
++  "Recent pass rate": "Recent pass rate",
++  "Latest answer": "Latest answer",
++  "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.": "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.",
++  "Last 24 checks: green passed, red wrong answer, amber error, gray untested.": "Last 24 checks: green passed, red wrong answer, amber error, gray untested.",
+   "translation": {
+     "360": "360",
+     "1000": "1000",
+diff --git a/web/src/i18n/locales/zh-TW.json b/web/src/i18n/locales/zh-TW.json
+index 3eca7eea..18996b5c 100644
+--- a/web/src/i18n/locales/zh-TW.json
++++ b/web/src/i18n/locales/zh-TW.json
+@@ -1,4 +1,15 @@
+ {
++  "Astra IQ": "Astra IQ",
++  "Astra IQ pending": "Astra IQ pending",
++  "Astra IQ passed": "Astra IQ passed",
++  "Astra IQ wrong answer": "Astra IQ wrong answer",
++  "Astra IQ request failed": "Astra IQ request failed",
++  "Astra IQ expired": "Astra IQ expired",
++  "Astra IQ status unavailable": "Astra IQ status unavailable",
++  "Recent pass rate": "Recent pass rate",
++  "Latest answer": "Latest answer",
++  "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.": "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.",
++  "Last 24 checks: green passed, red wrong answer, amber error, gray untested.": "Last 24 checks: green passed, red wrong answer, amber error, gray untested.",
+   "translation": {
+     "360": "360",
+     "1000": "1000",
+diff --git a/web/src/i18n/locales/zh.json b/web/src/i18n/locales/zh.json
+index 23de155c..77fe673a 100644
+--- a/web/src/i18n/locales/zh.json
++++ b/web/src/i18n/locales/zh.json
+@@ -1,4 +1,15 @@
+ {
++  "Astra IQ": "Astra 智力检测",
++  "Astra IQ pending": "待检测 · 暂不参与路由",
++  "Astra IQ passed": "已通过 · Astra 检测合格",
++  "Astra IQ wrong answer": "答案错误 · 已跳过",
++  "Astra IQ request failed": "检测异常 · 已跳过",
++  "Astra IQ expired": "结果过期或配置已变 · 待复检",
++  "Astra IQ status unavailable": "检测状态读取失败",
++  "Recent pass rate": "最近检测通过率",
++  "Latest answer": "最近答案",
++  "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.": "每 5 分钟以 medium 推理强度检测，仅最新一次通过的渠道参与 Astra 路由。",
++  "Last 24 checks: green passed, red wrong answer, amber error, gray untested.": "最近 24 次：绿色通过，红色答错，橙色异常，灰色未检测。",
+   "translation": {
+     "360": "360",
+     "1000": "1000",

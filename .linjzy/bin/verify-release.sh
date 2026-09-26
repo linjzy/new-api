@@ -16,10 +16,10 @@ if [[ "$MODE" != frontend ]]; then
   cp -R "$BUNDLE_DIR/tests/go/." "$SOURCE_DIR/"
   cd "$SOURCE_DIR"
   if [[ "$MODE" == race ]]; then
-    GOWORK=off go test -race ./relay ./relay/channel ./relay/channel/openai -run 'TestCustom|TestOaiResponses|TestNewTaskAPIRequestInheritsClientCancellation' -count=1
+    GOWORK=off go test -race ./controller ./relay ./relay/channel ./relay/channel/openai -run 'TestCustom|TestOaiResponses|TestNewTaskAPIRequestInheritsClientCancellation' -count=1
   else
     GOWORK=off go -C relaykit build ./...
-    GOWORK=off go test ./controller ./relay ./relay/channel ./relay/channel/openai ./model ./service -run 'TestCustom|TestOaiResponses|TestResponsesUsage|TestApplyResponsesUsage|TestNewTaskAPIRequestInheritsClientCancellation' -count=1
+    GOWORK=off go test -v ./controller ./relay ./relay/channel ./relay/channel/openai ./model ./service -run 'TestCustom|TestOaiResponses|TestResponsesUsage|TestApplyResponsesUsage|TestNewTaskAPIRequestInheritsClientCancellation' -count=1
   fi
 fi
 if [[ "$MODE" == frontend || "$MODE" == all ]]; then
@@ -46,6 +46,6 @@ print('\n'.join(sorted(files)))
 PYFILES
   )
   bun x oxlint -c .oxlintrc.json "${changed_ts[@]}" src/features/usage-logs/custom-tests
-  bun run test src/features/usage-logs/custom-tests
+  bun run test src/features/usage-logs/custom-tests src/features/channels/components/__tests__/astra-iq-status.test.tsx
   if [[ "${BUILD_FRONTEND:-true}" == true ]]; then bun run build; fi
 fi

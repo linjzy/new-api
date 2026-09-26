@@ -37,6 +37,26 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_PASSWORD: ci-test-only
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: ci-test-only
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -pci-test-only"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      TEST_MYSQL_DSN: root:ci-test-only@tcp(127.0.0.1:3306)/mysql?parseTime=true
+      TEST_POSTGRES_DSN: postgres://postgres:ci-test-only@127.0.0.1:5432/postgres?sslmode=disable
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -65,7 +85,7 @@ jobs:
           extended="$EXTENDED"
           if [[ "$GITHUB_EVENT_NAME" == schedule ]] ||
              { [[ -n "$BEFORE" && "$BEFORE" != 0000000000000000000000000000000000000000 ]] &&
-               ! git diff --quiet "$BEFORE" HEAD -- .linjzy/patches/responses-capacity-retry.patch .linjzy/tests/go .linjzy/bin/prepare-release.py; }; then
+               ! git diff --quiet "$BEFORE" HEAD -- .linjzy/patches/responses-capacity-retry.patch .linjzy/patches/astra-iq-gate.patch .linjzy/tests/go .linjzy/bin/prepare-release.py; }; then
             extended=true
           fi
           {

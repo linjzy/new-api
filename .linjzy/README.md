@@ -1,12 +1,13 @@
 # New API 定制
 
-基于 [QuantumNous/new-api](https://github.com/QuantumNous/new-api) 的已发布版本维护两份业务补丁。
+基于 [QuantumNous/new-api](https://github.com/QuantumNous/new-api) 的已发布版本维护独立业务补丁。
 补丁在 `patches/`，测试在 `tests/`，发布脚本在 `bin/`，服务器部署工具在 `deploy/`。
 
 | 补丁 | 功能 |
 | --- | --- |
 | `usage-logs-auto-refresh.patch` | 用量日志自动刷新、错误去重，失败后停止刷新 |
 | `responses-capacity-retry.patch` | 输出前无计费用量的容量错误重试，保留已产生用量的结算 |
+| `astra-iq-gate.patch` | Astra 定时答题检测、模型级路由门禁及卡片历史状态条 |
 
 容量重试需要开启自动重试，并配置同模型、同分组的可用替代渠道。
 已产生输出或计费用量的请求不会重放。
@@ -29,7 +30,7 @@ cp -R .linjzy ../port/ && cd ../port
 bash .linjzy/bin/prepare-release.sh . "$TAG" "$(git rev-parse HEAD)" custom/port   # 失败时保留部分应用结果和 .rej
 ```
 
-修好后重新生成对应补丁并提交到本仓库。当前补丁基于 rc.38；更换上游版本后必须重新验证。
+修好后重新生成对应补丁并提交到本仓库。Astra 补丁以 rc.40 生产源码为基线；更换上游版本后必须重新验证。
 `main` 的其余内容是上游 tag 的快照，只为方便阅读；需要时 `git merge <tag>` 同步。
 
 ## 本地验证
@@ -41,3 +42,19 @@ python3 -m unittest discover -s .linjzy/tests -p 'test_*.py'
 actionlint .github/workflows/custom-image.yml
 shellcheck .linjzy/bin/*.sh .linjzy/deploy/bin/*.sh
 ```
+
+## Astra 智力检测
+
+- 容器环境变量 `ASTRA_IQ_ENABLED=true` 启用；缺省关闭。回滚开关为 `false`，重建应用容器生效，无需删除渠道或数据库结果。
+- 仅检测配置了 `gpt-6-astra` 的渠道，每 5 分钟一轮，最多并行 3 个渠道，每个渠道最长 2 分钟。独立系统任务使用现有数据库租约避免多节点重复执行。
+- 使用指定糖果题，标准答案 **21**，请求固定 `medium` 推理强度，覆盖渠道的推理参数替换。题目不携带答案。普通业务请求参数保持原样。
+- 多密钥渠道逐一检查当前启用的密钥，全部正确才通过；答错或请求失败立即保存阻断结果。不会改变其他模型或渠道整体开关。
+- 首次未测、失败、异常、题目版本不符、凭据/上游配置变化，以及超过 10 分钟的旧结果均不放行。复检正确后恢复。读取结果失败时关闭通行，避免缓存放行旧结果。
+- 内存路由、数据库路由、重试与会话亲和都检查共享结果。指定渠道不合格时拒绝，不突破其绑定限制；检测完成前已经发出的请求不追溯中止。
+- 卡片显示最近 24 轮历史：绿=通过、红=答错、橙=异常、灰=未测；百分比是历史通过率，路由看最新结果。前端每 30 秒刷新，悬停/键盘聚焦查看最近答案和检测时间。
+- 结果只写入独立 `astra_iq_results` 表，现有渠道/密钥/计费表结构不变；历史最多保留 24 轮。每个启用密钥每天约 288 次上游检测请求，会产生上游用量，沿用现有渠道测试日志记录方式。
+- 这是一道固定题的质量门禁，不能证明模型身份或等价于通用智商评测。
+
+升级时保持补丁列于 `prepare-release.py` 和 `release-inputs.py`，不要直接使用未打补丁的官方镜像。CI 在真实 SQLite、MySQL 8、PostgreSQL 15 上验证新增表、重复迁移、旧渠道保留、即时跳过/恢复和缓存路径，并运行前端、后端回归与镜像启动检查；失败不会移动 candidate。
+
+部署固定上游版本时手动指定 release，并保留当前镜像 digest、数据库备份及 Compose 配置。独立结果表是增量添加，回滚至旧镜像时可保留。后续移植以补丁接入点为审查范围，不强行忽略冲突或跳过测试。
