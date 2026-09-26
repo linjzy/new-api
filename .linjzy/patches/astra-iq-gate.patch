@@ -22,10 +22,10 @@ index 399a2ab8..bd554f66 100644
  WORKDIR /data
 diff --git a/controller/astra_iq.go b/controller/astra_iq.go
 new file mode 100644
-index 00000000..80bb1d31
+index 00000000..bba2e040
 --- /dev/null
 +++ b/controller/astra_iq.go
-@@ -0,0 +1,397 @@
+@@ -0,0 +1,468 @@
 +package controller
 +
 +import (
@@ -239,6 +239,17 @@ index 00000000..80bb1d31
 +				continue
 +			}
 +		}
++		settings, err := model.GetAstraIQSettings()
++		if err != nil {
++			result.Status, result.Detail = "pending", "settings_unavailable"
++			return result
++		}
++		if !settings.Active(time.Now()) {
++			// A partially checked multi-key channel must not become a pass.
++			// Finish in-flight requests, but do not start another after the window.
++			result.Status, result.Detail = "pending", "outside_window"
++			return result
++		}
 +		// Probe every enabled key without advancing the production polling cursor.
 +		probe := *ch
 +		probe.Key, probe.Keys, probe.ChannelInfo = key, nil, model.ChannelInfo{}
@@ -289,7 +300,21 @@ index 00000000..80bb1d31
 +func (astraIQTestHandler) NewPayload() any         { return nil }
 +func (astraIQTestHandler) ScheduleFromStart() bool { return true }
 +
++func (astraIQTestHandler) ScheduleDue(now, lastRun int64) (bool, error) {
++	settings, err := model.GetAstraIQSettings()
++	return err == nil && settings.Due(now, lastRun), err
++}
++
 +func (astraIQTestHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
++	settings, settingsErr := model.GetAstraIQSettings()
++	if settingsErr != nil {
++		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, settingsErr)
++		return
++	}
++	if !model.AstraIQEnabled() || !settings.Active(time.Now()) {
++		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, nil, nil)
++		return
++	}
 +	userID, err := resolveChannelTestUserID(nil)
 +	if err != nil {
 +		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
@@ -318,6 +343,12 @@ index 00000000..80bb1d31
 +				result := probeAstraIQChannel(ctx, ch, userID)
 +				if ctx.Err() != nil {
 +					return
++				}
++				if result.Status == "pending" {
++					if result.Detail == "settings_unavailable" {
++						errs <- errors.New("check settings unavailable")
++					}
++					continue
 +				}
 +				if err := model.SaveAstraIQResult(ch, result); err != nil {
 +					errs <- fmt.Errorf("save channel %d IQ result: %w", ch.Id, err)
@@ -400,6 +431,11 @@ index 00000000..80bb1d31
 +		common.ApiSuccess(c, gin.H{"enabled": false, "results": views})
 +		return
 +	}
++	settings, err := model.GetAstraIQSettings()
++	if err != nil {
++		common.ApiError(c, err)
++		return
++	}
 +	var channels []*model.Channel
 +	if err := model.DB.Find(&channels).Error; err != nil {
 +		common.ApiError(c, err)
@@ -418,10 +454,45 @@ index 00000000..80bb1d31
 +	}
 +	for _, ch := range channels {
 +		if model.ChannelSupportsAstraIQ(ch) {
-+			views[ch.Id] = model.AstraIQResultView(ch, results[ch.Id])
++			views[ch.Id] = model.AstraIQResultView(ch, results[ch.Id], settings)
 +		}
 +	}
 +	common.ApiSuccess(c, gin.H{"enabled": true, "results": views})
++}
++
++func GetAstraIQSettings(c *gin.Context) {
++	settings, err := model.GetAstraIQSettings()
++	if err != nil {
++		common.ApiError(c, err)
++		return
++	}
++	common.ApiSuccess(c, settings)
++}
++
++func UpdateAstraIQSettings(c *gin.Context) {
++	var request struct {
++		StartTime       string `json:"start_time" binding:"required"`
++		EndTime         string `json:"end_time" binding:"required"`
++		IntervalMinutes int    `json:"interval_minutes" binding:"required"`
++		StopOnFailure   *bool  `json:"stop_on_failure" binding:"required"`
++	}
++	if err := c.ShouldBindJSON(&request); err != nil {
++		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Invalid check settings"})
++		return
++	}
++	settings := model.AstraIQSettings{
++		StartTime: request.StartTime, EndTime: request.EndTime,
++		IntervalMinutes: request.IntervalMinutes, StopOnFailure: *request.StopOnFailure,
++	}
++	if err := settings.Validate(); err != nil {
++		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
++		return
++	}
++	if err := model.SaveAstraIQSettings(settings); err != nil {
++		common.ApiError(c, err)
++		return
++	}
++	common.ApiSuccess(c, settings)
 +}
 diff --git a/controller/astra_iq_codex.go b/controller/astra_iq_codex.go
 new file mode 100644
@@ -597,10 +668,10 @@ index 00000000..cbe99ab7
 +}
 diff --git a/controller/astra_iq_test.go b/controller/astra_iq_test.go
 new file mode 100644
-index 00000000..4a1d8c1d
+index 00000000..2f9f192a
 --- /dev/null
 +++ b/controller/astra_iq_test.go
-@@ -0,0 +1,370 @@
+@@ -0,0 +1,452 @@
 +package controller
 +
 +import (
@@ -624,6 +695,7 @@ index 00000000..4a1d8c1d
 +	"github.com/stretchr/testify/assert"
 +	"github.com/stretchr/testify/require"
 +	"github.com/tidwall/gjson"
++	"gorm.io/gorm"
 +)
 +
 +// The first shipped IQ table used MySQL TEXT for its compact history.
@@ -694,6 +766,40 @@ index 00000000..4a1d8c1d
 +				t.Skip(dialect.env + " not configured")
 +			}
 +			db := modelManagementDB(t, dialect.kind, dsn)
++			t.Run("atomic settings API and persistent reload", func(t *testing.T) {
++				settings, err := model.GetAstraIQSettings()
++				require.NoError(t, err)
++				assert.Equal(t, model.DefaultAstraIQSettings(), settings)
++				engine := gin.New()
++				engine.GET("/settings", GetAstraIQSettings)
++				engine.PUT("/settings", UpdateAstraIQSettings)
++				valid := `{"start_time":"22:00","end_time":"06:30","interval_minutes":17,"stop_on_failure":false}`
++				w := httptest.NewRecorder()
++				engine.ServeHTTP(w, httptest.NewRequest(http.MethodPut, "/settings", strings.NewReader(valid)))
++				require.Equal(t, http.StatusOK, w.Code, w.Body.String())
++				for _, invalid := range []string{
++					strings.Replace(valid, "22:00", "24:00", 1),
++					strings.Replace(valid, "06:30", "6:30", 1),
++					strings.Replace(valid, ":17,", ":0,", 1),
++					strings.Replace(valid, ":17,", ":1441,", 1),
++					strings.Replace(valid, ":17,", ":1.5,", 1),
++					strings.Replace(valid, `,"stop_on_failure":false`, "", 1),
++					`{}`, `null`,
++				} {
++					w = httptest.NewRecorder()
++					engine.ServeHTTP(w, httptest.NewRequest(http.MethodPut, "/settings", strings.NewReader(invalid)))
++					assert.Equal(t, http.StatusBadRequest, w.Code, invalid)
++				}
++				// Read through another GORM session instead of relying on process state.
++				previousDB := model.DB
++				model.DB = db.Session(&gorm.Session{NewDB: true})
++				defer func() { model.DB = previousDB }()
++				w = httptest.NewRecorder()
++				engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/settings", nil))
++				require.Equal(t, http.StatusOK, w.Code, w.Body.String())
++				assert.JSONEq(t, valid, gjson.GetBytes(w.Body.Bytes(), "data").Raw)
++				require.NoError(t, model.SaveAstraIQSettings(model.DefaultAstraIQSettings()))
++			})
 +			channels := []model.Channel{
 +				{Id: 201, Name: "high priority", Type: 1, Key: "test-a", Status: common.ChannelStatusEnabled, Models: model.AstraIQModel + ",unrelated-model", Group: "default", Priority: common.GetPointer(int64(10))},
 +				{Id: 202, Name: "fallback", Type: 1, Key: "test-b", Status: common.ChannelStatusEnabled, Models: model.AstraIQModel, Group: "default", Priority: common.GetPointer(int64(5))},
@@ -737,12 +843,13 @@ index 00000000..4a1d8c1d
 +					require.NoError(t, db.Where("channel_id IN ?", []int{201, 202}).Delete(&model.AstraIQResult{}).Error)
 +					selected, err := model.GetRandomSatisfiedChannel("default", model.AstraIQModel, 0, nil)
 +					require.NoError(t, err)
-+					assert.Nil(t, selected, "untested channels must be blocked")
++					require.NotNil(t, selected)
++					assert.Equal(t, 201, selected.Id, "untested channels must be allowed")
 +					require.NoError(t, model.SaveAstraIQResult(&channels[1], model.AstraIQResult{Status: "pass", CheckedAt: common.GetTimestamp()}))
 +					selected, err = model.GetRandomSatisfiedChannel("default", model.AstraIQModel, 0, nil)
 +					require.NoError(t, err)
 +					require.NotNil(t, selected)
-+					assert.Equal(t, 202, selected.Id)
++					assert.Equal(t, 201, selected.Id, "an untested higher-priority channel stays eligible")
 +					require.NoError(t, model.SaveAstraIQResult(&channels[0], model.AstraIQResult{Status: "pass", CheckedAt: common.GetTimestamp()}))
 +					selected, err = model.GetRandomSatisfiedChannel("default", model.AstraIQModel, 0, nil)
 +					require.NoError(t, err)
@@ -762,18 +869,28 @@ index 00000000..4a1d8c1d
 +					require.NoError(t, err)
 +					require.NotNil(t, selected)
 +					assert.Equal(t, 201, selected.Id)
-+					require.NoError(t, model.SaveAstraIQResult(&channels[1], model.AstraIQResult{Status: "pass", CheckedAt: common.GetTimestamp() - int64(model.AstraIQMaxAge/time.Second)}))
++					require.NoError(t, model.SaveAstraIQResult(&channels[1], model.AstraIQResult{Status: "pass", CheckedAt: common.GetTimestamp() - 24*60*60}))
 +					selected, err = model.GetRandomSatisfiedChannel("default", model.AstraIQModel, 0, nil)
 +					require.NoError(t, err)
-+					assert.Nil(t, selected, "expired pass cannot bypass gate")
++					require.NotNil(t, selected)
++					assert.Equal(t, 202, selected.Id, "retain the latest result between scheduled checks")
++					settings := model.DefaultAstraIQSettings()
++					settings.StopOnFailure = false
++					require.NoError(t, model.SaveAstraIQSettings(settings))
++					selected, err = model.GetRandomSatisfiedChannel("default", model.AstraIQModel, 0, nil)
++					require.NoError(t, err)
++					require.NotNil(t, selected)
++					assert.Equal(t, 201, selected.Id, "saving the switch must immediately affect cached routing")
++					assert.True(t, model.AstraIQAllowsChannel(&channels[0], model.AstraIQModel))
++					require.NoError(t, model.SaveAstraIQSettings(model.DefaultAstraIQSettings()))
 +					require.NoError(t, model.SaveAstraIQResult(&channels[0], model.AstraIQResult{Status: "pass", CheckedAt: common.GetTimestamp()}))
 +					assert.True(t, model.AstraIQAllowsChannel(&channels[0], model.AstraIQModel), "next correct probe restores routing")
 +					changed := channels[0]
 +					changed.Key = "replacement-key"
-+					assert.False(t, model.AstraIQAllowsChannel(&changed, model.AstraIQModel))
++					assert.True(t, model.AstraIQAllowsChannel(&changed, model.AstraIQModel), "changed credentials have no applicable result yet")
 +					rows, err := model.GetAstraIQResults([]int{201})
 +					require.NoError(t, err)
-+					view := model.AstraIQResultView(&channels[0], rows[201])
++					view := model.AstraIQResultView(&channels[0], rows[201], model.DefaultAstraIQSettings())
 +					assert.InDelta(t, 66.6667, view.PassRate, 0.001)
 +					encoded, err := common.Marshal(view)
 +					require.NoError(t, err)
@@ -806,20 +923,20 @@ index 00000000..4a1d8c1d
 +					{"/checks/201/0", 400, 3, true},
 +					{"/checks/201/999", 404, 3, true},
 +					{fmt.Sprintf("/checks/201/%d", now-30), 200, 2, true},
-+					{fmt.Sprintf("/checks/201/%d", now-10), 200, 1, false},
-+					{"/checks/201", 200, 0, false},
-+					{"/checks/201", 200, 0, false},
++					{fmt.Sprintf("/checks/201/%d", now-10), 200, 1, true},
++					{"/checks/201", 200, 0, true},
++					{"/checks/201", 200, 0, true},
 +				} {
 +					w := httptest.NewRecorder()
 +					engine.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, tc.path, nil))
 +					require.Equal(t, tc.code, w.Code, w.Body.String())
 +					rows, err := model.GetAstraIQResults([]int{201, 202})
 +					require.NoError(t, err)
-+					view := model.AstraIQResultView(&channels[0], rows[201])
++					view := model.AstraIQResultView(&channels[0], rows[201], model.DefaultAstraIQSettings())
 +					assert.Len(t, view.History, tc.count)
 +					assert.Equal(t, tc.allowed, view.Allowed)
 +					assert.Equal(t, before[202], rows[202], "deletion must be scoped to the selected channel")
-+					if !tc.allowed {
++					if tc.count <= 1 {
 +						assert.Equal(t, "pending", view.Status)
 +						assert.Zero(t, view.CheckedAt)
 +						assert.Empty(t, view.Answer)
@@ -828,10 +945,14 @@ index 00000000..4a1d8c1d
 +				require.NoError(t, model.SaveAstraIQResult(&channels[0], model.AstraIQResult{Status: "pass", CheckedAt: now, Answer: "21"}))
 +				rows, err := model.GetAstraIQResults([]int{201})
 +				require.NoError(t, err)
-+				assert.Len(t, model.AstraIQResultView(&channels[0], rows[201]).History, 1, "new checks must not resurrect deleted history")
++				assert.Len(t, model.AstraIQResultView(&channels[0], rows[201], model.DefaultAstraIQSettings()).History, 1, "new checks must not resurrect deleted history")
 +				require.NoError(t, model.SaveAstraIQResult(&channels[0], model.AstraIQResult{Status: "fail", CheckedAt: now + 1, Answer: "29"}))
 +				require.NoError(t, model.DeleteAstraIQResults(201, now+1))
-+				assert.False(t, model.AstraIQAllowsChannel(&channels[0], model.AstraIQModel), "deleting a failure must not revive an older passing result")
++				assert.True(t, model.AstraIQAllowsChannel(&channels[0], model.AstraIQModel), "deleting the latest result permits untested calls")
++				rows, err = model.GetAstraIQResults([]int{201})
++				require.NoError(t, err)
++				assert.Equal(t, "pending", rows[201].Status)
++				assert.Zero(t, rows[201].CheckedAt, "an older result must not be promoted")
 +			})
 +		})
 +	}
@@ -952,7 +1073,7 @@ index 00000000..4a1d8c1d
 +	require.NoError(t, model.SaveAstraIQResult(ch, model.AstraIQResult{Status: "pass", CheckedAt: 200, Answer: "21"}))
 +	rows, err := model.GetAstraIQResults([]int{ch.Id})
 +	require.NoError(t, err)
-+	assert.Empty(t, model.AstraIQResultView(ch, rows[ch.Id]).History[0].Attempts, "polling endpoint must not carry all historical responses")
++	assert.Empty(t, model.AstraIQResultView(ch, rows[ch.Id], model.DefaultAstraIQSettings()).History[0].Attempts, "polling endpoint must not carry all historical responses")
 +	for _, tc := range []struct {
 +		at   string
 +		code int
@@ -969,6 +1090,38 @@ index 00000000..4a1d8c1d
 +			assert.Equal(t, astraIQQuestion, gjson.GetBytes(w.Body.Bytes(), "data.question").String())
 +			assert.Equal(t, "medium", gjson.GetBytes(w.Body.Bytes(), "data.reasoning_effort").String())
 +		}
++	}
++}
++
++func TestCustomAstraIQDailySchedule(t *testing.T) {
++	stamp := func(value string) int64 {
++		parsed, err := time.Parse(time.RFC3339, value)
++		require.NoError(t, err)
++		return parsed.Unix()
++	}
++	for _, tc := range []struct {
++		name, start, end, now, last string
++		interval                    int
++		active, due                 bool
++	}{
++		{"before start", "09:00", "18:00", "2026-09-26T08:59:59+08:00", "2026-09-25T09:00:00+08:00", 5, false, false},
++		{"start inclusive", "09:00", "18:00", "2026-09-26T09:00:00+08:00", "2026-09-25T17:59:00+08:00", 1440, true, true},
++		{"wait interval", "09:00", "18:00", "2026-09-26T09:16:59+08:00", "2026-09-26T09:00:00+08:00", 17, true, false},
++		{"interval due in UTC", "09:00", "18:00", "2026-09-26T01:17:00Z", "2026-09-26T09:00:00+08:00", 17, true, true},
++		{"end exclusive", "09:00", "18:00", "2026-09-26T18:00:00+08:00", "2026-09-26T09:00:00+08:00", 5, false, false},
++		{"overnight before midnight", "22:00", "06:00", "2026-09-26T23:59:00+08:00", "2026-09-26T22:00:00+08:00", 5, true, true},
++		{"overnight does not reset at midnight", "22:00", "06:00", "2026-09-27T00:01:00+08:00", "2026-09-26T23:59:00+08:00", 5, true, false},
++		{"overnight end", "22:00", "06:00", "2026-09-27T06:00:00+08:00", "2026-09-26T22:00:00+08:00", 5, false, false},
++		{"equal means all day", "09:00", "09:00", "2026-09-27T08:59:00+08:00", "2026-09-26T23:59:00+08:00", 5, true, true},
++		{"all day does not reset at midnight", "00:00", "00:00", "2026-09-27T00:01:00+08:00", "2026-09-26T23:59:00+08:00", 5, true, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			settings := model.AstraIQSettings{StartTime: tc.start, EndTime: tc.end, IntervalMinutes: tc.interval, StopOnFailure: true}
++			require.NoError(t, settings.Validate())
++			assert.Equal(t, tc.active, settings.Active(time.Unix(stamp(tc.now), 0)))
++			assert.Equal(t, tc.due, settings.Due(stamp(tc.now), stamp(tc.last)))
++			assert.Equal(t, tc.active, settings.Due(stamp(tc.now), 0), "first check obeys the window")
++		})
 +	}
 +}
 diff --git a/controller/channel-test.go b/controller/channel-test.go
@@ -1146,10 +1299,10 @@ index b86c442d..abf4fd1b 100644
  				return nil
 diff --git a/model/astra_iq.go b/model/astra_iq.go
 new file mode 100644
-index 00000000..44c70d09
+index 00000000..4c487c99
 --- /dev/null
 +++ b/model/astra_iq.go
-@@ -0,0 +1,253 @@
+@@ -0,0 +1,272 @@
 +package model
 +
 +import (
@@ -1172,7 +1325,6 @@ index 00000000..44c70d09
 +	AstraIQVersion     = "candy-21-medium-v1"
 +	AstraIQTaskType    = "astra_iq_test"
 +	AstraIQInterval    = 5 * time.Minute
-+	AstraIQMaxAge      = 10 * time.Minute
 +	AstraIQHistorySize = 24
 +)
 +
@@ -1256,10 +1408,19 @@ index 00000000..44c70d09
 +	return fmt.Sprintf("%x", sha256.Sum256(data))
 +}
 +
-+func (r AstraIQResult) Allows(ch *Channel, now int64) bool {
-+	return ch != nil && r.Status == "pass" && r.Version == AstraIQVersion &&
-+		r.CheckedAt > 0 && now >= r.CheckedAt && now-r.CheckedAt < int64(AstraIQMaxAge/time.Second) &&
++func (r AstraIQResult) applicable(ch *Channel) bool {
++	return ch != nil && r.CheckedAt > 0 && r.Version == AstraIQVersion &&
 +		r.Fingerprint != "" && r.Fingerprint == AstraIQFingerprint(ch)
++}
++
++func (r AstraIQResult) Allows(ch *Channel, settings AstraIQSettings) bool {
++	if ch == nil {
++		return false
++	}
++	// No result (including cleared history or changed credentials) is allowed.
++	// Only an actual failure blocks calls, and it remains in force outside the
++	// check window until a new pass, deletion, or disabling this setting.
++	return !settings.StopOnFailure || !r.applicable(ch) || (r.Status != "fail" && r.Status != "error")
 +}
 +
 +// Read shared storage at selection time so a failed probe takes effect on every
@@ -1286,12 +1447,26 @@ index 00000000..44c70d09
 +	if ch == nil {
 +		return false
 +	}
++	settings, err := GetAstraIQSettings()
++	if err != nil {
++		return false
++	}
++	if !settings.StopOnFailure {
++		return true
++	}
 +	results, err := GetAstraIQResults([]int{ch.Id})
-+	return err == nil && results[ch.Id].Allows(ch, common.GetTimestamp())
++	return err == nil && results[ch.Id].Allows(ch, settings)
 +}
 +
 +func filterAstraIQCandidateIDs(ids []int, modelName string) []int {
 +	if !AstraIQRequired(modelName) {
++		return ids
++	}
++	settings, err := GetAstraIQSettings()
++	if err != nil {
++		return nil
++	}
++	if !settings.StopOnFailure {
 +		return ids
 +	}
 +	results, err := GetAstraIQResults(ids)
@@ -1300,7 +1475,7 @@ index 00000000..44c70d09
 +	}
 +	kept := make([]int, 0, len(ids))
 +	for _, id := range ids {
-+		if results[id].Allows(channelsIDM[id], common.GetTimestamp()) {
++		if results[id].Allows(channelsIDM[id], settings) {
 +			kept = append(kept, id)
 +		}
 +	}
@@ -1342,7 +1517,7 @@ index 00000000..44c70d09
 +}
 +
 +// checkedAt == 0 clears this channel's entire history. Removing the latest
-+// result always revokes approval; an older passing sample is never promoted.
++// result resets the channel to untested; an older sample is never promoted.
 +func DeleteAstraIQResults(channelID int, checkedAt int64) error {
 +	return DB.Transaction(func(tx *gorm.DB) error {
 +		var result AstraIQResult
@@ -1377,15 +1552,12 @@ index 00000000..44c70d09
 +	})
 +}
 +
-+func AstraIQResultView(ch *Channel, r AstraIQResult) AstraIQView {
++func AstraIQResultView(ch *Channel, r AstraIQResult, settings AstraIQSettings) AstraIQView {
 +	view := AstraIQView{AstraIQResult: r, History: []AstraIQSample{}}
 +	view.ChannelID = ch.Id
-+	view.Allowed = r.Allows(ch, common.GetTimestamp())
-+	if view.Status == "" {
++	view.Allowed = r.Allows(ch, settings)
++	if view.Status == "" || !r.applicable(ch) {
 +		view.Status = "pending"
-+	}
-+	if r.Status == "pass" && !view.Allowed {
-+		view.Status = "expired"
 +	}
 +	_ = common.UnmarshalJsonStr(string(r.HistoryJSON), &view.History)
 +	passed := 0
@@ -1402,6 +1574,110 @@ index 00000000..44c70d09
 +		view.PassRate = float64(passed) * 100 / float64(len(view.History))
 +	}
 +	return view
++}
+diff --git a/model/astra_iq_settings.go b/model/astra_iq_settings.go
+new file mode 100644
+index 00000000..910e3a0c
+--- /dev/null
++++ b/model/astra_iq_settings.go
+@@ -0,0 +1,98 @@
++package model
++
++import (
++	"context"
++	"errors"
++	"time"
++
++	"github.com/QuantumNous/new-api/common"
++	"gorm.io/gorm/clause"
++)
++
++const astraIQSettingsKey = "AstraIQSettings"
++
++var astraIQTimezone = time.FixedZone("Asia/Shanghai", 8*60*60)
++
++type AstraIQSettings struct {
++	StartTime       string `json:"start_time"`
++	EndTime         string `json:"end_time"`
++	IntervalMinutes int    `json:"interval_minutes"`
++	StopOnFailure   bool   `json:"stop_on_failure"`
++}
++
++func DefaultAstraIQSettings() AstraIQSettings {
++	return AstraIQSettings{StartTime: "00:00", EndTime: "00:00", IntervalMinutes: 5, StopOnFailure: true}
++}
++
++func (s AstraIQSettings) Validate() error {
++	for _, value := range []string{s.StartTime, s.EndTime} {
++		parsed, err := time.Parse("15:04", value)
++		if err != nil || parsed.Format("15:04") != value {
++			return errors.New("Use HH:mm for check times")
++		}
++	}
++	if s.IntervalMinutes < 1 || s.IntervalMinutes > 1440 {
++		return errors.New("Check interval must be an integer from 1 to 1440")
++	}
++	return nil
++}
++
++// All nodes use Beijing time. Equal endpoints mean all day; overnight windows
++// belong to the day on which they start. The end boundary is exclusive.
++func (s AstraIQSettings) window(now time.Time) (time.Time, bool) {
++	now = now.In(astraIQTimezone)
++	startClock, _ := time.Parse("15:04", s.StartTime)
++	endClock, _ := time.Parse("15:04", s.EndTime)
++	start := time.Date(now.Year(), now.Month(), now.Day(), startClock.Hour(), startClock.Minute(), 0, 0, astraIQTimezone)
++	end := time.Date(now.Year(), now.Month(), now.Day(), endClock.Hour(), endClock.Minute(), 0, 0, astraIQTimezone)
++	if !end.After(start) {
++		if now.Before(end) {
++			start = start.AddDate(0, 0, -1)
++		} else {
++			end = end.AddDate(0, 0, 1)
++		}
++	}
++	return start, !now.Before(start) && now.Before(end)
++}
++
++func (s AstraIQSettings) Active(now time.Time) bool {
++	_, active := s.window(now)
++	return active
++}
++
++func (s AstraIQSettings) Due(now, lastRun int64) bool {
++	start, active := s.window(time.Unix(now, 0))
++	return active && (lastRun == 0 || (s.StartTime != s.EndTime && lastRun < start.Unix()) || now-lastRun >= int64(s.IntervalMinutes)*60)
++}
++
++// A single shared database value makes all four fields atomic and immediately
++// visible to every routing/scheduler instance, including after a restart.
++func GetAstraIQSettings() (AstraIQSettings, error) {
++	settings := DefaultAstraIQSettings()
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	var option Option
++	result := DB.WithContext(ctx).Where(&Option{Key: astraIQSettingsKey}).Find(&option)
++	if result.Error != nil || result.RowsAffected == 0 {
++		return settings, result.Error
++	}
++	if err := common.UnmarshalJsonStr(option.Value, &settings); err != nil {
++		return settings, err
++	}
++	return settings, settings.Validate()
++}
++
++func SaveAstraIQSettings(settings AstraIQSettings) error {
++	if err := settings.Validate(); err != nil {
++		return err
++	}
++	value, err := common.Marshal(settings)
++	if err != nil {
++		return err
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	return DB.WithContext(ctx).Clauses(clause.OnConflict{
++		Columns: []clause.Column{{Name: "key"}}, DoUpdates: clause.AssignmentColumns([]string{"value"}),
++	}).Create(&Option{Key: astraIQSettingsKey, Value: string(value)}).Error
 +}
 diff --git a/model/channel_constraint.go b/model/channel_constraint.go
 index 34121a7b..b8452657 100644
@@ -1442,14 +1718,16 @@ index 917d4e05..1aae158f 100644
  		&User{},
  		&UserSession{},
 diff --git a/router/channel-router.go b/router/channel-router.go
-index 2d59b039..dc0dfa78 100644
+index 2d59b039..c5df7b1d 100644
 --- a/router/channel-router.go
 +++ b/router/channel-router.go
-@@ -37,6 +37,10 @@ func registerChannelRoutes(apiRouter *gin.RouterGroup) {
+@@ -37,6 +37,12 @@ func registerChannelRoutes(apiRouter *gin.RouterGroup) {
  }
  
  var channelPermissionRoutes = []permissionRoute{
 +	{method: http.MethodGet, path: "/astra_iq", permission: authz.ChannelRead, handler: controller.GetAstraIQStatus},
++	{method: http.MethodGet, path: "/astra_iq/settings", permission: authz.ChannelRead, handler: controller.GetAstraIQSettings},
++	{method: http.MethodPut, path: "/astra_iq/settings", permission: authz.ChannelWrite, handler: controller.UpdateAstraIQSettings},
 +	{method: http.MethodGet, path: "/astra_iq/:id/:checked_at", permission: authz.ChannelRead, handler: controller.GetAstraIQSample},
 +	{method: http.MethodDelete, path: "/astra_iq/:id", permission: authz.ChannelWrite, handler: controller.DeleteAstraIQResults},
 +	{method: http.MethodDelete, path: "/astra_iq/:id/:checked_at", permission: authz.ChannelWrite, handler: controller.DeleteAstraIQResults},
@@ -1457,10 +1735,10 @@ index 2d59b039..dc0dfa78 100644
  	{method: http.MethodGet, path: "/search", permission: authz.ChannelRead, handler: controller.SearchChannels},
  	{method: http.MethodGet, path: "/models", permission: authz.ChannelRead, handler: controller.ChannelListModels},
 diff --git a/router/channel_router_test.go b/router/channel_router_test.go
-index cd897713..82c8bafb 100644
+index cd897713..c44b4496 100644
 --- a/router/channel_router_test.go
 +++ b/router/channel_router_test.go
-@@ -51,6 +51,19 @@ func TestChannelStatusRoutesRegisterWithoutConflict(t *testing.T) {
+@@ -51,6 +51,31 @@ func TestChannelStatusRoutesRegisterWithoutConflict(t *testing.T) {
  	})
  }
  
@@ -1473,6 +1751,18 @@ index cd897713..82c8bafb 100644
 +	for _, path := range []string{"/api/channel/astra_iq/201", "/api/channel/astra_iq/201/100"} {
 +		w := httptest.NewRecorder()
 +		engine.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, path, nil))
++		assert.Equal(t, http.StatusUnauthorized, w.Code)
++	}
++}
++
++func TestCustomAstraIQSettingsRequireChannelPermissions(t *testing.T) {
++	assertChannelRoutePermission(t, http.MethodGet, "/astra_iq/settings", authz.ChannelRead, controller.GetAstraIQSettings)
++	assertChannelRoutePermission(t, http.MethodPut, "/astra_iq/settings", authz.ChannelWrite, controller.UpdateAstraIQSettings)
++	engine := gin.New()
++	registerChannelRoutes(engine.Group("/api"))
++	for _, method := range []string{http.MethodGet, http.MethodPut} {
++		w := httptest.NewRecorder()
++		engine.ServeHTTP(w, httptest.NewRequest(method, "/api/channel/astra_iq/settings", nil))
 +		assert.Equal(t, http.StatusUnauthorized, w.Code)
 +	}
 +}
@@ -1509,10 +1799,10 @@ index 00000000..2d9f6054
 +mkdir -p "$destination"
 +install -m 755 "$scratch/codex-$target" "$destination/codex"
 diff --git a/service/system_task.go b/service/system_task.go
-index b7182aef..e19ed05d 100644
+index b7182aef..96196720 100644
 --- a/service/system_task.go
 +++ b/service/system_task.go
-@@ -46,6 +46,12 @@ type ScheduledSystemTaskHandler interface {
+@@ -46,6 +46,17 @@ type ScheduledSystemTaskHandler interface {
  	NewPayload() any
  }
  
@@ -1522,27 +1812,56 @@ index b7182aef..e19ed05d 100644
 +	ScheduleFromStart() bool
 +}
 +
++// Optional for schedules with daily windows or a configurable cadence.
++type dueSystemTaskHandler interface {
++	ScheduleDue(now, lastRun int64) (bool, error)
++}
++
  var (
  	systemTaskHandlersMu sync.RWMutex
  	systemTaskHandlers   = map[string]SystemTaskHandler{}
-@@ -284,7 +290,11 @@ func runSystemTaskScheduler() {
+@@ -280,13 +291,26 @@ func runSystemTaskScheduler() {
+ 	}
+ 	for _, scheduled := range scheduledHandlers {
+ 		latest := latestTasks[scheduled.Type()]
++		var lastRun int64
+ 		if latest != nil {
  			if latest.Status == model.SystemTaskStatusPending || latest.Status == model.SystemTaskStatusRunning {
  				continue // an active row already exists
  			}
 -			if now-latest.UpdatedAt < int64(scheduled.Interval().Seconds()) {
-+			lastRun := latest.UpdatedAt
+-				continue // not due yet
++			lastRun = latest.UpdatedAt
 +			if anchored, ok := scheduled.(startIntervalSystemTaskHandler); ok && anchored.ScheduleFromStart() {
 +				lastRun = latest.CreatedAt
 +			}
-+			if now-lastRun < int64(scheduled.Interval().Seconds()) {
- 				continue // not due yet
++		}
++		if custom, ok := scheduled.(dueSystemTaskHandler); ok {
++			due, err := custom.ScheduleDue(now, lastRun)
++			if err != nil {
++				logger.LogWarn(context.Background(), fmt.Sprintf("system task schedule failed: type=%s err=%v", scheduled.Type(), err))
++			}
++			if err != nil || !due {
++				continue
  			}
++		} else if latest != nil && now-lastRun < int64(scheduled.Interval().Seconds()) {
++			continue // not due yet
  		}
+ 		if _, err := model.CreateSystemTask(scheduled.Type(), scheduled.NewPayload(), nil); err != nil {
+ 			activeTask, activeErr := model.GetActiveSystemTask(scheduled.Type())
 diff --git a/service/system_task_test.go b/service/system_task_test.go
-index baaf9142..f9b04b64 100644
+index baaf9142..44adcc05 100644
 --- a/service/system_task_test.go
 +++ b/service/system_task_test.go
-@@ -31,10 +31,11 @@ func withSystemTaskRegistry(t *testing.T, handlers ...SystemTaskHandler) {
+@@ -2,6 +2,7 @@ package service
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"testing"
+ 	"time"
+ 
+@@ -31,10 +32,11 @@ func withSystemTaskRegistry(t *testing.T, handlers ...SystemTaskHandler) {
  }
  
  type stubScheduledHandler struct {
@@ -1558,7 +1877,7 @@ index baaf9142..f9b04b64 100644
  }
  
  type stubSystemTaskRunResult struct {
-@@ -54,6 +55,32 @@ func (h *stubScheduledHandler) Run(ctx context.Context, task *model.SystemTask,
+@@ -54,6 +56,70 @@ func (h *stubScheduledHandler) Run(ctx context.Context, task *model.SystemTask,
  func (h *stubScheduledHandler) Enabled() bool           { return h.enabled }
  func (h *stubScheduledHandler) Interval() time.Duration { return h.interval }
  func (h *stubScheduledHandler) NewPayload() any         { return nil }
@@ -1588,15 +1907,53 @@ index baaf9142..f9b04b64 100644
 +		})
 +	}
 +}
++
++type stubWindowHandler struct {
++	stubScheduledHandler
++	due bool
++	err error
++}
++
++func (h *stubWindowHandler) ScheduleDue(now, lastRun int64) (bool, error) {
++	return h.due, h.err
++}
++
++func TestCustomAstraIQSchedulerHonorsWindowForFirstAndLaterRuns(t *testing.T) {
++	truncate(t)
++	handler := &stubWindowHandler{stubScheduledHandler: stubScheduledHandler{taskType: model.AstraIQTaskType, enabled: true, interval: 24 * time.Hour, fromStart: true}}
++	withSystemTaskRegistry(t, handler)
++	runSystemTaskScheduler()
++	assert.Zero(t, countSystemTasks(t, handler.taskType), "no first run outside the window")
++	handler.due, handler.err = true, errors.New("settings unavailable")
++	runSystemTaskScheduler()
++	assert.Zero(t, countSystemTasks(t, handler.taskType), "configuration errors must not launch probes")
++	handler.err = nil
++	runSystemTaskScheduler()
++	require.Equal(t, int64(1), countSystemTasks(t, handler.taskType))
++	runSystemTaskScheduler()
++	assert.Equal(t, int64(1), countSystemTasks(t, handler.taskType), "active runs remain deduplicated")
++	task, err := model.GetLatestSystemTask(handler.taskType)
++	require.NoError(t, err)
++	_, claimed, err := model.ClaimSystemTask(task.ID, task.Type, "window-runner", common.GetTimestamp()+60)
++	require.NoError(t, err)
++	require.True(t, claimed)
++	require.NoError(t, model.FinishSystemTask(task.TaskID, "window-runner", model.SystemTaskStatusSucceeded, nil, ""))
++	handler.due = false
++	runSystemTaskScheduler()
++	assert.Equal(t, int64(1), countSystemTasks(t, handler.taskType))
++	handler.due = true
++	runSystemTaskScheduler()
++	assert.Equal(t, int64(2), countSystemTasks(t, handler.taskType), "reopening a daily window can override the default interval")
++}
  
  func countSystemTasks(t *testing.T, taskType string) int64 {
  	t.Helper()
 diff --git a/web/src/features/channels/components/__tests__/astra-iq-status.test.tsx b/web/src/features/channels/components/__tests__/astra-iq-status.test.tsx
 new file mode 100644
-index 00000000..8d647e72
+index 00000000..fe75eded
 --- /dev/null
 +++ b/web/src/features/channels/components/__tests__/astra-iq-status.test.tsx
-@@ -0,0 +1,353 @@
+@@ -0,0 +1,444 @@
 +/*
 +Copyright (C) 2023-2026 QuantumNous
 +
@@ -1616,16 +1973,21 @@ index 00000000..8d647e72
 +For commercial licensing, please contact support@quantumnous.com
 +*/
 +import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-+import { render, screen, waitFor, within } from '@testing-library/react'
++import {
++  fireEvent,
++  render,
++  screen,
++  waitFor,
++  within,
++} from '@testing-library/react'
 +import userEvent from '@testing-library/user-event'
-+import { createInstance } from 'i18next'
 +import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 +
-+import zh from '@/i18n/locales/zh.json'
 +import { api } from '@/lib/api'
 +import { ROLE } from '@/lib/roles'
 +import { useAuthStore } from '@/stores/auth-store'
 +
++import { AstraIQSettings } from '../astra-iq-settings'
 +import { AstraIQStatus, type AstraIQStatusData } from '../astra-iq-status'
 +import type { IQCheckDetail } from '../dialogs/astra-iq-detail-dialog'
 +
@@ -1641,13 +2003,6 @@ index 00000000..8d647e72
 +afterEach(() => {
 +  vi.restoreAllMocks()
 +  useAuthStore.setState({ auth: originalAuth })
-+})
-+
-+it('resolves the Chinese check labels through the application translation namespace', async () => {
-+  const translator = createInstance()
-+  await translator.init({ lng: 'zhCN', resources: { zhCN: zh } })
-+  expect(translator.t('Astra IQ passed')).toBe('通过')
-+  expect(translator.t('Astra IQ check details')).toBe('Astra 检测详情')
 +})
 +
 +const history = [
@@ -1696,27 +2051,18 @@ index 00000000..8d647e72
 +  },
 +}
 +
-+function renderStatus(data: AstraIQStatusData = statusData, enabled = true) {
++function renderStatus() {
 +  const client = new QueryClient({
 +    defaultOptions: { queries: { retry: false } },
 +  })
-+  client.setQueryData(['channels', 'astra-iq'], data)
++  client.setQueryData(['channels', 'astra-iq'], statusData)
 +  render(
 +    <QueryClientProvider client={client}>
-+      <AstraIQStatus channelId={2} channelEnabled={enabled} />
++      <AstraIQStatus channelId={2} />
 +    </QueryClientProvider>
 +  )
 +  return client
 +}
-+
-+it('renders only timeline segments without headings, percentages or status text', () => {
-+  renderStatus()
-+  const timeline = screen.getByRole('group')
-+  expect(timeline).toHaveTextContent('')
-+  expect(within(timeline).getAllByRole('button')).toHaveLength(2)
-+  expect(screen.queryByText('50%')).not.toBeInTheDocument()
-+  expect(screen.queryByText('Astra IQ')).not.toBeInTheDocument()
-+})
 +
 +it('opens the selected historical check rather than the newest result', async () => {
 +  const get = vi
@@ -1742,44 +2088,6 @@ index 00000000..8d647e72
 +  expect(within(dialog).getByText('4,631 / 1,540')).toBeVisible()
 +  client.setQueryData(['channels', 'astra-iq'], { ...statusData, results: {} })
 +  expect(within(dialog).getByText('22')).toBeVisible()
-+})
-+
-+it('supports keyboard opening and closing each historical check', async () => {
-+  vi.spyOn(api, 'get').mockResolvedValue({
-+    data: { success: true, data: detail },
-+  })
-+  renderStatus()
-+  await userEvent.tab()
-+  expect(
-+    screen.getByRole('button', { name: /Astra IQ wrong answer/ })
-+  ).toHaveFocus()
-+  await userEvent.keyboard('{Enter}')
-+  expect(await screen.findByRole('dialog')).toBeVisible()
-+  await userEvent.keyboard('{Escape}')
-+  await waitFor(() =>
-+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
-+  )
-+})
-+
-+it('shows placeholders without inventing records for untested channels', () => {
-+  renderStatus({ enabled: true, results: {} })
-+  expect(
-+    screen.getByRole('group', { name: /Astra IQ pending/ })
-+  ).toHaveTextContent('')
-+  expect(screen.queryByRole('button')).not.toBeInTheDocument()
-+})
-+
-+it('keeps historical segments readable for a disabled channel', () => {
-+  renderStatus(statusData, false)
-+  expect(
-+    screen.getByRole('group', { name: /Astra IQ disabled channel/ })
-+  ).toBeInTheDocument()
-+  expect(screen.getAllByRole('button')).toHaveLength(2)
-+})
-+
-+it('hides the timeline when the feature is off', () => {
-+  renderStatus({ enabled: false, results: {} })
-+  expect(screen.queryByRole('group')).not.toBeInTheDocument()
 +})
 +
 +it('does not keep displaying an old pass when status polling fails', async () => {
@@ -1950,6 +2258,441 @@ index 00000000..8d647e72
 +    screen.queryByRole('button', { name: 'Delete all checks' })
 +  ).not.toBeInTheDocument()
 +})
++
++const defaultSettings = {
++  start_time: '00:00',
++  end_time: '00:00',
++  interval_minutes: 5,
++  stop_on_failure: true,
++}
++
++async function openSettings() {
++  const client = new QueryClient({
++    defaultOptions: { queries: { retry: false } },
++  })
++  render(
++    <QueryClientProvider client={client}>
++      <AstraIQSettings />
++    </QueryClientProvider>
++  )
++  await userEvent.click(screen.getByRole('button', { name: 'Check settings' }))
++  return client
++}
++
++it('loads, saves all four settings and reloads the saved values on reopen', async () => {
++  let saved = { ...defaultSettings }
++  const get = vi
++    .spyOn(api, 'get')
++    .mockImplementation(async () => ({ data: { success: true, data: saved } }))
++  const put = vi.spyOn(api, 'put').mockImplementation(async (_url, body) => {
++    saved = body as typeof defaultSettings
++    return { data: { success: true, data: saved } }
++  })
++  const client = await openSettings()
++  const invalidate = vi.spyOn(client, 'invalidateQueries')
++  fireEvent.change(await screen.findByLabelText('Check start time'), {
++    target: { value: '22:00' },
++  })
++  fireEvent.change(screen.getByLabelText('End Time'), {
++    target: { value: '06:30' },
++  })
++  fireEvent.change(screen.getByLabelText('Interval (minutes)'), {
++    target: { value: '17' },
++  })
++  await userEvent.click(screen.getByRole('switch', { name: 'Stop on failure' }))
++  await userEvent.click(screen.getByRole('button', { name: 'Save' }))
++  await waitFor(() =>
++    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
++  )
++  expect(put).toHaveBeenCalledWith('/api/channel/astra_iq/settings', {
++    start_time: '22:00',
++    end_time: '06:30',
++    interval_minutes: 17,
++    stop_on_failure: false,
++  })
++  expect(invalidate).toHaveBeenCalledWith({
++    queryKey: ['channels', 'astra-iq'],
++  })
++  await userEvent.click(screen.getByRole('button', { name: 'Check settings' }))
++  expect(await screen.findByLabelText('Check start time')).toHaveValue('22:00')
++  expect(screen.getByLabelText('End Time')).toHaveValue('06:30')
++  expect(screen.getByLabelText('Interval (minutes)')).toHaveValue(17)
++  expect(screen.getByRole('switch')).not.toBeChecked()
++  expect(get).toHaveBeenCalledTimes(2)
++})
++
++it('rejects a fractional interval before sending a request', async () => {
++  vi.spyOn(api, 'get').mockResolvedValue({
++    data: { success: true, data: defaultSettings },
++  })
++  const put = vi.spyOn(api, 'put')
++  await openSettings()
++  fireEvent.change(await screen.findByLabelText('Interval (minutes)'), {
++    target: { value: '1.5' },
++  })
++  await userEvent.click(screen.getByRole('button', { name: 'Save' }))
++  expect(
++    await screen.findByText('Check interval must be an integer from 1 to 1440')
++  ).toBeVisible()
++  expect(put).not.toHaveBeenCalled()
++})
++
++it('disables saving after a load failure and allows retry', async () => {
++  vi.spyOn(api, 'get')
++    .mockRejectedValueOnce(new Error('offline'))
++    .mockResolvedValue({ data: { success: true, data: defaultSettings } })
++  await openSettings()
++  expect(await screen.findByText('Check settings unavailable')).toBeVisible()
++  expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
++  await userEvent.click(screen.getByRole('button', { name: 'Retry' }))
++  expect(await screen.findByLabelText('Interval (minutes)')).toHaveValue(5)
++  expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled()
++})
++
++it('preserves edits after a save failure and permits retry', async () => {
++  vi.spyOn(api, 'get').mockResolvedValue({
++    data: { success: true, data: defaultSettings },
++  })
++  const put = vi
++    .spyOn(api, 'put')
++    .mockResolvedValueOnce({
++      data: { success: false, message: 'Cannot save check settings' },
++    })
++    .mockResolvedValue({ data: { success: true, data: defaultSettings } })
++  await openSettings()
++  fireEvent.change(await screen.findByLabelText('Interval (minutes)'), {
++    target: { value: '20' },
++  })
++  await userEvent.click(screen.getByRole('button', { name: 'Save' }))
++  expect(await screen.findByRole('alert')).toHaveTextContent(
++    'Cannot save check settings'
++  )
++  expect(screen.getByLabelText('Interval (minutes)')).toHaveValue(20)
++  await userEvent.click(screen.getByRole('button', { name: 'Save' }))
++  await waitFor(() =>
++    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
++  )
++  expect(put).toHaveBeenCalledTimes(2)
++})
++
++it('allows channel readers to inspect settings without editing them', async () => {
++  useAuthStore.setState({
++    auth: {
++      ...originalAuth,
++      user: {
++        id: 2,
++        username: 'reader',
++        role: ROLE.ADMIN,
++        permissions: { admin_permissions: { channel: { read: true } } },
++      },
++    },
++  })
++  vi.spyOn(api, 'get').mockResolvedValue({
++    data: { success: true, data: defaultSettings },
++  })
++  await openSettings()
++  expect(await screen.findByLabelText('Interval (minutes)')).toBeDisabled()
++  expect(screen.getByLabelText('Check start time')).toBeDisabled()
++  expect(screen.getByRole('switch')).toHaveAttribute('aria-disabled', 'true')
++  await userEvent.click(screen.getByRole('switch'))
++  expect(screen.getByRole('switch')).toBeChecked()
++  expect(screen.queryByRole('button', { name: 'Save' })).not.toBeInTheDocument()
++})
+diff --git a/web/src/features/channels/components/astra-iq-settings.tsx b/web/src/features/channels/components/astra-iq-settings.tsx
+new file mode 100644
+index 00000000..f98530ba
+--- /dev/null
++++ b/web/src/features/channels/components/astra-iq-settings.tsx
+@@ -0,0 +1,289 @@
++/*
++Copyright (C) 2023-2026 QuantumNous
++
++This program is free software: you can redistribute it and/or modify
++it under the terms of the GNU Affero General Public License as
++published by the Free Software Foundation, either version 3 of the
++License, or (at your option) any later version.
++
++This program is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++GNU Affero General Public License for more details.
++
++You should have received a copy of the GNU Affero General Public License
++along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++For commercial licensing, please contact support@quantumnous.com
++*/
++import { zodResolver } from '@hookform/resolvers/zod'
++import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
++import { Settings2 } from 'lucide-react'
++import { useState } from 'react'
++import { useForm } from 'react-hook-form'
++import { useTranslation } from 'react-i18next'
++import { z } from 'zod'
++
++import { Dialog } from '@/components/dialog'
++import { ErrorState } from '@/components/error-state'
++import { LoadingState } from '@/components/loading-state'
++import { Button } from '@/components/ui/button'
++import {
++  Form,
++  FormControl,
++  FormDescription,
++  FormField,
++  FormItem,
++  FormLabel,
++  FormMessage,
++} from '@/components/ui/form'
++import { Input } from '@/components/ui/input'
++import { Switch } from '@/components/ui/switch'
++import { safeNumberFieldProps } from '@/features/system-settings/utils/numeric-field'
++import {
++  ADMIN_PERMISSION_ACTIONS,
++  ADMIN_PERMISSION_RESOURCES,
++  hasPermission,
++} from '@/lib/admin-permissions'
++import { api } from '@/lib/api'
++import { markServerErrorHandled } from '@/lib/handle-server-error'
++import {
++  getServerErrorMessage,
++  requireServerSuccess,
++} from '@/lib/server-error-message'
++import { useAuthStore } from '@/stores/auth-store'
++
++const timeSchema = z
++  .string()
++  .regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Use HH:mm for check times')
++const settingsSchema = z.object({
++  start_time: timeSchema,
++  end_time: timeSchema,
++  interval_minutes: z
++    .number()
++    .int('Check interval must be an integer from 1 to 1440')
++    .min(1, 'Check interval must be an integer from 1 to 1440')
++    .max(1440, 'Check interval must be an integer from 1 to 1440'),
++  stop_on_failure: z.boolean(),
++})
++type CheckSettings = z.infer<typeof settingsSchema>
++type SettingsResponse = {
++  success: boolean
++  message?: string
++  data: CheckSettings
++}
++const endpoint = '/api/channel/astra_iq/settings'
++const queryKey = ['channels', 'astra-iq-settings']
++const formId = 'astra-iq-settings-form'
++
++export function AstraIQSettings() {
++  const { t } = useTranslation()
++  const [open, setOpen] = useState(false)
++  return (
++    <>
++      <Button
++        variant='outline'
++        size='sm'
++        className='h-6 shrink-0 gap-1 rounded-full px-2 text-xs font-normal'
++        onClick={() => setOpen(true)}
++      >
++        {t('Check settings')}
++        <Settings2 data-icon='inline-end' />
++      </Button>
++      {open && <SettingsDialog onClose={() => setOpen(false)} />}
++    </>
++  )
++}
++
++function SettingsDialog(props: { onClose: () => void }) {
++  const { t } = useTranslation()
++  const user = useAuthStore((state) => state.auth.user)
++  const canWrite = hasPermission(
++    user,
++    ADMIN_PERMISSION_RESOURCES.CHANNEL,
++    ADMIN_PERMISSION_ACTIONS.WRITE
++  )
++  const client = useQueryClient()
++  const query = useQuery({
++    queryKey,
++    queryFn: async ({ signal }) => {
++      const response = await api.get<SettingsResponse>(endpoint, { signal })
++      return settingsSchema.parse(requireServerSuccess(response.data).data)
++    },
++    gcTime: 0,
++    refetchOnWindowFocus: false,
++    retry: false,
++    meta: { errorToast: false },
++  })
++  const mutation = useMutation({
++    mutationFn: async (settings: CheckSettings) => {
++      const response = await api.put<SettingsResponse>(endpoint, settings)
++      return requireServerSuccess(response.data).data
++    },
++    onSuccess: () => {
++      void client.invalidateQueries({ queryKey: ['channels', 'astra-iq'] })
++      props.onClose()
++    },
++    onError: markServerErrorHandled,
++    meta: { errorToast: false },
++  })
++  return (
++    <Dialog
++      open
++      onOpenChange={(open) => {
++        if (!open && !mutation.isPending) props.onClose()
++      }}
++      title={t('Check settings')}
++      description={t(
++        'Applies to all Astra channels. Daily schedule in Beijing time (UTC+8).'
++      )}
++      contentClassName='sm:max-w-md'
++      contentHeight='auto'
++      bodyClassName='space-y-4'
++      footer={
++        <>
++          <Button
++            variant='outline'
++            disabled={mutation.isPending}
++            onClick={props.onClose}
++          >
++            {t('Cancel')}
++          </Button>
++          {canWrite && (
++            <Button
++              type='submit'
++              form={formId}
++              disabled={
++                !query.isSuccess || query.isFetching || mutation.isPending
++              }
++            >
++              {t('Save')}
++            </Button>
++          )}
++        </>
++      }
++    >
++      {query.isPending && <LoadingState />}
++      {query.isError && (
++        <ErrorState
++          className='min-h-40'
++          title={t('Check settings unavailable')}
++          onRetry={() => void query.refetch()}
++        />
++      )}
++      {query.isSuccess && (
++        <SettingsForm
++          key={query.dataUpdatedAt}
++          settings={query.data}
++          disabled={!canWrite || query.isFetching || mutation.isPending}
++          onSave={(values) => mutation.mutate(values)}
++        />
++      )}
++      {mutation.isError && (
++        <p role='alert' className='text-destructive text-sm'>
++          {t(getServerErrorMessage(mutation.error))}
++        </p>
++      )}
++    </Dialog>
++  )
++}
++
++function SettingsForm(props: {
++  settings: CheckSettings
++  disabled: boolean
++  onSave: (settings: CheckSettings) => void
++}) {
++  const { t } = useTranslation()
++  const form = useForm<CheckSettings>({
++    resolver: zodResolver(settingsSchema),
++    defaultValues: props.settings,
++  })
++  return (
++    <Form {...form}>
++      <form
++        id={formId}
++        noValidate
++        className='space-y-5'
++        onSubmit={form.handleSubmit(props.onSave)}
++      >
++        <div className='grid grid-cols-2 gap-4'>
++          {(['start_time', 'end_time'] as const).map((name) => (
++            <FormField
++              key={name}
++              control={form.control}
++              name={name}
++              render={({ field }) => (
++                <FormItem>
++                  <FormLabel>
++                    {name === 'start_time'
++                      ? t('Check start time')
++                      : t('End Time')}
++                  </FormLabel>
++                  <FormControl>
++                    <Input
++                      {...field}
++                      type='time'
++                      step={60}
++                      disabled={props.disabled}
++                    />
++                  </FormControl>
++                  <FormMessage />
++                </FormItem>
++              )}
++            />
++          ))}
++        </div>
++        <p className='text-muted-foreground text-xs'>
++          {t('Equal times mean all day. Overnight schedules are supported.')}
++        </p>
++        <FormField
++          control={form.control}
++          name='interval_minutes'
++          render={({ field }) => (
++            <FormItem>
++              <FormLabel>{t('Interval (minutes)')}</FormLabel>
++              <FormControl>
++                <Input
++                  {...safeNumberFieldProps(field)}
++                  type='number'
++                  min={1}
++                  max={1440}
++                  step={1}
++                  disabled={props.disabled}
++                />
++              </FormControl>
++              <FormMessage />
++            </FormItem>
++          )}
++        />
++        <FormField
++          control={form.control}
++          name='stop_on_failure'
++          render={({ field }) => (
++            <FormItem className='flex items-center justify-between gap-4 rounded-lg border p-3'>
++              <div className='space-y-1'>
++                <FormLabel>{t('Stop on failure')}</FormLabel>
++                <FormDescription>
++                  {t(
++                    'Pause Astra calls after a failed check. Calls without a result are allowed.'
++                  )}
++                </FormDescription>
++              </div>
++              <FormControl>
++                <Switch
++                  name={field.name}
++                  checked={field.value}
++                  onCheckedChange={field.onChange}
++                  onBlur={field.onBlur}
++                  ref={field.ref}
++                  disabled={props.disabled}
++                />
++              </FormControl>
++              <FormMessage />
++            </FormItem>
++          )}
++        />
++      </form>
++    </Form>
++  )
++}
 diff --git a/web/src/features/channels/components/astra-iq-status.tsx b/web/src/features/channels/components/astra-iq-status.tsx
 new file mode 100644
 index 00000000..e7a30fcb
@@ -2207,7 +2950,7 @@ index 2d28e45c..a2bab719 100644
          collapsibleOnMobile: true,
 diff --git a/web/src/features/channels/components/dialogs/astra-iq-detail-dialog.tsx b/web/src/features/channels/components/dialogs/astra-iq-detail-dialog.tsx
 new file mode 100644
-index 00000000..a223c642
+index 00000000..7331bcfd
 --- /dev/null
 +++ b/web/src/features/channels/components/dialogs/astra-iq-detail-dialog.tsx
 @@ -0,0 +1,362 @@
@@ -2546,10 +3289,10 @@ index 00000000..a223c642
 +        desc={
 +          deleteScope === 'all'
 +            ? t(
-+                'This permanently deletes all check results for this channel. The channel will wait for a new check.'
++                'This permanently deletes all check results for this channel. Calls are allowed until the next check.'
 +              )
 +            : t(
-+                'This permanently deletes this check. If it is the latest result, the channel will wait for a new check.'
++                'This permanently deletes this check. If it is the latest result, calls are allowed until the next check.'
 +              )
 +        }
 +        confirmText={t('Delete')}
@@ -2573,6 +3316,30 @@ index 00000000..a223c642
 +    </>
 +  )
 +}
+diff --git a/web/src/features/channels/index.tsx b/web/src/features/channels/index.tsx
+index a34d037f..25df9888 100644
+--- a/web/src/features/channels/index.tsx
++++ b/web/src/features/channels/index.tsx
+@@ -33,6 +33,7 @@ import { requireServerSuccess } from '@/lib/server-error-message'
+ import { useAuthStore } from '@/stores/auth-store'
+ 
+ import { getChannelOps } from './api'
++import { AstraIQSettings } from './components/astra-iq-settings'
+ import { ChannelsDialogs } from './components/channels-dialogs'
+ import { ChannelsPrimaryButtons } from './components/channels-primary-buttons'
+ import { ChannelsProvider } from './components/channels-provider'
+@@ -89,9 +90,10 @@ export function Channels() {
+     <ChannelsProvider>
+       <SectionPageLayout fixedContent>
+         <SectionPageLayout.Title>
+-          <span className='flex min-w-0 items-center gap-2'>
++          <span className='flex min-w-0 flex-wrap items-center gap-2'>
+             <span className='truncate'>{t('Channels')}</span>
+             {retryBadge}
++            <AstraIQSettings />
+           </span>
+         </SectionPageLayout.Title>
+         <SectionPageLayout.Actions>
 diff --git a/web/src/features/channels/lib/astra-iq.ts b/web/src/features/channels/lib/astra-iq.ts
 new file mode 100644
 index 00000000..ade3f5f6
@@ -2642,7 +3409,7 @@ index 00000000..ade3f5f6
 +  return 'Astra IQ pending'
 +}
 diff --git a/web/src/i18n/locales/en.json b/web/src/i18n/locales/en.json
-index 8ce9da22..43511a71 100644
+index 8ce9da22..a9ab4907 100644
 --- a/web/src/i18n/locales/en.json
 +++ b/web/src/i18n/locales/en.json
 @@ -2618,7 +2618,7 @@
@@ -2654,7 +3421,7 @@ index 8ce9da22..43511a71 100644
      "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.",
      "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment",
      "For private deployments, format: https://fastgpt.run/api/openapi": "For private deployments, format: https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,40 @@
+@@ -6777,6 +6777,51 @@
      "Zhipu": "Zhipu",
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V4",
@@ -2691,13 +3458,24 @@ index 8ce9da22..43511a71 100644
 +    "Delete all checks": "Delete all checks",
 +    "Delete this check?": "Delete this check?",
 +    "Delete all checks for this channel?": "Delete all checks for this channel?",
-+    "This permanently deletes this check. If it is the latest result, the channel will wait for a new check.": "This permanently deletes this check. If it is the latest result, the channel will wait for a new check.",
-+    "This permanently deletes all check results for this channel. The channel will wait for a new check.": "This permanently deletes all check results for this channel. The channel will wait for a new check.",
-+    "Failed to delete check results": "Failed to delete check results"
++    "Failed to delete check results": "Failed to delete check results",
++    "Check settings": "Check settings",
++    "Check start time": "Start time",
++    "Interval (minutes)": "Interval (minutes)",
++    "Stop on failure": "Stop on failure",
++    "Applies to all Astra channels. Daily schedule in Beijing time (UTC+8).": "Applies to all Astra channels. Daily schedule in Beijing time (UTC+8).",
++    "Equal times mean all day. Overnight schedules are supported.": "Equal times mean all day. Overnight schedules are supported.",
++    "Pause Astra calls after a failed check. Calls without a result are allowed.": "Pause Astra calls after a failed check. Calls without a result are allowed.",
++    "Check settings unavailable": "Check settings unavailable",
++    "Use HH:mm for check times": "Use HH:mm for check times",
++    "Check interval must be an integer from 1 to 1440": "Check interval must be an integer from 1 to 1440",
++    "Invalid check settings": "Invalid check settings",
++    "This permanently deletes this check. If it is the latest result, calls are allowed until the next check.": "This permanently deletes this check. If it is the latest result, calls are allowed until the next check.",
++    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "This permanently deletes all check results for this channel. Calls are allowed until the next check."
    }
  }
 diff --git a/web/src/i18n/locales/fr.json b/web/src/i18n/locales/fr.json
-index a239f206..eff6c5c9 100644
+index a239f206..8d375326 100644
 --- a/web/src/i18n/locales/fr.json
 +++ b/web/src/i18n/locales/fr.json
 @@ -2618,7 +2618,7 @@
@@ -2709,7 +3487,7 @@ index a239f206..eff6c5c9 100644
      "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "Pour les canaux personnalisés avancés, ceci ne s’applique qu’aux routes /v1/responses sans conversion de protocole.",
      "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "Pour les canaux ajoutés après le 10 mai 2025, pas besoin de supprimer \".\" des noms de modèles lors du déploiement",
      "For private deployments, format: https://fastgpt.run/api/openapi": "Pour les déploiements privés, format : https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,40 @@
+@@ -6777,6 +6777,51 @@
      "Zhipu": "Zhipu",
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V4",
@@ -2746,13 +3524,24 @@ index a239f206..eff6c5c9 100644
 +    "Delete all checks": "Supprimer tous les résultats",
 +    "Delete this check?": "Supprimer ce résultat de test ?",
 +    "Delete all checks for this channel?": "Supprimer tous les résultats de ce canal ?",
-+    "This permanently deletes this check. If it is the latest result, the channel will wait for a new check.": "Ce résultat sera définitivement supprimé. S’il s’agit du plus récent, le canal attendra un nouveau test.",
-+    "This permanently deletes all check results for this channel. The channel will wait for a new check.": "Tous les résultats de ce canal seront définitivement supprimés. Le canal attendra un nouveau test.",
-+    "Failed to delete check results": "Échec de la suppression des résultats"
++    "Failed to delete check results": "Échec de la suppression des résultats",
++    "Check settings": "Réglages des tests",
++    "Check start time": "Heure de début",
++    "Interval (minutes)": "Intervalle (minutes)",
++    "Stop on failure": "Arrêt si échec",
++    "Applies to all Astra channels. Daily schedule in Beijing time (UTC+8).": "Pour tous les canaux Astra. Horaire quotidien de Pékin (UTC+8).",
++    "Equal times mean all day. Overnight schedules are supported.": "Des heures identiques signifient toute la journée. Les plages peuvent passer minuit.",
++    "Pause Astra calls after a failed check. Calls without a result are allowed.": "Suspendre les appels Astra après un échec. Sans résultat, les appels sont autorisés.",
++    "Check settings unavailable": "Réglages des tests indisponibles",
++    "Use HH:mm for check times": "Utilisez HH:mm pour les heures des tests",
++    "Check interval must be an integer from 1 to 1440": "L’intervalle doit être un entier entre 1 et 1440",
++    "Invalid check settings": "Réglages des tests invalides",
++    "This permanently deletes this check. If it is the latest result, calls are allowed until the next check.": "Ce résultat sera supprimé définitivement. Si c’est le plus récent, les appels seront autorisés jusqu’au prochain test.",
++    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "Tous les résultats de ce canal seront supprimés définitivement. Les appels seront autorisés jusqu’au prochain test."
    }
  }
 diff --git a/web/src/i18n/locales/ja.json b/web/src/i18n/locales/ja.json
-index e3e09261..c10ef986 100644
+index e3e09261..43685dc6 100644
 --- a/web/src/i18n/locales/ja.json
 +++ b/web/src/i18n/locales/ja.json
 @@ -2618,7 +2618,7 @@
@@ -2764,7 +3553,7 @@ index e3e09261..c10ef986 100644
      "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "高度なカスタムチャネルでは、プロトコル変換を行わない /v1/responses ルートにのみ適用されます。",
      "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "2025 年 5 月 10 日以降に追加されたチャネルの場合、デプロイ時にモデル名から「.」を削除する必要はありません",
      "For private deployments, format: https://fastgpt.run/api/openapi": "プライベートデプロイメントの場合、形式: https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,40 @@
+@@ -6777,6 +6777,51 @@
      "Zhipu": "Zhipu",
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V 4",
@@ -2801,13 +3590,24 @@ index e3e09261..c10ef986 100644
 +    "Delete all checks": "すべての結果を削除",
 +    "Delete this check?": "この検査結果を削除しますか？",
 +    "Delete all checks for this channel?": "このチャネルの検査結果をすべて削除しますか？",
-+    "This permanently deletes this check. If it is the latest result, the channel will wait for a new check.": "この検査結果は完全に削除されます。最新の結果の場合、チャネルは次の検査を待ちます。",
-+    "This permanently deletes all check results for this channel. The channel will wait for a new check.": "このチャネルの検査結果はすべて完全に削除され、次の検査を待ちます。",
-+    "Failed to delete check results": "検査結果を削除できませんでした"
++    "Failed to delete check results": "検査結果を削除できませんでした",
++    "Check settings": "検査設定",
++    "Check start time": "開始時刻",
++    "Interval (minutes)": "間隔（分）",
++    "Stop on failure": "失敗時に停止",
++    "Applies to all Astra channels. Daily schedule in Beijing time (UTC+8).": "すべての Astra チャネルに適用。北京時間（UTC+8）で毎日実行します。",
++    "Equal times mean all day. Overnight schedules are supported.": "同じ時刻は終日を意味します。日付をまたぐ時間帯も設定できます。",
++    "Pause Astra calls after a failed check. Calls without a result are allowed.": "検査失敗後に Astra 呼び出しを停止します。結果がない場合は許可します。",
++    "Check settings unavailable": "検査設定を読み込めません",
++    "Use HH:mm for check times": "時刻は HH:mm 形式で入力してください",
++    "Check interval must be an integer from 1 to 1440": "間隔は 1～1440 の整数で入力してください",
++    "Invalid check settings": "検査設定が無効です",
++    "This permanently deletes this check. If it is the latest result, calls are allowed until the next check.": "この検査結果を完全に削除します。最新の結果の場合、次の検査まで呼び出しを許可します。",
++    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "このチャネルの全検査結果を完全に削除します。次の検査まで呼び出しを許可します。"
    }
  }
 diff --git a/web/src/i18n/locales/ru.json b/web/src/i18n/locales/ru.json
-index af18b036..3f3038a7 100644
+index af18b036..832d18a9 100644
 --- a/web/src/i18n/locales/ru.json
 +++ b/web/src/i18n/locales/ru.json
 @@ -2618,7 +2618,7 @@
@@ -2819,7 +3619,7 @@ index af18b036..3f3038a7 100644
      "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "Для расширенных пользовательских каналов это действует только для маршрутов /v1/responses без преобразования протокола.",
      "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "Для каналов, добавленных после 10 мая 2025 г., не нужно удалять \".\" из имён моделей при развёртывании",
      "For private deployments, format: https://fastgpt.run/api/openapi": "Для частных развертываний, формат: https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,40 @@
+@@ -6777,6 +6777,51 @@
      "Zhipu": "Zhipu",
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V4",
@@ -2856,13 +3656,24 @@ index af18b036..3f3038a7 100644
 +    "Delete all checks": "Удалить все результаты",
 +    "Delete this check?": "Удалить этот результат проверки?",
 +    "Delete all checks for this channel?": "Удалить все результаты проверок этого канала?",
-+    "This permanently deletes this check. If it is the latest result, the channel will wait for a new check.": "Этот результат будет удалён навсегда. Если он последний, канал будет ожидать новой проверки.",
-+    "This permanently deletes all check results for this channel. The channel will wait for a new check.": "Все результаты проверок этого канала будут удалены навсегда. Канал будет ожидать новой проверки.",
-+    "Failed to delete check results": "Не удалось удалить результаты проверок"
++    "Failed to delete check results": "Не удалось удалить результаты проверок",
++    "Check settings": "Настройки проверок",
++    "Check start time": "Время начала",
++    "Interval (minutes)": "Интервал (минуты)",
++    "Stop on failure": "Отключать при сбое",
++    "Applies to all Astra channels. Daily schedule in Beijing time (UTC+8).": "Для всех каналов Astra. Ежедневно по времени Пекина (UTC+8).",
++    "Equal times mean all day. Overnight schedules are supported.": "Одинаковое время означает весь день. Поддерживается переход через полночь.",
++    "Pause Astra calls after a failed check. Calls without a result are allowed.": "Приостанавливать вызовы Astra после неудачной проверки. Без результата вызовы разрешены.",
++    "Check settings unavailable": "Настройки проверок недоступны",
++    "Use HH:mm for check times": "Используйте формат HH:mm",
++    "Check interval must be an integer from 1 to 1440": "Интервал должен быть целым числом от 1 до 1440",
++    "Invalid check settings": "Неверные настройки проверок",
++    "This permanently deletes this check. If it is the latest result, calls are allowed until the next check.": "Этот результат будет удалён навсегда. Если он последний, вызовы будут разрешены до следующей проверки.",
++    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "Все результаты этого канала будут удалены навсегда. Вызовы будут разрешены до следующей проверки."
    }
  }
 diff --git a/web/src/i18n/locales/vi.json b/web/src/i18n/locales/vi.json
-index c7d3e719..49edd4b8 100644
+index c7d3e719..0ef4802b 100644
 --- a/web/src/i18n/locales/vi.json
 +++ b/web/src/i18n/locales/vi.json
 @@ -2618,7 +2618,7 @@
@@ -2874,7 +3685,7 @@ index c7d3e719..49edd4b8 100644
      "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "Với kênh tùy chỉnh nâng cao, thiết lập này chỉ áp dụng cho các route /v1/responses không chuyển đổi giao thức.",
      "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "Đối với các kênh được thêm sau ngày 10 tháng 5 năm 2025, không cần loại bỏ \".\" khỏi tên mô hình trong quá trình triển khai",
      "For private deployments, format: https://fastgpt.run/api/openapi": "Đối với các triển khai riêng tư, định dạng: https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,40 @@
+@@ -6777,6 +6777,51 @@
      "Zhipu": "Zhipu",
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V4",
@@ -2911,13 +3722,24 @@ index c7d3e719..49edd4b8 100644
 +    "Delete all checks": "Xóa tất cả kết quả",
 +    "Delete this check?": "Xóa kết quả kiểm tra này?",
 +    "Delete all checks for this channel?": "Xóa tất cả kết quả kiểm tra của kênh này?",
-+    "This permanently deletes this check. If it is the latest result, the channel will wait for a new check.": "Kết quả này sẽ bị xóa vĩnh viễn. Nếu đây là kết quả mới nhất, kênh sẽ chờ lần kiểm tra mới.",
-+    "This permanently deletes all check results for this channel. The channel will wait for a new check.": "Tất cả kết quả kiểm tra của kênh này sẽ bị xóa vĩnh viễn. Kênh sẽ chờ lần kiểm tra mới.",
-+    "Failed to delete check results": "Không thể xóa kết quả kiểm tra"
++    "Failed to delete check results": "Không thể xóa kết quả kiểm tra",
++    "Check settings": "Cài đặt kiểm tra",
++    "Check start time": "Giờ bắt đầu",
++    "Interval (minutes)": "Khoảng cách (phút)",
++    "Stop on failure": "Dừng khi thất bại",
++    "Applies to all Astra channels. Daily schedule in Beijing time (UTC+8).": "Áp dụng cho mọi kênh Astra. Chạy hằng ngày theo giờ Bắc Kinh (UTC+8).",
++    "Equal times mean all day. Overnight schedules are supported.": "Hai giờ giống nhau nghĩa là cả ngày. Hỗ trợ khoảng thời gian qua nửa đêm.",
++    "Pause Astra calls after a failed check. Calls without a result are allowed.": "Tạm dừng gọi Astra sau kiểm tra thất bại. Cho phép gọi khi chưa có kết quả.",
++    "Check settings unavailable": "Không tải được cài đặt kiểm tra",
++    "Use HH:mm for check times": "Nhập giờ theo định dạng HH:mm",
++    "Check interval must be an integer from 1 to 1440": "Khoảng cách phải là số nguyên từ 1 đến 1440",
++    "Invalid check settings": "Cài đặt kiểm tra không hợp lệ",
++    "This permanently deletes this check. If it is the latest result, calls are allowed until the next check.": "Xóa vĩnh viễn kết quả này. Nếu là kết quả mới nhất, cho phép gọi đến lần kiểm tra tiếp theo.",
++    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "Xóa vĩnh viễn mọi kết quả của kênh này. Cho phép gọi đến lần kiểm tra tiếp theo."
    }
  }
 diff --git a/web/src/i18n/locales/zh-TW.json b/web/src/i18n/locales/zh-TW.json
-index 3eca7eea..3dc764a5 100644
+index 3eca7eea..70ea76f1 100644
 --- a/web/src/i18n/locales/zh-TW.json
 +++ b/web/src/i18n/locales/zh-TW.json
 @@ -2618,7 +2618,7 @@
@@ -2929,7 +3751,7 @@ index 3eca7eea..3dc764a5 100644
      "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "進階自訂渠道僅對 /v1/responses 且不做協定轉換的路由生效。",
      "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "對於 2025 年 5 月 10 日之後新增的渠道，在部署時無需從模型名稱中移除 \".\"",
      "For private deployments, format: https://fastgpt.run/api/openapi": "對於私有部署，格式為：https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,40 @@
+@@ -6777,6 +6777,51 @@
      "Zhipu": "智譜",
      "Zhipu GLM": "智譜GLM",
      "Zhipu V4": "智譜 V4",
@@ -2966,13 +3788,24 @@ index 3eca7eea..3dc764a5 100644
 +    "Delete all checks": "刪除全部結果",
 +    "Delete this check?": "刪除此筆檢測結果？",
 +    "Delete all checks for this channel?": "刪除此管道的全部檢測結果？",
-+    "This permanently deletes this check. If it is the latest result, the channel will wait for a new check.": "此筆檢測結果將永久刪除。如果這是最新結果，管道將等待重新檢測。",
-+    "This permanently deletes all check results for this channel. The channel will wait for a new check.": "此管道的全部檢測結果將永久刪除，管道將等待重新檢測。",
-+    "Failed to delete check results": "刪除檢測結果失敗"
++    "Failed to delete check results": "刪除檢測結果失敗",
++    "Check settings": "檢測設定",
++    "Check start time": "開始時間",
++    "Interval (minutes)": "間隔（分鐘）",
++    "Stop on failure": "失敗停用",
++    "Applies to all Astra channels. Daily schedule in Beijing time (UTC+8).": "適用於所有 Astra 渠道，按北京時間（UTC+8）每天執行。",
++    "Equal times mean all day. Overnight schedules are supported.": "時間相同表示全天，支援跨午夜。",
++    "Pause Astra calls after a failed check. Calls without a result are allowed.": "檢測失敗後暫停 Astra 呼叫；無結果時允許呼叫。",
++    "Check settings unavailable": "檢測設定載入失敗",
++    "Use HH:mm for check times": "時間格式為 HH:mm",
++    "Check interval must be an integer from 1 to 1440": "間隔須為 1～1440 的整數",
++    "Invalid check settings": "檢測設定無效",
++    "This permanently deletes this check. If it is the latest result, calls are allowed until the next check.": "此次檢測結果將被永久刪除。如果這是最新結果，下次檢測前允許呼叫。",
++    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "此渠道的全部檢測結果將被永久刪除，下次檢測前允許呼叫。"
    }
  }
 diff --git a/web/src/i18n/locales/zh.json b/web/src/i18n/locales/zh.json
-index 23de155c..b69faf05 100644
+index 23de155c..eec37c0f 100644
 --- a/web/src/i18n/locales/zh.json
 +++ b/web/src/i18n/locales/zh.json
 @@ -2618,7 +2618,7 @@
@@ -2984,7 +3817,7 @@ index 23de155c..b69faf05 100644
      "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "高级自定义渠道仅对 /v1/responses 且不做协议转换的路由生效。",
      "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "对于 2025 年 5 月 10 日之后添加的渠道，在部署时无需从模型名称中移除 \".\"",
      "For private deployments, format: https://fastgpt.run/api/openapi": "对于私有部署，格式为：https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,40 @@
+@@ -6777,6 +6777,51 @@
      "Zhipu": "智谱",
      "Zhipu GLM": "智谱GLM",
      "Zhipu V4": "智谱 V4",
@@ -3021,8 +3854,19 @@ index 23de155c..b69faf05 100644
 +    "Delete all checks": "删除全部结果",
 +    "Delete this check?": "删除此次检测结果？",
 +    "Delete all checks for this channel?": "删除此渠道的全部检测结果？",
-+    "This permanently deletes this check. If it is the latest result, the channel will wait for a new check.": "此次检测结果将被永久删除。如果这是最新结果，渠道将等待重新检测。",
-+    "This permanently deletes all check results for this channel. The channel will wait for a new check.": "此渠道的全部检测结果将被永久删除，渠道将等待重新检测。",
-+    "Failed to delete check results": "删除检测结果失败"
++    "Failed to delete check results": "删除检测结果失败",
++    "Check settings": "检测设置",
++    "Check start time": "开始时间",
++    "Interval (minutes)": "间隔（分钟）",
++    "Stop on failure": "失败停用",
++    "Applies to all Astra channels. Daily schedule in Beijing time (UTC+8).": "适用于所有 Astra 渠道，按北京时间（UTC+8）每天执行。",
++    "Equal times mean all day. Overnight schedules are supported.": "时间相同表示全天，支持跨午夜。",
++    "Pause Astra calls after a failed check. Calls without a result are allowed.": "检测失败后暂停 Astra 调用；无结果时允许调用。",
++    "Check settings unavailable": "检测设置加载失败",
++    "Use HH:mm for check times": "时间格式为 HH:mm",
++    "Check interval must be an integer from 1 to 1440": "间隔须为 1～1440 的整数",
++    "Invalid check settings": "检测设置无效",
++    "This permanently deletes this check. If it is the latest result, calls are allowed until the next check.": "此次检测结果将被永久删除。如果这是最新结果，下次检测前允许调用。",
++    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "此渠道的全部检测结果将被永久删除，下次检测前允许调用。"
    }
  }
