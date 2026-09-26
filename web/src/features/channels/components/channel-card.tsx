@@ -22,10 +22,12 @@ import { useTranslation } from 'react-i18next'
 
 import { GroupBadge } from '@/components/group-badge'
 import { StatusBadgeTypeContext } from '@/components/status-badge'
+import { cn } from '@/lib/utils'
 
 import { CHANNEL_STATUS } from '../constants'
 import { isTagAggregateRow, parseGroupsList } from '../lib'
 import type { Channel } from '../types'
+import { AstraIQStatus } from './astra-iq-status'
 import { ChannelRowActionsLayoutContext } from './channel-row-actions-context'
 import { useChannels } from './channels-provider'
 
@@ -60,6 +62,9 @@ function ChannelCardComponent({
   }
 
   const groups = parseGroupsList(row.original.group ?? '')
+  const showAstraIQ =
+    !isTagRow &&
+    row.original.models.split(',').some((name) => name.trim() === 'gpt-6-astra')
 
   const selectCell = renderCell('select')
   const typeCell = renderCell('type')
@@ -72,7 +77,8 @@ function ChannelCardComponent({
   const responseCell = renderCell('response_time')
   const testCell = renderCell('test_time')
 
-  const labelClass = 'text-muted-foreground text-[11px] font-medium select-none'
+  const labelClass =
+    'text-muted-foreground/80 text-[10px] font-medium tracking-wide select-none'
 
   // In card view the enable/disable state is already conveyed by the inline
   // power toggle, so the plain "Enabled"/"Disabled" badge is redundant. Keep
@@ -86,7 +92,7 @@ function ChannelCardComponent({
     <ChannelRowActionsLayoutContext.Provider value='card'>
       <div
         data-state={isSelected ? 'selected' : undefined}
-        className='flex min-w-0 flex-col gap-3'
+        className='flex h-full min-w-0 flex-col gap-4'
       >
         {/* Row 1: selection + type, with status badge + actions menu */}
         <div className='flex items-center justify-between gap-2'>
@@ -105,7 +111,7 @@ function ChannelCardComponent({
         {/* Both rows share their columns: identity/balance on the left,
           priority/response and weight/last tested on the right. */}
         <StatusBadgeTypeContext.Provider value='text'>
-          <div className='grid grid-cols-[minmax(0,1fr)_auto_auto] items-start gap-3'>
+          <div className='grid grid-cols-[minmax(0,1fr)_auto_auto] items-start gap-x-4 gap-y-4'>
             <div className='min-w-0 overflow-hidden text-sm'>
               {!isTagRow && (
                 <div className={labelClass}>
@@ -122,7 +128,7 @@ function ChannelCardComponent({
               <span className={labelClass}>{t('Weight')}</span>
               {weightCell}
             </div>
-            <dl className='col-span-3 grid grid-cols-subgrid gap-y-1'>
+            <dl className='bg-muted/35 col-span-3 grid grid-cols-subgrid gap-y-1.5 rounded-xl px-3 py-2.5'>
               <div className='row-span-2 grid min-w-0 grid-rows-subgrid'>
                 <dt className={labelClass}>{t('Used / Remaining')}</dt>
                 <dd className='min-w-0 text-sm tabular-nums [&_[data-slot=status-badge]]:!ml-0 [&>div]:ml-0 [&>div]:flex-wrap [&>div]:gap-x-3'>
@@ -149,10 +155,15 @@ function ChannelCardComponent({
           </div>
         </StatusBadgeTypeContext.Provider>
 
-        {/* Groups retain their compact, full-width footer. */}
-        <div className='min-w-0'>
+        {/* Checks share the group row without adding to the card height. */}
+        <div className='group/channel-footer mt-auto flex min-w-0 items-center gap-3'>
           {groups.length > 0 ? (
-            <div className='-ml-1.5 flex min-w-0 flex-wrap gap-1'>
+            <div
+              className={cn(
+                '-ml-1.5 flex min-w-0 flex-wrap gap-1',
+                'group-has-data-[slot=astra-iq-timeline]/channel-footer:max-w-2/5 group-has-data-[slot=astra-iq-timeline]/channel-footer:flex-nowrap'
+              )}
+            >
               {groups.map((g) => (
                 <GroupBadge
                   key={g}
@@ -164,6 +175,12 @@ function ChannelCardComponent({
             </div>
           ) : (
             <span className='text-muted-foreground text-sm'>-</span>
+          )}
+          {showAstraIQ && (
+            <AstraIQStatus
+              channelId={row.original.id}
+              channelEnabled={row.original.status === CHANNEL_STATUS.ENABLED}
+            />
           )}
         </div>
       </div>

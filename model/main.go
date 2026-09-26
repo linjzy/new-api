@@ -336,6 +336,7 @@ func migrateDB() error {
 
 	err := DB.AutoMigrate(
 		&Channel{},
+		&AstraIQResult{},
 		&Token{},
 		&User{},
 		&UserSession{},
