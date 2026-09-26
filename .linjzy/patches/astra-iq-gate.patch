@@ -22,10 +22,10 @@ index 399a2ab8..bd554f66 100644
  WORKDIR /data
 diff --git a/controller/astra_iq.go b/controller/astra_iq.go
 new file mode 100644
-index 00000000..f46f8ec3
+index 00000000..69656f39
 --- /dev/null
 +++ b/controller/astra_iq.go
-@@ -0,0 +1,494 @@
+@@ -0,0 +1,499 @@
 +package controller
 +
 +import (
@@ -481,7 +481,12 @@ index 00000000..f46f8ec3
 +			views[ch.Id] = model.AstraIQResultView(ch, results[ch.Id], settings)
 +		}
 +	}
-+	common.ApiSuccess(c, gin.H{"enabled": true, "interval_minutes": settings.IntervalMinutes, "server_time": common.GetTimestamp(), "results": views})
++	runs, err := model.GetAstraIQRuns()
++	if err != nil {
++		common.ApiError(c, err)
++		return
++	}
++	common.ApiSuccess(c, gin.H{"enabled": true, "interval_minutes": settings.IntervalMinutes, "server_time": common.GetTimestamp(), "runs": runs, "results": views})
 +}
 +
 +func GetAstraIQSettings(c *gin.Context) {
@@ -735,10 +740,10 @@ index 00000000..be606c0a
 +}
 diff --git a/controller/astra_iq_test.go b/controller/astra_iq_test.go
 new file mode 100644
-index 00000000..d5d489b3
+index 00000000..52286775
 --- /dev/null
 +++ b/controller/astra_iq_test.go
-@@ -0,0 +1,510 @@
+@@ -0,0 +1,530 @@
 +package controller
 +
 +import (
@@ -833,6 +838,7 @@ index 00000000..d5d489b3
 +				t.Skip(dialect.env + " not configured")
 +			}
 +			db := modelManagementDB(t, dialect.kind, dsn)
++			require.NoError(t, db.AutoMigrate(&model.SystemTask{}))
 +			t.Run("atomic settings API and persistent reload", func(t *testing.T) {
 +				settings, err := model.GetAstraIQSettings()
 +				require.NoError(t, err)
@@ -872,6 +878,25 @@ index 00000000..d5d489b3
 +				require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 +				assert.JSONEq(t, valid, gjson.GetBytes(w.Body.Bytes(), "data").Raw)
 +				require.NoError(t, model.SaveAstraIQSettings(model.DefaultAstraIQSettings()))
++			})
++			t.Run("status exposes recent check rounds without internal task data", func(t *testing.T) {
++				for i := range model.AstraIQHistorySize + 1 {
++					task := model.SystemTask{TaskID: fmt.Sprintf("iq-round-%d", i), Type: model.AstraIQTaskType, Status: model.SystemTaskStatusSucceeded, CreatedAt: 100 + int64(i)*75, UpdatedAt: 110 + int64(i)*75, Payload: "internal-task-payload"}
++					if i == model.AstraIQHistorySize {
++						task.Status = model.SystemTaskStatusRunning
++					}
++					require.NoError(t, db.Create(&task).Error)
++				}
++				require.NoError(t, db.Create(&model.SystemTask{TaskID: "unrelated-round", Type: model.SystemTaskTypeChannelTest, Status: model.SystemTaskStatusSucceeded, CreatedAt: 2000, UpdatedAt: 2010}).Error)
++				w := httptest.NewRecorder()
++				c, _ := gin.CreateTestContext(w)
++				GetAstraIQStatus(c)
++				require.Equal(t, http.StatusOK, w.Code, w.Body.String())
++				runs := gjson.GetBytes(w.Body.Bytes(), "data.runs").Array()
++				require.Len(t, runs, model.AstraIQHistorySize)
++				assert.JSONEq(t, `{"started_at":175,"finished_at":185}`, runs[0].Raw)
++				assert.JSONEq(t, `{"started_at":1900,"finished_at":0}`, runs[len(runs)-1].Raw)
++				assert.NotContains(t, w.Body.String(), "internal-task-payload")
 +			})
 +			channels := []model.Channel{
 +				{Id: 201, Name: "high priority", Type: 1, Key: "test-a", Status: common.ChannelStatusEnabled, Models: model.AstraIQModel + ",unrelated-model", Group: "default", Priority: common.GetPointer(int64(10))},
@@ -1463,10 +1488,10 @@ index b86c442d..abf4fd1b 100644
  				return nil
 diff --git a/model/astra_iq.go b/model/astra_iq.go
 new file mode 100644
-index 00000000..574eab01
+index 00000000..0629e685
 --- /dev/null
 +++ b/model/astra_iq.go
-@@ -0,0 +1,276 @@
+@@ -0,0 +1,303 @@
 +package model
 +
 +import (
@@ -1540,6 +1565,33 @@ index 00000000..574eab01
 +	Allowed  bool            `json:"allowed"`
 +	PassRate float64         `json:"pass_rate"`
 +	History  []AstraIQSample `json:"history"`
++}
++
++type AstraIQRun struct {
++	StartedAt  int64 `json:"started_at"`
++	FinishedAt int64 `json:"finished_at"`
++}
++
++// Actual rounds distinguish scheduler drift and long-running probes from
++// missed checks. Only their times are exposed, never task payloads or errors.
++func GetAstraIQRuns() ([]AstraIQRun, error) {
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	var tasks []SystemTask
++	if err := DB.WithContext(ctx).Select("created_at", "updated_at", "status").
++		Where("type = ?", AstraIQTaskType).Order("id DESC").Limit(AstraIQHistorySize).
++		Find(&tasks).Error; err != nil {
++		return nil, err
++	}
++	runs := make([]AstraIQRun, 0, len(tasks))
++	for i := len(tasks) - 1; i >= 0; i-- {
++		run := AstraIQRun{StartedAt: tasks[i].CreatedAt}
++		if tasks[i].Status == SystemTaskStatusSucceeded || tasks[i].Status == SystemTaskStatusFailed {
++			run.FinishedAt = tasks[i].UpdatedAt
++		}
++		runs = append(runs, run)
++	}
++	return runs, nil
 +}
 +
 +func AstraIQEnabled() bool {
@@ -2119,10 +2171,10 @@ index baaf9142..44adcc05 100644
  	t.Helper()
 diff --git a/web/src/features/channels/components/__tests__/astra-iq-status.test.tsx b/web/src/features/channels/components/__tests__/astra-iq-status.test.tsx
 new file mode 100644
-index 00000000..8b088ee2
+index 00000000..b3ebc5fc
 --- /dev/null
 +++ b/web/src/features/channels/components/__tests__/astra-iq-status.test.tsx
-@@ -0,0 +1,534 @@
+@@ -0,0 +1,577 @@
 +/*
 +Copyright (C) 2023-2026 QuantumNous
 +
@@ -2157,6 +2209,7 @@ index 00000000..8b088ee2
 +import { ROLE } from '@/lib/roles'
 +import { useAuthStore } from '@/stores/auth-store'
 +
++import { astraIQTimeline } from '../../lib/astra-iq'
 +import { AstraIQSettings } from '../astra-iq-settings'
 +import { AstraIQStatus, type AstraIQStatusData } from '../astra-iq-status'
 +import type { IQCheckDetail } from '../dialogs/astra-iq-detail-dialog'
@@ -2638,7 +2691,7 @@ index 00000000..8b088ee2
 +  const client = renderStatus()
 +  const timeline = screen.getByRole('group')
 +  const buttons = within(timeline).getAllByRole('button')
-+  // The records at 100 and 200 seconds leave the 120–179 interval empty.
++  // A missing scheduled check keeps its position between the two results.
 +  expect(buttons[0].nextElementSibling?.tagName).toBe('SPAN')
 +  expect(buttons[0].nextElementSibling?.nextElementSibling).toBe(buttons[1])
 +  await act(async () =>
@@ -2657,6 +2710,48 @@ index 00000000..8b088ee2
 +    within(await screen.findByRole('group')).getAllByRole('button')
 +  ).toHaveLength(2)
 +})
++
++it.each([
++  {
++    name: 'scheduler drift and a slow check on another channel',
++    starts: [103, 178, 238, 373, 448],
++    ends: [115, 198, 358, 384, 460],
++    deleted: -1,
++    expected: [113, 188, 248, 383, 458],
++  },
++  {
++    name: 'a pause spanning two scheduled checks',
++    starts: [103, 178, 373],
++    ends: [115, 198, 384],
++    deleted: -1,
++    expected: [113, 188, null, null, 383],
++  },
++  {
++    name: 'a deleted result between continuing checks',
++    starts: [103, 178, 238],
++    ends: [115, 198, 250],
++    deleted: 1,
++    expected: [113, null, 248],
++  },
++])(
++  'keeps the correct gaps for $name',
++  ({ starts, ends, deleted, expected }) => {
++    const records = starts.flatMap((started, index) =>
++      index === deleted
++        ? []
++        : [{ status: 'pass', checked_at: started + 10, latency_ms: 10_000 }]
++    )
++    const runs = starts.map((started, index) => ({
++      started_at: started,
++      finished_at: ends[index],
++    }))
++    const slots = astraIQTimeline(records, 1, ends.at(-1) ?? 0, runs)
++    expect(slots.map((sample) => sample?.checked_at ?? null)).toEqual([
++      ...Array(24 - expected.length).fill(null),
++      ...expected,
++    ])
++  }
++)
 diff --git a/web/src/features/channels/components/astra-iq-settings.tsx b/web/src/features/channels/components/astra-iq-settings.tsx
 new file mode 100644
 index 00000000..cd540101
@@ -2981,10 +3076,10 @@ index 00000000..cd540101
 +}
 diff --git a/web/src/features/channels/components/astra-iq-status.tsx b/web/src/features/channels/components/astra-iq-status.tsx
 new file mode 100644
-index 00000000..0fa19ed0
+index 00000000..138fbc9d
 --- /dev/null
 +++ b/web/src/features/channels/components/astra-iq-status.tsx
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,144 @@
 +/*
 +Copyright (C) 2023-2026 QuantumNous
 +
@@ -3060,7 +3155,8 @@ index 00000000..0fa19ed0
 +  const samples = astraIQTimeline(
 +    history,
 +    query.data?.interval_minutes ?? 5,
-+    query.data?.server_time ?? Date.now() / 1000
++    query.data?.server_time ?? Date.now() / 1000,
++    query.data?.runs
 +  )
 +  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
 +  let state = t(astraIQStatusLabel(result?.status ?? 'pending'))
@@ -3694,10 +3790,10 @@ index a34d037f..25df9888 100644
          <SectionPageLayout.Actions>
 diff --git a/web/src/features/channels/lib/astra-iq.ts b/web/src/features/channels/lib/astra-iq.ts
 new file mode 100644
-index 00000000..f2c0543c
+index 00000000..5ba6107e
 --- /dev/null
 +++ b/web/src/features/channels/lib/astra-iq.ts
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,132 @@
 +/*
 +Copyright (C) 2023-2026 QuantumNous
 +
@@ -3745,6 +3841,7 @@ index 00000000..f2c0543c
 +  enabled: boolean
 +  interval_minutes?: number
 +  server_time?: number
++  runs?: IQRun[]
 +  results: Record<
 +    string,
 +    {
@@ -3759,30 +3856,67 @@ index 00000000..f2c0543c
 +  >
 +}
 +
-+// Keep real time gaps, including pauses and deleted results. A slow check
-+// belongs to the interval when it started, not the later completion interval.
++type IQRun = { started_at: number; finished_at: number }
++
++// Each actual scheduler round occupies one position. Account for the whole
++// round's duration and the scheduler/runner's two 15-second polling windows;
++// wall-clock minute boundaries must not turn normal delays into missed checks.
 +export function astraIQTimeline(
 +  history: IQSample[],
 +  intervalMinutes: number,
-+  now: number
++  now: number,
++  runs: IQRun[] = []
 +): (IQSample | null)[] {
 +  const interval = Math.max(1, intervalMinutes) * 60
-+  const firstSlot = Math.floor(now / interval) - 23
-+  const slots = Array<IQSample | null>(24).fill(null)
++  const rounds = [...runs]
++  const samples = new Map<IQRun, IQSample>()
 +  for (const sample of history) {
 +    const started =
 +      sample.started_at ||
 +      sample.checked_at - Math.floor((sample.latency_ms || 0) / 1000)
-+    const index = Math.floor(started / interval) - firstSlot
-+    if (
-+      index >= 0 &&
-+      index < slots.length &&
-+      (!slots[index] || sample.checked_at > slots[index].checked_at)
-+    ) {
-+      slots[index] = sample
++    let round: IQRun | undefined
++    for (let i = rounds.length - 1; i >= 0; i--) {
++      const candidate = rounds[i]
++      if (
++        started >= candidate.started_at - 1 &&
++        started <= (candidate.finished_at || now) + 1
++      ) {
++        round = candidate
++        break
++      }
++    }
++    // Task history can be cleared independently of saved check results.
++    if (!round) {
++      round = { started_at: started, finished_at: sample.checked_at }
++      rounds.push(round)
++    }
++    const previous = samples.get(round)
++    if (!previous || sample.checked_at > previous.checked_at) {
++      samples.set(round, sample)
 +    }
 +  }
-+  return slots
++  rounds.sort((a, b) => a.started_at - b.started_at)
++  const slots: (IQSample | null)[] = []
++  let dueAt: number | undefined
++  for (const round of rounds) {
++    if (dueAt !== undefined) {
++      const missed = Math.min(
++        24,
++        Math.max(0, Math.ceil((round.started_at - dueAt - 30) / interval))
++      )
++      slots.push(...Array<IQSample | null>(missed).fill(null))
++    }
++    slots.push(samples.get(round) ?? null)
++    dueAt = Math.max(round.started_at + interval, round.finished_at || now)
++  }
++  if (dueAt !== undefined) {
++    const missed = Math.min(
++      24,
++      Math.max(0, Math.ceil((now - dueAt - 30) / interval))
++    )
++    slots.push(...Array<IQSample | null>(missed).fill(null))
++  }
++  return [...Array<IQSample | null>(24).fill(null), ...slots].slice(-24)
 +}
 +
 +export function astraIQStatusLabel(status: string) {
