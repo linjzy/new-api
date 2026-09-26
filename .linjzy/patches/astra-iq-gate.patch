@@ -22,10 +22,10 @@ index 399a2ab8..bd554f66 100644
  WORKDIR /data
 diff --git a/controller/astra_iq.go b/controller/astra_iq.go
 new file mode 100644
-index 00000000..069917bb
+index 00000000..80bb1d31
 --- /dev/null
 +++ b/controller/astra_iq.go
-@@ -0,0 +1,372 @@
+@@ -0,0 +1,397 @@
 +package controller
 +
 +import (
@@ -45,6 +45,7 @@ index 00000000..069917bb
 +	"github.com/gin-gonic/gin"
 +	"github.com/samber/lo"
 +	"github.com/tidwall/gjson"
++	"gorm.io/gorm"
 +)
 +
 +const astraIQQuestion = `在一个黑色的袋子里放有三种口味的糖果，每种糖果有两种不同的形状（圆形和五角星形，不同的形状靠手感可以分辨）。现已知不同口味的糖和不同形状的数量统计如下表。参赛者需要在活动前决定摸出的糖果数目，那么，最少取出多少个糖果才能保证手中同时拥有不同形状的苹果味和桃子味的糖？（同时手中有圆形苹果味匹配五角星桃子味糖果，或者有圆形桃子味匹配五角星苹果味糖果都满足要求）
@@ -369,6 +370,30 @@ index 00000000..069917bb
 +	c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "Check history is no longer available"})
 +}
 +
++func DeleteAstraIQResults(c *gin.Context) {
++	channelID, err := strconv.Atoi(c.Param("id"))
++	if err != nil || channelID <= 0 {
++		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Invalid check identifier"})
++		return
++	}
++	var checkedAt int64
++	if value := c.Param("checked_at"); value != "" {
++		checkedAt, err = strconv.ParseInt(value, 10, 64)
++		if err != nil || checkedAt <= 0 {
++			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Invalid check identifier"})
++			return
++		}
++	}
++	if err = model.DeleteAstraIQResults(channelID, checkedAt); errors.Is(err, gorm.ErrRecordNotFound) {
++		c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "Check history is no longer available"})
++		return
++	} else if err != nil {
++		common.ApiError(c, err)
++		return
++	}
++	common.ApiSuccess(c, nil)
++}
++
 +func GetAstraIQStatus(c *gin.Context) {
 +	views := make(map[int]model.AstraIQView)
 +	if !model.AstraIQEnabled() {
@@ -572,10 +597,10 @@ index 00000000..cbe99ab7
 +}
 diff --git a/controller/astra_iq_test.go b/controller/astra_iq_test.go
 new file mode 100644
-index 00000000..d69843c2
+index 00000000..4a1d8c1d
 --- /dev/null
 +++ b/controller/astra_iq_test.go
-@@ -0,0 +1,318 @@
+@@ -0,0 +1,370 @@
 +package controller
 +
 +import (
@@ -756,6 +781,58 @@ index 00000000..d69843c2
 +					assert.NotContains(t, string(encoded), "test-a")
 +				})
 +			}
++			t.Run("delete history without restoring stale approval", func(t *testing.T) {
++				require.NoError(t, db.Where("channel_id = ?", 201).Delete(&model.AstraIQResult{}).Error)
++				now := common.GetTimestamp()
++				for _, result := range []model.AstraIQResult{
++					{Status: "pass", CheckedAt: now - 30, Answer: "21"},
++					{Status: "fail", CheckedAt: now - 20, Answer: "29"},
++					{Status: "pass", CheckedAt: now - 10, Answer: "21"},
++				} {
++					require.NoError(t, model.SaveAstraIQResult(&channels[0], result))
++				}
++				before, err := model.GetAstraIQResults([]int{202})
++				require.NoError(t, err)
++				engine := gin.New()
++				engine.DELETE("/checks/:id", DeleteAstraIQResults)
++				engine.DELETE("/checks/:id/:checked_at", DeleteAstraIQResults)
++				for _, tc := range []struct {
++					path    string
++					code    int
++					count   int
++					allowed bool
++				}{
++					{"/checks/bad", 400, 3, true},
++					{"/checks/201/0", 400, 3, true},
++					{"/checks/201/999", 404, 3, true},
++					{fmt.Sprintf("/checks/201/%d", now-30), 200, 2, true},
++					{fmt.Sprintf("/checks/201/%d", now-10), 200, 1, false},
++					{"/checks/201", 200, 0, false},
++					{"/checks/201", 200, 0, false},
++				} {
++					w := httptest.NewRecorder()
++					engine.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, tc.path, nil))
++					require.Equal(t, tc.code, w.Code, w.Body.String())
++					rows, err := model.GetAstraIQResults([]int{201, 202})
++					require.NoError(t, err)
++					view := model.AstraIQResultView(&channels[0], rows[201])
++					assert.Len(t, view.History, tc.count)
++					assert.Equal(t, tc.allowed, view.Allowed)
++					assert.Equal(t, before[202], rows[202], "deletion must be scoped to the selected channel")
++					if !tc.allowed {
++						assert.Equal(t, "pending", view.Status)
++						assert.Zero(t, view.CheckedAt)
++						assert.Empty(t, view.Answer)
++					}
++				}
++				require.NoError(t, model.SaveAstraIQResult(&channels[0], model.AstraIQResult{Status: "pass", CheckedAt: now, Answer: "21"}))
++				rows, err := model.GetAstraIQResults([]int{201})
++				require.NoError(t, err)
++				assert.Len(t, model.AstraIQResultView(&channels[0], rows[201]).History, 1, "new checks must not resurrect deleted history")
++				require.NoError(t, model.SaveAstraIQResult(&channels[0], model.AstraIQResult{Status: "fail", CheckedAt: now + 1, Answer: "29"}))
++				require.NoError(t, model.DeleteAstraIQResults(201, now+1))
++				assert.False(t, model.AstraIQAllowsChannel(&channels[0], model.AstraIQModel), "deleting a failure must not revive an older passing result")
++			})
 +		})
 +	}
 +}
@@ -1069,20 +1146,23 @@ index b86c442d..abf4fd1b 100644
  				return nil
 diff --git a/model/astra_iq.go b/model/astra_iq.go
 new file mode 100644
-index 00000000..c17bfa55
+index 00000000..44c70d09
 --- /dev/null
 +++ b/model/astra_iq.go
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,253 @@
 +package model
 +
 +import (
 +	"context"
 +	"crypto/sha256"
++	"errors"
 +	"fmt"
++	"slices"
 +	"strings"
 +	"time"
 +
 +	"github.com/QuantumNous/new-api/common"
++	"gorm.io/gorm"
 +	"gorm.io/gorm/clause"
 +)
 +
@@ -1228,30 +1308,73 @@ index 00000000..c17bfa55
 +}
 +
 +func SaveAstraIQResult(ch *Channel, result AstraIQResult) error {
-+	previous, err := GetAstraIQResults([]int{ch.Id})
-+	if err != nil {
-+		return err
-+	}
-+	var history []AstraIQSample
-+	if old := previous[ch.Id]; old.Version == AstraIQVersion {
-+		_ = common.UnmarshalJsonStr(string(old.HistoryJSON), &history)
-+	}
-+	sample := result.Sample
-+	sample.Status, sample.CheckedAt = result.Status, result.CheckedAt
-+	sample.Answer, sample.Detail, sample.LatencyMS = result.Answer, result.Detail, result.LatencyMS
-+	history = append(history, sample)
-+	if len(history) > AstraIQHistorySize {
-+		history = history[len(history)-AstraIQHistorySize:]
-+	}
-+	data, err := common.Marshal(history)
-+	if err != nil {
-+		return err
-+	}
-+	result.ChannelID = ch.Id
-+	result.Version = AstraIQVersion
-+	result.Fingerprint = AstraIQFingerprint(ch)
-+	result.HistoryJSON = LongText(data)
-+	return DB.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "channel_id"}}, UpdateAll: true}).Create(&result).Error
++	return DB.Transaction(func(tx *gorm.DB) error {
++		// Serialize history changes with deletion so a finishing probe cannot
++		// write back a copy of history that an administrator just removed.
++		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&AstraIQResult{ChannelID: ch.Id}).Error; err != nil {
++			return err
++		}
++		var previous AstraIQResult
++		if err := lockForUpdate(tx).First(&previous, "channel_id = ?", ch.Id).Error; err != nil {
++			return err
++		}
++		var history []AstraIQSample
++		if previous.Version == AstraIQVersion {
++			_ = common.UnmarshalJsonStr(string(previous.HistoryJSON), &history)
++		}
++		sample := result.Sample
++		sample.Status, sample.CheckedAt = result.Status, result.CheckedAt
++		sample.Answer, sample.Detail, sample.LatencyMS = result.Answer, result.Detail, result.LatencyMS
++		history = append(history, sample)
++		if len(history) > AstraIQHistorySize {
++			history = history[len(history)-AstraIQHistorySize:]
++		}
++		data, err := common.Marshal(history)
++		if err != nil {
++			return err
++		}
++		result.ChannelID = ch.Id
++		result.Version = AstraIQVersion
++		result.Fingerprint = AstraIQFingerprint(ch)
++		result.HistoryJSON = LongText(data)
++		return tx.Save(&result).Error
++	})
++}
++
++// checkedAt == 0 clears this channel's entire history. Removing the latest
++// result always revokes approval; an older passing sample is never promoted.
++func DeleteAstraIQResults(channelID int, checkedAt int64) error {
++	return DB.Transaction(func(tx *gorm.DB) error {
++		var result AstraIQResult
++		if err := lockForUpdate(tx).First(&result, "channel_id = ?", channelID).Error; err != nil {
++			if checkedAt == 0 && errors.Is(err, gorm.ErrRecordNotFound) {
++				return nil
++			}
++			return err
++		}
++		history := []AstraIQSample{}
++		if checkedAt != 0 {
++			if err := common.UnmarshalJsonStr(string(result.HistoryJSON), &history); err != nil {
++				return err
++			}
++			count := len(history)
++			history = slices.DeleteFunc(history, func(sample AstraIQSample) bool { return sample.CheckedAt == checkedAt })
++			if len(history) == count {
++				return gorm.ErrRecordNotFound
++			}
++		}
++		if checkedAt == 0 || checkedAt == result.CheckedAt {
++			result.Status, result.CheckedAt = "pending", 0
++			result.Answer, result.Detail, result.Fingerprint = "", "", ""
++			result.LatencyMS = 0
++		}
++		data, err := common.Marshal(history)
++		if err != nil {
++			return err
++		}
++		result.HistoryJSON = LongText(data)
++		return tx.Save(&result).Error
++	})
 +}
 +
 +func AstraIQResultView(ch *Channel, r AstraIQResult) AstraIQView {
@@ -1319,18 +1442,44 @@ index 917d4e05..1aae158f 100644
  		&User{},
  		&UserSession{},
 diff --git a/router/channel-router.go b/router/channel-router.go
-index 2d59b039..c6561d23 100644
+index 2d59b039..dc0dfa78 100644
 --- a/router/channel-router.go
 +++ b/router/channel-router.go
-@@ -37,6 +37,8 @@ func registerChannelRoutes(apiRouter *gin.RouterGroup) {
+@@ -37,6 +37,10 @@ func registerChannelRoutes(apiRouter *gin.RouterGroup) {
  }
  
  var channelPermissionRoutes = []permissionRoute{
 +	{method: http.MethodGet, path: "/astra_iq", permission: authz.ChannelRead, handler: controller.GetAstraIQStatus},
 +	{method: http.MethodGet, path: "/astra_iq/:id/:checked_at", permission: authz.ChannelRead, handler: controller.GetAstraIQSample},
++	{method: http.MethodDelete, path: "/astra_iq/:id", permission: authz.ChannelWrite, handler: controller.DeleteAstraIQResults},
++	{method: http.MethodDelete, path: "/astra_iq/:id/:checked_at", permission: authz.ChannelWrite, handler: controller.DeleteAstraIQResults},
  	{method: http.MethodGet, path: "/", permission: authz.ChannelRead, handler: controller.GetAllChannels},
  	{method: http.MethodGet, path: "/search", permission: authz.ChannelRead, handler: controller.SearchChannels},
  	{method: http.MethodGet, path: "/models", permission: authz.ChannelRead, handler: controller.ChannelListModels},
+diff --git a/router/channel_router_test.go b/router/channel_router_test.go
+index cd897713..82c8bafb 100644
+--- a/router/channel_router_test.go
++++ b/router/channel_router_test.go
+@@ -51,6 +51,19 @@ func TestChannelStatusRoutesRegisterWithoutConflict(t *testing.T) {
+ 	})
+ }
+ 
++func TestCustomAstraIQDeletionRequiresWritePermission(t *testing.T) {
++	for _, path := range []string{"/astra_iq/:id", "/astra_iq/:id/:checked_at"} {
++		assertChannelRoutePermission(t, http.MethodDelete, path, authz.ChannelWrite, controller.DeleteAstraIQResults)
++	}
++	engine := gin.New()
++	registerChannelRoutes(engine.Group("/api"))
++	for _, path := range []string{"/api/channel/astra_iq/201", "/api/channel/astra_iq/201/100"} {
++		w := httptest.NewRecorder()
++		engine.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, path, nil))
++		assert.Equal(t, http.StatusUnauthorized, w.Code)
++	}
++}
++
+ func assertChannelRoutePermission(t *testing.T, method string, path string, permission authz.Permission, handler any) {
+ 	t.Helper()
+ 	for _, route := range channelPermissionRoutes {
 diff --git a/scripts/install-astra-iq-codex.sh b/scripts/install-astra-iq-codex.sh
 new file mode 100644
 index 00000000..2d9f6054
@@ -1444,10 +1593,10 @@ index baaf9142..f9b04b64 100644
  	t.Helper()
 diff --git a/web/src/features/channels/components/__tests__/astra-iq-status.test.tsx b/web/src/features/channels/components/__tests__/astra-iq-status.test.tsx
 new file mode 100644
-index 00000000..2063b939
+index 00000000..8d647e72
 --- /dev/null
 +++ b/web/src/features/channels/components/__tests__/astra-iq-status.test.tsx
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,353 @@
 +/*
 +Copyright (C) 2023-2026 QuantumNous
 +
@@ -1470,15 +1619,29 @@ index 00000000..2063b939
 +import { render, screen, waitFor, within } from '@testing-library/react'
 +import userEvent from '@testing-library/user-event'
 +import { createInstance } from 'i18next'
-+import { afterEach, expect, it, vi } from 'vitest'
++import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 +
 +import zh from '@/i18n/locales/zh.json'
 +import { api } from '@/lib/api'
++import { ROLE } from '@/lib/roles'
++import { useAuthStore } from '@/stores/auth-store'
 +
 +import { AstraIQStatus, type AstraIQStatusData } from '../astra-iq-status'
 +import type { IQCheckDetail } from '../dialogs/astra-iq-detail-dialog'
 +
-+afterEach(() => vi.restoreAllMocks())
++const originalAuth = useAuthStore.getState().auth
++beforeEach(() => {
++  useAuthStore.setState({
++    auth: {
++      ...originalAuth,
++      user: { id: 1, username: 'root', role: ROLE.SUPER_ADMIN },
++    },
++  })
++})
++afterEach(() => {
++  vi.restoreAllMocks()
++  useAuthStore.setState({ auth: originalAuth })
++})
 +
 +it('resolves the Chinese check labels through the application translation namespace', async () => {
 +  const translator = createInstance()
@@ -1665,9 +1828,131 @@ index 00000000..2063b939
 +  ).toBeVisible()
 +  expect(screen.getAllByText('—')).toHaveLength(4)
 +})
++
++it.each([
++  ['Delete this check', '/api/channel/astra_iq/2/100'],
++  ['Delete all checks', '/api/channel/astra_iq/2'],
++])(
++  'confirms %s and refreshes the timeline after deletion',
++  async (label, endpoint) => {
++    vi.spyOn(api, 'get').mockImplementation(async (url) => ({
++      data: {
++        success: true,
++        data:
++          url === '/api/channel/astra_iq'
++            ? { enabled: true, results: {} }
++            : detail,
++      },
++    }))
++    let resolveDelete!: (value: unknown) => void
++    const pending = new Promise<unknown>((resolve) => {
++      resolveDelete = resolve
++    })
++    const remove = vi.spyOn(api, 'delete').mockReturnValue(pending as never)
++    renderStatus()
++    await userEvent.click(
++      screen.getByRole('button', { name: /Astra IQ wrong answer/ })
++    )
++    await screen.findByText(detail.question)
++    await userEvent.click(screen.getByRole('button', { name: label }))
++    await userEvent.click(
++      within(screen.getByRole('alertdialog')).getByRole('button', {
++        name: 'Cancel',
++      })
++    )
++    expect(remove).not.toHaveBeenCalled()
++    await userEvent.click(screen.getByRole('button', { name: label }))
++    const confirmation = screen.getByRole('alertdialog')
++    await userEvent.click(
++      within(confirmation).getByRole('button', { name: 'Delete' })
++    )
++    expect(remove).toHaveBeenCalledWith(endpoint)
++    expect(
++      within(confirmation).getByRole('button', { name: 'Delete' })
++    ).toBeDisabled()
++    resolveDelete({ data: { success: true } })
++    await waitFor(() =>
++      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
++    )
++    await waitFor(() =>
++      expect(screen.queryByRole('button')).not.toBeInTheDocument()
++    )
++  }
++)
++
++it.each(['business', 'network'])(
++  'keeps history and permits retry after a %s deletion error',
++  async (kind) => {
++    vi.spyOn(api, 'get').mockResolvedValue({
++      data: { success: true, data: detail },
++    })
++    const remove = vi.spyOn(api, 'delete')
++    if (kind === 'business') {
++      remove.mockResolvedValue({
++        data: { success: false, message: 'Cannot delete this result' },
++      })
++    } else {
++      remove.mockRejectedValue(new Error('Cannot delete this result'))
++    }
++    renderStatus()
++    await userEvent.click(
++      screen.getByRole('button', { name: /Astra IQ wrong answer/ })
++    )
++    await screen.findByText(detail.question)
++    await userEvent.click(
++      screen.getByRole('button', { name: 'Delete this check' })
++    )
++    const confirmation = screen.getByRole('alertdialog')
++    await userEvent.click(
++      within(confirmation).getByRole('button', { name: 'Delete' })
++    )
++    expect(await within(confirmation).findByRole('alert')).toHaveTextContent(
++      'Cannot delete this result'
++    )
++    expect(
++      within(confirmation).getByRole('button', { name: 'Delete' })
++    ).toBeEnabled()
++    await userEvent.click(
++      within(confirmation).getByRole('button', { name: 'Cancel' })
++    )
++    expect(screen.getByRole('dialog')).toBeInTheDocument()
++    await userEvent.keyboard('{Escape}')
++    expect(
++      within(screen.getByRole('group')).getAllByRole('button')
++    ).toHaveLength(2)
++  }
++)
++
++it('does not offer deletion to a user with read-only channel access', async () => {
++  useAuthStore.setState({
++    auth: {
++      ...originalAuth,
++      user: {
++        id: 2,
++        username: 'reader',
++        role: ROLE.ADMIN,
++        permissions: { admin_permissions: { channel: { read: true } } },
++      },
++    },
++  })
++  vi.spyOn(api, 'get').mockResolvedValue({
++    data: { success: true, data: detail },
++  })
++  renderStatus()
++  await userEvent.click(
++    screen.getByRole('button', { name: /Astra IQ wrong answer/ })
++  )
++  await screen.findByText(detail.question)
++  expect(
++    screen.queryByRole('button', { name: 'Delete this check' })
++  ).not.toBeInTheDocument()
++  expect(
++    screen.queryByRole('button', { name: 'Delete all checks' })
++  ).not.toBeInTheDocument()
++})
 diff --git a/web/src/features/channels/components/astra-iq-status.tsx b/web/src/features/channels/components/astra-iq-status.tsx
 new file mode 100644
-index 00000000..0bf5f1c4
+index 00000000..e7a30fcb
 --- /dev/null
 +++ b/web/src/features/channels/components/astra-iq-status.tsx
 @@ -0,0 +1,140 @@
@@ -1754,7 +2039,7 @@ index 00000000..0bf5f1c4
 +  return (
 +    <>
 +      <div
-+        className='flex h-7 items-center gap-[3px]'
++        className='flex h-5 min-w-0 flex-1 items-center gap-0.5'
 +        role='group'
 +        aria-label={`${t('Astra IQ')}: ${state}`}
 +      >
@@ -1777,7 +2062,7 @@ index 00000000..0bf5f1c4
 +                    variant='ghost'
 +                    aria-label={label}
 +                    onClick={() => setSelected(sample)}
-+                    className='group h-7 min-w-0 flex-1 rounded-md border-0 p-0 hover:bg-transparent focus-visible:ring-2'
++                    className='group h-5 min-w-0 flex-1 rounded-md border-0 p-0 hover:bg-transparent focus-visible:ring-2'
 +                  />
 +                }
 +              >
@@ -1812,10 +2097,15 @@ index 00000000..0bf5f1c4
 +  )
 +}
 diff --git a/web/src/features/channels/components/channel-card.tsx b/web/src/features/channels/components/channel-card.tsx
-index 3f0b3d4c..26328bf7 100644
+index 3f0b3d4c..be9f3235 100644
 --- a/web/src/features/channels/components/channel-card.tsx
 +++ b/web/src/features/channels/components/channel-card.tsx
-@@ -26,6 +26,7 @@ import { StatusBadgeTypeContext } from '@/components/status-badge'
+@@ -22,10 +22,12 @@ import { useTranslation } from 'react-i18next'
+ 
+ import { GroupBadge } from '@/components/group-badge'
+ import { StatusBadgeTypeContext } from '@/components/status-badge'
++import { cn } from '@/lib/utils'
+ 
  import { CHANNEL_STATUS } from '../constants'
  import { isTagAggregateRow, parseGroupsList } from '../lib'
  import type { Channel } from '../types'
@@ -1823,7 +2113,17 @@ index 3f0b3d4c..26328bf7 100644
  import { ChannelRowActionsLayoutContext } from './channel-row-actions-context'
  import { useChannels } from './channels-provider'
  
-@@ -72,7 +73,8 @@ function ChannelCardComponent({
+@@ -60,6 +62,9 @@ function ChannelCardComponent({
+   }
+ 
+   const groups = parseGroupsList(row.original.group ?? '')
++  const showAstraIQ =
++    !isTagRow &&
++    row.original.models.split(',').some((name) => name.trim() === 'gpt-6-astra')
+ 
+   const selectCell = renderCell('select')
+   const typeCell = renderCell('type')
+@@ -72,7 +77,8 @@ function ChannelCardComponent({
    const responseCell = renderCell('response_time')
    const testCell = renderCell('test_time')
  
@@ -1833,7 +2133,7 @@ index 3f0b3d4c..26328bf7 100644
  
    // In card view the enable/disable state is already conveyed by the inline
    // power toggle, so the plain "Enabled"/"Disabled" badge is redundant. Keep
-@@ -86,7 +88,7 @@ function ChannelCardComponent({
+@@ -86,7 +92,7 @@ function ChannelCardComponent({
      <ChannelRowActionsLayoutContext.Provider value='card'>
        <div
          data-state={isSelected ? 'selected' : undefined}
@@ -1842,7 +2142,7 @@ index 3f0b3d4c..26328bf7 100644
        >
          {/* Row 1: selection + type, with status badge + actions menu */}
          <div className='flex items-center justify-between gap-2'>
-@@ -105,7 +107,7 @@ function ChannelCardComponent({
+@@ -105,7 +111,7 @@ function ChannelCardComponent({
          {/* Both rows share their columns: identity/balance on the left,
            priority/response and weight/last tested on the right. */}
          <StatusBadgeTypeContext.Provider value='text'>
@@ -1851,7 +2151,7 @@ index 3f0b3d4c..26328bf7 100644
              <div className='min-w-0 overflow-hidden text-sm'>
                {!isTagRow && (
                  <div className={labelClass}>
-@@ -122,7 +124,7 @@ function ChannelCardComponent({
+@@ -122,7 +128,7 @@ function ChannelCardComponent({
                <span className={labelClass}>{t('Weight')}</span>
                {weightCell}
              </div>
@@ -1860,32 +2160,38 @@ index 3f0b3d4c..26328bf7 100644
                <div className='row-span-2 grid min-w-0 grid-rows-subgrid'>
                  <dt className={labelClass}>{t('Used / Remaining')}</dt>
                  <dd className='min-w-0 text-sm tabular-nums [&_[data-slot=status-badge]]:!ml-0 [&>div]:ml-0 [&>div]:flex-wrap [&>div]:gap-x-3'>
-@@ -150,7 +152,7 @@ function ChannelCardComponent({
+@@ -149,10 +155,15 @@ function ChannelCardComponent({
+           </div>
          </StatusBadgeTypeContext.Provider>
  
-         {/* Groups retain their compact, full-width footer. */}
+-        {/* Groups retain their compact, full-width footer. */}
 -        <div className='min-w-0'>
-+        <div className='mt-auto min-w-0'>
++        {/* Checks share the group row without adding to the card height. */}
++        <div className='mt-auto flex min-w-0 items-center gap-3'>
            {groups.length > 0 ? (
-             <div className='-ml-1.5 flex min-w-0 flex-wrap gap-1'>
+-            <div className='-ml-1.5 flex min-w-0 flex-wrap gap-1'>
++            <div
++              className={cn(
++                '-ml-1.5 flex min-w-0 flex-wrap gap-1',
++                showAstraIQ && 'max-w-2/5 flex-nowrap'
++              )}
++            >
                {groups.map((g) => (
-@@ -166,6 +168,16 @@ function ChannelCardComponent({
+                 <GroupBadge
+                   key={g}
+@@ -165,6 +176,12 @@ function ChannelCardComponent({
+           ) : (
              <span className='text-muted-foreground text-sm'>-</span>
            )}
-         </div>
-+
-+        {!isTagRow &&
-+          row.original.models
-+            .split(',')
-+            .some((name) => name.trim() === 'gpt-6-astra') && (
++          {showAstraIQ && (
 +            <AstraIQStatus
 +              channelId={row.original.id}
 +              channelEnabled={row.original.status === CHANNEL_STATUS.ENABLED}
 +            />
 +          )}
+         </div>
        </div>
      </ChannelRowActionsLayoutContext.Provider>
-   )
 diff --git a/web/src/features/channels/components/channels-table.tsx b/web/src/features/channels/components/channels-table.tsx
 index 2d28e45c..a2bab719 100644
 --- a/web/src/features/channels/components/channels-table.tsx
@@ -1901,10 +2207,10 @@ index 2d28e45c..a2bab719 100644
          collapsibleOnMobile: true,
 diff --git a/web/src/features/channels/components/dialogs/astra-iq-detail-dialog.tsx b/web/src/features/channels/components/dialogs/astra-iq-detail-dialog.tsx
 new file mode 100644
-index 00000000..f3eed2cd
+index 00000000..a223c642
 --- /dev/null
 +++ b/web/src/features/channels/components/dialogs/astra-iq-detail-dialog.tsx
-@@ -0,0 +1,249 @@
+@@ -0,0 +1,362 @@
 +/*
 +Copyright (C) 2023-2026 QuantumNous
 +
@@ -1923,17 +2229,30 @@ index 00000000..f3eed2cd
 +
 +For commercial licensing, please contact support@quantumnous.com
 +*/
-+import { useQuery } from '@tanstack/react-query'
++import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
++import { useState } from 'react'
 +import { useTranslation } from 'react-i18next'
 +
++import { ConfirmDialog } from '@/components/confirm-dialog'
 +import { Dialog } from '@/components/dialog'
 +import { ErrorState } from '@/components/error-state'
 +import { LoadingState } from '@/components/loading-state'
++import { Button } from '@/components/ui/button'
 +import { toIntlLocale } from '@/i18n/languages'
++import {
++  ADMIN_PERMISSION_ACTIONS,
++  ADMIN_PERMISSION_RESOURCES,
++  hasPermission,
++} from '@/lib/admin-permissions'
 +import { api } from '@/lib/api'
 +import { formatNumber } from '@/lib/format'
-+import { requireServerSuccess } from '@/lib/server-error-message'
++import { markServerErrorHandled } from '@/lib/handle-server-error'
++import {
++  getServerErrorMessage,
++  requireServerSuccess,
++} from '@/lib/server-error-message'
 +import { cn } from '@/lib/utils'
++import { useAuthStore } from '@/stores/auth-store'
 +
 +import { astraIQStatusLabel, type IQSample } from '../../lib/astra-iq'
 +
@@ -1949,6 +2268,41 @@ index 00000000..f3eed2cd
 +
 +export function AstraIQDetailDialog(props: Props) {
 +  const { t, i18n } = useTranslation()
++  const queryClient = useQueryClient()
++  const currentUser = useAuthStore((state) => state.auth.user)
++  const canDelete = hasPermission(
++    currentUser,
++    ADMIN_PERMISSION_RESOURCES.CHANNEL,
++    ADMIN_PERMISSION_ACTIONS.WRITE
++  )
++  const [deleteScope, setDeleteScope] = useState<'this' | 'all' | null>(null)
++  const deletion = useMutation({
++    mutationFn: async (scope: 'this' | 'all') => {
++      const endpoint = `/api/channel/astra_iq/${props.channelId}`
++      const response = await api.delete<{ success: boolean; message?: string }>(
++        scope === 'all' ? endpoint : `${endpoint}/${props.sample.checked_at}`
++      )
++      requireServerSuccess(response.data)
++    },
++    onSuccess: (_, scope) => {
++      setDeleteScope(null)
++      props.onClose()
++      queryClient.removeQueries({
++        queryKey:
++          scope === 'all'
++            ? ['channels', 'astra-iq-detail', props.channelId]
++            : [
++                'channels',
++                'astra-iq-detail',
++                props.channelId,
++                props.sample.checked_at,
++              ],
++      })
++      void queryClient.invalidateQueries({ queryKey: ['channels', 'astra-iq'] })
++    },
++    onError: markServerErrorHandled,
++    meta: { errorToast: false },
++  })
 +  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
 +  const query = useQuery({
 +    queryKey: [
@@ -2013,145 +2367,210 @@ index 00000000..f3eed2cd
 +  ]
 +
 +  return (
-+    <Dialog
-+      open
-+      onOpenChange={(open) => {
-+        if (!open) props.onClose()
-+      }}
-+      title={t('Astra IQ check details')}
-+      description={new Date(sample.checked_at * 1000).toLocaleString(locale)}
-+      contentClassName='rounded-2xl sm:max-w-3xl'
-+      headerClassName='border-b border-border/60 pb-4 pr-6'
-+      bodyClassName='space-y-6'
-+    >
-+      {query.isPending && <LoadingState />}
-+      {query.isError && (
-+        <ErrorState
-+          title={t('Astra IQ details unavailable')}
-+          onRetry={() => void query.refetch()}
-+        />
-+      )}
-+      {detail && !query.isError && (
-+        <>
-+          <div className='flex flex-wrap items-center justify-between gap-3'>
-+            <div className='flex flex-wrap items-center gap-3'>
-+              <span
-+                className={cn(
-+                  'inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-medium ring-1 ring-inset',
-+                  sample.status === 'pass' &&
-+                    'bg-emerald-500/8 text-emerald-700 ring-emerald-500/20 dark:text-emerald-400',
-+                  sample.status === 'fail' &&
-+                    'bg-rose-500/8 text-rose-700 ring-rose-500/20 dark:text-rose-400',
-+                  sample.status === 'error' &&
-+                    'bg-amber-500/8 text-amber-700 ring-amber-500/20 dark:text-amber-400'
-+                )}
++    <>
++      <Dialog
++        open
++        onOpenChange={(open) => {
++          if (!open && !deletion.isPending) props.onClose()
++        }}
++        title={t('Astra IQ check details')}
++        description={new Date(sample.checked_at * 1000).toLocaleString(locale)}
++        contentClassName='rounded-2xl sm:max-w-3xl'
++        headerClassName='border-b border-border/60 pb-4 pr-6'
++        bodyClassName='space-y-6'
++        footer={
++          canDelete && (
++            <>
++              <Button
++                variant='outline'
++                disabled={deletion.isPending}
++                onClick={() => {
++                  deletion.reset()
++                  setDeleteScope('this')
++                }}
 +              >
-+                <span className='size-1.5 rounded-full bg-current' />
-+                {t(astraIQStatusLabel(sample.status))}
-+              </span>
-+              <span className='text-muted-foreground text-sm'>
-+                {t('Expected answer')}:{' '}
-+                <strong className='text-foreground font-medium'>
-+                  {detail.expected_answer}
-+                </strong>
-+              </span>
-+            </div>
-+            <div className='text-muted-foreground flex flex-wrap items-center gap-2 font-mono text-xs'>
-+              <span>{detail.model}</span>
-+              <span aria-hidden='true'>·</span>
-+              <span>{detail.reasoning_effort}</span>
-+              {sample.client && (
-+                <>
-+                  <span aria-hidden='true'>·</span>
-+                  <span>{sample.client}</span>
-+                </>
-+              )}
-+            </div>
-+          </div>
-+          <section className='space-y-2.5'>
-+            <div className='flex flex-wrap items-center justify-between gap-2'>
-+              <h3 className='text-sm font-medium'>
-+                {t('Question sent to model')}
-+              </h3>
-+              {sample.endpoint && (
-+                <span className='text-muted-foreground font-mono text-xs'>
-+                  {sample.endpoint}
++                {t('Delete this check')}
++              </Button>
++              <Button
++                variant='destructive'
++                disabled={deletion.isPending}
++                onClick={() => {
++                  deletion.reset()
++                  setDeleteScope('all')
++                }}
++              >
++                {t('Delete all checks')}
++              </Button>
++            </>
++          )
++        }
++      >
++        {query.isPending && <LoadingState />}
++        {query.isError && (
++          <ErrorState
++            title={t('Astra IQ details unavailable')}
++            onRetry={() => void query.refetch()}
++          />
++        )}
++        {detail && !query.isError && (
++          <>
++            <div className='flex flex-wrap items-center justify-between gap-3'>
++              <div className='flex flex-wrap items-center gap-3'>
++                <span
++                  className={cn(
++                    'inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-medium ring-1 ring-inset',
++                    sample.status === 'pass' &&
++                      'bg-emerald-500/8 text-emerald-700 ring-emerald-500/20 dark:text-emerald-400',
++                    sample.status === 'fail' &&
++                      'bg-rose-500/8 text-rose-700 ring-rose-500/20 dark:text-rose-400',
++                    sample.status === 'error' &&
++                      'bg-amber-500/8 text-amber-700 ring-amber-500/20 dark:text-amber-400'
++                  )}
++                >
++                  <span className='size-1.5 rounded-full bg-current' />
++                  {t(astraIQStatusLabel(sample.status))}
 +                </span>
++                <span className='text-muted-foreground text-sm'>
++                  {t('Expected answer')}:{' '}
++                  <strong className='text-foreground font-medium'>
++                    {detail.expected_answer}
++                  </strong>
++                </span>
++              </div>
++              <div className='text-muted-foreground flex flex-wrap items-center gap-2 font-mono text-xs'>
++                <span>{detail.model}</span>
++                <span aria-hidden='true'>·</span>
++                <span>{detail.reasoning_effort}</span>
++                {sample.client && (
++                  <>
++                    <span aria-hidden='true'>·</span>
++                    <span>{sample.client}</span>
++                  </>
++                )}
++              </div>
++            </div>
++            <section className='space-y-2.5'>
++              <div className='flex flex-wrap items-center justify-between gap-2'>
++                <h3 className='text-sm font-medium'>
++                  {t('Question sent to model')}
++                </h3>
++                {sample.endpoint && (
++                  <span className='text-muted-foreground font-mono text-xs'>
++                    {sample.endpoint}
++                  </span>
++                )}
++              </div>
++              <div className='bg-muted/35 border-border/60 rounded-xl border p-4 text-sm leading-7 break-words whitespace-pre-wrap'>
++                {detail.question}
++              </div>
++            </section>
++            <dl className='bg-muted/35 grid grid-cols-2 gap-x-5 gap-y-4 rounded-xl p-4 sm:grid-cols-4'>
++              {metrics.map((metric) => (
++                <div key={metric.label} className='space-y-1.5'>
++                  <dt className='text-muted-foreground text-xs'>
++                    {metric.label}
++                  </dt>
++                  <dd className='font-mono text-sm font-medium tabular-nums'>
++                    {metric.value}
++                  </dd>
++                </div>
++              ))}
++            </dl>
++            <section className='space-y-3'>
++              <h3 className='text-sm font-medium'>{t('Model response')}</h3>
++              {!attempts.length && (
++                <div className='border-border/60 rounded-xl border p-4 text-sm'>
++                  {sample.answer && (
++                    <p className='mb-2 whitespace-pre-wrap'>{sample.answer}</p>
++                  )}
++                  <p className='text-muted-foreground'>
++                    {t('Detailed metrics were not saved for this older check.')}
++                  </p>
++                </div>
 +              )}
-+            </div>
-+            <div className='bg-muted/35 border-border/60 rounded-xl border p-4 text-sm leading-7 break-words whitespace-pre-wrap'>
-+              {detail.question}
-+            </div>
-+          </section>
-+          <dl className='bg-muted/35 grid grid-cols-2 gap-x-5 gap-y-4 rounded-xl p-4 sm:grid-cols-4'>
-+            {metrics.map((metric) => (
-+              <div key={metric.label} className='space-y-1.5'>
-+                <dt className='text-muted-foreground text-xs'>
-+                  {metric.label}
-+                </dt>
-+                <dd className='font-mono text-sm font-medium tabular-nums'>
-+                  {metric.value}
-+                </dd>
-+              </div>
-+            ))}
-+          </dl>
-+          <section className='space-y-3'>
-+            <h3 className='text-sm font-medium'>{t('Model response')}</h3>
-+            {!attempts.length && (
-+              <div className='border-border/60 rounded-xl border p-4 text-sm'>
-+                {sample.answer && (
-+                  <p className='mb-2 whitespace-pre-wrap'>{sample.answer}</p>
-+                )}
-+                <p className='text-muted-foreground'>
-+                  {t('Detailed metrics were not saved for this older check.')}
-+                </p>
-+              </div>
++              {attempts.map((attempt, index) => (
++                <div
++                  key={attempt.key_index}
++                  className='border-border/60 space-y-3 rounded-xl border p-4'
++                >
++                  {attempts.length > 1 && (
++                    <p className='text-muted-foreground text-xs'>
++                      {t('Check request')} {formatNumber(index + 1, locale)} ·{' '}
++                      {t(astraIQStatusLabel(attempt.status))}
++                    </p>
++                  )}
++                  {attempt.response ? (
++                    <p className='text-sm leading-7 break-words whitespace-pre-wrap'>
++                      {attempt.response}
++                    </p>
++                  ) : (
++                    <p className='text-muted-foreground text-sm'>
++                      {t('No completed model response')}
++                    </p>
++                  )}
++                  {attempt.detail && (
++                    <p className='text-muted-foreground text-xs'>
++                      {t(astraIQStatusLabel(attempt.status))}
++                      {attempt.http_status
++                        ? ` · HTTP ${attempt.http_status}`
++                        : ''}
++                      {attempt.detail === 'timeout'
++                        ? ` · ${t('Request timeout')}`
++                        : ''}
++                      {attempt.detail === 'official_client_rejected'
++                        ? ` · ${t('Upstream rejected the official Codex client.')}`
++                        : ''}
++                      {attempt.detail === 'official_client_unavailable' ||
++                      attempt.detail === 'official_client_failed' ||
++                      attempt.detail === 'official_client_incomplete'
++                        ? ` · ${t('Official Codex client did not complete this check.')}`
++                        : ''}
++                    </p>
++                  )}
++                </div>
++              ))}
++            </section>
++          </>
++        )}
++      </Dialog>
++      <ConfirmDialog
++        open={deleteScope !== null}
++        onOpenChange={(open) => {
++          if (!open && !deletion.isPending) setDeleteScope(null)
++        }}
++        title={
++          deleteScope === 'all'
++            ? t('Delete all checks for this channel?')
++            : t('Delete this check?')
++        }
++        desc={
++          deleteScope === 'all'
++            ? t(
++                'This permanently deletes all check results for this channel. The channel will wait for a new check.'
++              )
++            : t(
++                'This permanently deletes this check. If it is the latest result, the channel will wait for a new check.'
++              )
++        }
++        confirmText={t('Delete')}
++        destructive
++        isLoading={deletion.isPending}
++        handleConfirm={() => {
++          if (deleteScope && canDelete && !deletion.isPending) {
++            deletion.mutate(deleteScope)
++          }
++        }}
++      >
++        {deletion.isError && (
++          <p role='alert' className='text-destructive text-sm'>
++            {getServerErrorMessage(
++              deletion.error,
++              t('Failed to delete check results')
 +            )}
-+            {attempts.map((attempt, index) => (
-+              <div
-+                key={attempt.key_index}
-+                className='border-border/60 space-y-3 rounded-xl border p-4'
-+              >
-+                {attempts.length > 1 && (
-+                  <p className='text-muted-foreground text-xs'>
-+                    {t('Check request')} {formatNumber(index + 1, locale)} ·{' '}
-+                    {t(astraIQStatusLabel(attempt.status))}
-+                  </p>
-+                )}
-+                {attempt.response ? (
-+                  <p className='text-sm leading-7 break-words whitespace-pre-wrap'>
-+                    {attempt.response}
-+                  </p>
-+                ) : (
-+                  <p className='text-muted-foreground text-sm'>
-+                    {t('No completed model response')}
-+                  </p>
-+                )}
-+                {attempt.detail && (
-+                  <p className='text-muted-foreground text-xs'>
-+                    {t(astraIQStatusLabel(attempt.status))}
-+                    {attempt.http_status
-+                      ? ` · HTTP ${attempt.http_status}`
-+                      : ''}
-+                    {attempt.detail === 'timeout'
-+                      ? ` · ${t('Request timeout')}`
-+                      : ''}
-+                    {attempt.detail === 'official_client_rejected'
-+                      ? ` · ${t('Upstream rejected the official Codex client.')}`
-+                      : ''}
-+                    {attempt.detail === 'official_client_unavailable' ||
-+                    attempt.detail === 'official_client_failed' ||
-+                    attempt.detail === 'official_client_incomplete'
-+                      ? ` · ${t('Official Codex client did not complete this check.')}`
-+                      : ''}
-+                  </p>
-+                )}
-+              </div>
-+            ))}
-+          </section>
-+        </>
-+      )}
-+    </Dialog>
++          </p>
++        )}
++      </ConfirmDialog>
++    </>
 +  )
 +}
 diff --git a/web/src/features/channels/lib/astra-iq.ts b/web/src/features/channels/lib/astra-iq.ts
@@ -2223,7 +2642,7 @@ index 00000000..ade3f5f6
 +  return 'Astra IQ pending'
 +}
 diff --git a/web/src/i18n/locales/en.json b/web/src/i18n/locales/en.json
-index 8ce9da22..b6817f81 100644
+index 8ce9da22..43511a71 100644
 --- a/web/src/i18n/locales/en.json
 +++ b/web/src/i18n/locales/en.json
 @@ -2618,7 +2618,7 @@
@@ -2235,7 +2654,7 @@ index 8ce9da22..b6817f81 100644
      "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.",
      "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment",
      "For private deployments, format: https://fastgpt.run/api/openapi": "For private deployments, format: https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,33 @@
+@@ -6777,6 +6777,40 @@
      "Zhipu": "Zhipu",
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V4",
@@ -2267,11 +2686,18 @@ index 8ce9da22..b6817f81 100644
 +    "Time to first token": "Time to first token",
 +    "View check details": "View check details",
 +    "Upstream rejected the official Codex client.": "Upstream rejected the official Codex client.",
-+    "Official Codex client did not complete this check.": "Official Codex client did not complete this check."
++    "Official Codex client did not complete this check.": "Official Codex client did not complete this check.",
++    "Delete this check": "Delete this check",
++    "Delete all checks": "Delete all checks",
++    "Delete this check?": "Delete this check?",
++    "Delete all checks for this channel?": "Delete all checks for this channel?",
++    "This permanently deletes this check. If it is the latest result, the channel will wait for a new check.": "This permanently deletes this check. If it is the latest result, the channel will wait for a new check.",
++    "This permanently deletes all check results for this channel. The channel will wait for a new check.": "This permanently deletes all check results for this channel. The channel will wait for a new check.",
++    "Failed to delete check results": "Failed to delete check results"
    }
  }
 diff --git a/web/src/i18n/locales/fr.json b/web/src/i18n/locales/fr.json
-index a239f206..57939105 100644
+index a239f206..eff6c5c9 100644
 --- a/web/src/i18n/locales/fr.json
 +++ b/web/src/i18n/locales/fr.json
 @@ -2618,7 +2618,7 @@
@@ -2283,7 +2709,7 @@ index a239f206..57939105 100644
      "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "Pour les canaux personnalisés avancés, ceci ne s’applique qu’aux routes /v1/responses sans conversion de protocole.",
      "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "Pour les canaux ajoutés après le 10 mai 2025, pas besoin de supprimer \".\" des noms de modèles lors du déploiement",
      "For private deployments, format: https://fastgpt.run/api/openapi": "Pour les déploiements privés, format : https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,33 @@
+@@ -6777,6 +6777,40 @@
      "Zhipu": "Zhipu",
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V4",
@@ -2315,11 +2741,18 @@ index a239f206..57939105 100644
 +    "Time to first token": "Time to first token",
 +    "View check details": "View check details",
 +    "Upstream rejected the official Codex client.": "Le fournisseur a refusé le client officiel Codex.",
-+    "Official Codex client did not complete this check.": "Le client officiel Codex n’a pas terminé ce contrôle."
++    "Official Codex client did not complete this check.": "Le client officiel Codex n’a pas terminé ce contrôle.",
++    "Delete this check": "Supprimer ce résultat",
++    "Delete all checks": "Supprimer tous les résultats",
++    "Delete this check?": "Supprimer ce résultat de test ?",
++    "Delete all checks for this channel?": "Supprimer tous les résultats de ce canal ?",
++    "This permanently deletes this check. If it is the latest result, the channel will wait for a new check.": "Ce résultat sera définitivement supprimé. S’il s’agit du plus récent, le canal attendra un nouveau test.",
++    "This permanently deletes all check results for this channel. The channel will wait for a new check.": "Tous les résultats de ce canal seront définitivement supprimés. Le canal attendra un nouveau test.",
++    "Failed to delete check results": "Échec de la suppression des résultats"
    }
  }
 diff --git a/web/src/i18n/locales/ja.json b/web/src/i18n/locales/ja.json
-index e3e09261..86a519e6 100644
+index e3e09261..c10ef986 100644
 --- a/web/src/i18n/locales/ja.json
 +++ b/web/src/i18n/locales/ja.json
 @@ -2618,7 +2618,7 @@
@@ -2331,7 +2764,7 @@ index e3e09261..86a519e6 100644
      "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "高度なカスタムチャネルでは、プロトコル変換を行わない /v1/responses ルートにのみ適用されます。",
      "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "2025 年 5 月 10 日以降に追加されたチャネルの場合、デプロイ時にモデル名から「.」を削除する必要はありません",
      "For private deployments, format: https://fastgpt.run/api/openapi": "プライベートデプロイメントの場合、形式: https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,33 @@
+@@ -6777,6 +6777,40 @@
      "Zhipu": "Zhipu",
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V 4",
@@ -2363,11 +2796,18 @@ index e3e09261..86a519e6 100644
 +    "Time to first token": "Time to first token",
 +    "View check details": "View check details",
 +    "Upstream rejected the official Codex client.": "上流が公式 Codex クライアントを拒否しました。",
-+    "Official Codex client did not complete this check.": "公式 Codex クライアントはこの検査を完了できませんでした。"
++    "Official Codex client did not complete this check.": "公式 Codex クライアントはこの検査を完了できませんでした。",
++    "Delete this check": "この結果を削除",
++    "Delete all checks": "すべての結果を削除",
++    "Delete this check?": "この検査結果を削除しますか？",
++    "Delete all checks for this channel?": "このチャネルの検査結果をすべて削除しますか？",
++    "This permanently deletes this check. If it is the latest result, the channel will wait for a new check.": "この検査結果は完全に削除されます。最新の結果の場合、チャネルは次の検査を待ちます。",
++    "This permanently deletes all check results for this channel. The channel will wait for a new check.": "このチャネルの検査結果はすべて完全に削除され、次の検査を待ちます。",
++    "Failed to delete check results": "検査結果を削除できませんでした"
    }
  }
 diff --git a/web/src/i18n/locales/ru.json b/web/src/i18n/locales/ru.json
-index af18b036..6c5f7b20 100644
+index af18b036..3f3038a7 100644
 --- a/web/src/i18n/locales/ru.json
 +++ b/web/src/i18n/locales/ru.json
 @@ -2618,7 +2618,7 @@
@@ -2379,7 +2819,7 @@ index af18b036..6c5f7b20 100644
      "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "Для расширенных пользовательских каналов это действует только для маршрутов /v1/responses без преобразования протокола.",
      "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "Для каналов, добавленных после 10 мая 2025 г., не нужно удалять \".\" из имён моделей при развёртывании",
      "For private deployments, format: https://fastgpt.run/api/openapi": "Для частных развертываний, формат: https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,33 @@
+@@ -6777,6 +6777,40 @@
      "Zhipu": "Zhipu",
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V4",
@@ -2411,11 +2851,18 @@ index af18b036..6c5f7b20 100644
 +    "Time to first token": "Time to first token",
 +    "View check details": "View check details",
 +    "Upstream rejected the official Codex client.": "Сервис отклонил официальный клиент Codex.",
-+    "Official Codex client did not complete this check.": "Официальный клиент Codex не завершил эту проверку."
++    "Official Codex client did not complete this check.": "Официальный клиент Codex не завершил эту проверку.",
++    "Delete this check": "Удалить этот результат",
++    "Delete all checks": "Удалить все результаты",
++    "Delete this check?": "Удалить этот результат проверки?",
++    "Delete all checks for this channel?": "Удалить все результаты проверок этого канала?",
++    "This permanently deletes this check. If it is the latest result, the channel will wait for a new check.": "Этот результат будет удалён навсегда. Если он последний, канал будет ожидать новой проверки.",
++    "This permanently deletes all check results for this channel. The channel will wait for a new check.": "Все результаты проверок этого канала будут удалены навсегда. Канал будет ожидать новой проверки.",
++    "Failed to delete check results": "Не удалось удалить результаты проверок"
    }
  }
 diff --git a/web/src/i18n/locales/vi.json b/web/src/i18n/locales/vi.json
-index c7d3e719..c7d9bc53 100644
+index c7d3e719..49edd4b8 100644
 --- a/web/src/i18n/locales/vi.json
 +++ b/web/src/i18n/locales/vi.json
 @@ -2618,7 +2618,7 @@
@@ -2427,7 +2874,7 @@ index c7d3e719..c7d9bc53 100644
      "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "Với kênh tùy chỉnh nâng cao, thiết lập này chỉ áp dụng cho các route /v1/responses không chuyển đổi giao thức.",
      "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "Đối với các kênh được thêm sau ngày 10 tháng 5 năm 2025, không cần loại bỏ \".\" khỏi tên mô hình trong quá trình triển khai",
      "For private deployments, format: https://fastgpt.run/api/openapi": "Đối với các triển khai riêng tư, định dạng: https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,33 @@
+@@ -6777,6 +6777,40 @@
      "Zhipu": "Zhipu",
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V4",
@@ -2459,11 +2906,18 @@ index c7d3e719..c7d9bc53 100644
 +    "Time to first token": "Time to first token",
 +    "View check details": "View check details",
 +    "Upstream rejected the official Codex client.": "Dịch vụ từ chối ứng dụng Codex chính thức.",
-+    "Official Codex client did not complete this check.": "Ứng dụng Codex chính thức chưa hoàn tất lần kiểm tra này."
++    "Official Codex client did not complete this check.": "Ứng dụng Codex chính thức chưa hoàn tất lần kiểm tra này.",
++    "Delete this check": "Xóa kết quả này",
++    "Delete all checks": "Xóa tất cả kết quả",
++    "Delete this check?": "Xóa kết quả kiểm tra này?",
++    "Delete all checks for this channel?": "Xóa tất cả kết quả kiểm tra của kênh này?",
++    "This permanently deletes this check. If it is the latest result, the channel will wait for a new check.": "Kết quả này sẽ bị xóa vĩnh viễn. Nếu đây là kết quả mới nhất, kênh sẽ chờ lần kiểm tra mới.",
++    "This permanently deletes all check results for this channel. The channel will wait for a new check.": "Tất cả kết quả kiểm tra của kênh này sẽ bị xóa vĩnh viễn. Kênh sẽ chờ lần kiểm tra mới.",
++    "Failed to delete check results": "Không thể xóa kết quả kiểm tra"
    }
  }
 diff --git a/web/src/i18n/locales/zh-TW.json b/web/src/i18n/locales/zh-TW.json
-index 3eca7eea..06b5e26e 100644
+index 3eca7eea..3dc764a5 100644
 --- a/web/src/i18n/locales/zh-TW.json
 +++ b/web/src/i18n/locales/zh-TW.json
 @@ -2618,7 +2618,7 @@
@@ -2475,7 +2929,7 @@ index 3eca7eea..06b5e26e 100644
      "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "進階自訂渠道僅對 /v1/responses 且不做協定轉換的路由生效。",
      "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "對於 2025 年 5 月 10 日之後新增的渠道，在部署時無需從模型名稱中移除 \".\"",
      "For private deployments, format: https://fastgpt.run/api/openapi": "對於私有部署，格式為：https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,33 @@
+@@ -6777,6 +6777,40 @@
      "Zhipu": "智譜",
      "Zhipu GLM": "智譜GLM",
      "Zhipu V4": "智譜 V4",
@@ -2507,11 +2961,18 @@ index 3eca7eea..06b5e26e 100644
 +    "Time to first token": "Time to first token",
 +    "View check details": "View check details",
 +    "Upstream rejected the official Codex client.": "上游拒絕了官方 Codex 用戶端。",
-+    "Official Codex client did not complete this check.": "官方 Codex 用戶端未完成本次檢測。"
++    "Official Codex client did not complete this check.": "官方 Codex 用戶端未完成本次檢測。",
++    "Delete this check": "刪除此筆結果",
++    "Delete all checks": "刪除全部結果",
++    "Delete this check?": "刪除此筆檢測結果？",
++    "Delete all checks for this channel?": "刪除此管道的全部檢測結果？",
++    "This permanently deletes this check. If it is the latest result, the channel will wait for a new check.": "此筆檢測結果將永久刪除。如果這是最新結果，管道將等待重新檢測。",
++    "This permanently deletes all check results for this channel. The channel will wait for a new check.": "此管道的全部檢測結果將永久刪除，管道將等待重新檢測。",
++    "Failed to delete check results": "刪除檢測結果失敗"
    }
  }
 diff --git a/web/src/i18n/locales/zh.json b/web/src/i18n/locales/zh.json
-index 23de155c..c982e8bb 100644
+index 23de155c..b69faf05 100644
 --- a/web/src/i18n/locales/zh.json
 +++ b/web/src/i18n/locales/zh.json
 @@ -2618,7 +2618,7 @@
@@ -2523,7 +2984,7 @@ index 23de155c..c982e8bb 100644
      "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "高级自定义渠道仅对 /v1/responses 且不做协议转换的路由生效。",
      "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "对于 2025 年 5 月 10 日之后添加的渠道，在部署时无需从模型名称中移除 \".\"",
      "For private deployments, format: https://fastgpt.run/api/openapi": "对于私有部署，格式为：https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,33 @@
+@@ -6777,6 +6777,40 @@
      "Zhipu": "智谱",
      "Zhipu GLM": "智谱GLM",
      "Zhipu V4": "智谱 V4",
@@ -2555,6 +3016,13 @@ index 23de155c..c982e8bb 100644
 +    "Time to first token": "首字延迟",
 +    "View check details": "点击查看检测详情",
 +    "Upstream rejected the official Codex client.": "上游拒绝了官方 Codex 客户端。",
-+    "Official Codex client did not complete this check.": "官方 Codex 客户端未完成本次检测。"
++    "Official Codex client did not complete this check.": "官方 Codex 客户端未完成本次检测。",
++    "Delete this check": "删除此次结果",
++    "Delete all checks": "删除全部结果",
++    "Delete this check?": "删除此次检测结果？",
++    "Delete all checks for this channel?": "删除此渠道的全部检测结果？",
++    "This permanently deletes this check. If it is the latest result, the channel will wait for a new check.": "此次检测结果将被永久删除。如果这是最新结果，渠道将等待重新检测。",
++    "This permanently deletes all check results for this channel. The channel will wait for a new check.": "此渠道的全部检测结果将被永久删除，渠道将等待重新检测。",
++    "Failed to delete check results": "删除检测结果失败"
    }
  }
