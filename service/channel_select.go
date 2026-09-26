@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -117,6 +118,20 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 	selectGroup := param.TokenGroup
 	userGroup := common.GetContextKeyString(param.Ctx, constant.ContextKeyUserGroup)
 	filters := GetChannelConstraints(param.Ctx).Filters
+	capacityRetry := common.GetContextKeyBool(param.Ctx, constant.ContextKeyResponsesCapacityRetried)
+	selectionRetry := param.GetRetry()
+	if capacityRetry {
+		var excluded []int
+		for _, value := range param.Ctx.GetStringSlice("use_channel") {
+			if id, err := strconv.Atoi(value); err == nil {
+				excluded = append(excluded, id)
+			}
+		}
+		filters = append(append([]dto.ChannelFilter(nil), filters...), dto.ChannelFilter{Kind: dto.FilterExcludeChannels, ExcludedChannelIDs: excluded})
+		// Exclusion already advances the candidate set. Incrementing its priority
+		// index as well would skip the next available tier.
+		selectionRetry = 0
+	}
 
 	if param.TokenGroup == "auto" {
 		autoGroups := GetRequestAutoGroups(param.Ctx, userGroup)
@@ -139,7 +154,7 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 			autoGroup := autoGroups[i]
 			// Calculate priorityRetry for current group
 			// 计算当前分组的 priorityRetry
-			priorityRetry := param.GetRetry()
+			priorityRetry := selectionRetry
 			// If moved to a new group, reset priorityRetry and update startRetryIndex
 			// 如果切换到新分组，重置 priorityRetry 并更新 startRetryIndex
 			if i > startGroupIndex {
@@ -193,7 +208,7 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 		channel, err = model.GetRandomSatisfiedChannel(
 			param.TokenGroup,
 			param.ModelName,
-			param.GetRetry(),
+			selectionRetry,
 			filters,
 		)
 		if err != nil {

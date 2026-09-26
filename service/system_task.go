@@ -46,6 +46,17 @@ type ScheduledSystemTaskHandler interface {
 	NewPayload() any
 }
 
+// Optional for probes whose cadence must include execution time. Existing
+// scheduled handlers continue waiting their interval after completion.
+type startIntervalSystemTaskHandler interface {
+	ScheduleFromStart() bool
+}
+
+// Optional for schedules with daily windows or a configurable cadence.
+type dueSystemTaskHandler interface {
+	ScheduleDue(now, lastRun int64) (bool, error)
+}
+
 var (
 	systemTaskHandlersMu sync.RWMutex
 	systemTaskHandlers   = map[string]SystemTaskHandler{}
@@ -280,13 +291,26 @@ func runSystemTaskScheduler() {
 	}
 	for _, scheduled := range scheduledHandlers {
 		latest := latestTasks[scheduled.Type()]
+		var lastRun int64
 		if latest != nil {
 			if latest.Status == model.SystemTaskStatusPending || latest.Status == model.SystemTaskStatusRunning {
 				continue // an active row already exists
 			}
-			if now-latest.UpdatedAt < int64(scheduled.Interval().Seconds()) {
-				continue // not due yet
+			lastRun = latest.UpdatedAt
+			if anchored, ok := scheduled.(startIntervalSystemTaskHandler); ok && anchored.ScheduleFromStart() {
+				lastRun = latest.CreatedAt
 			}
+		}
+		if custom, ok := scheduled.(dueSystemTaskHandler); ok {
+			due, err := custom.ScheduleDue(now, lastRun)
+			if err != nil {
+				logger.LogWarn(context.Background(), fmt.Sprintf("system task schedule failed: type=%s err=%v", scheduled.Type(), err))
+			}
+			if err != nil || !due {
+				continue
+			}
+		} else if latest != nil && now-lastRun < int64(scheduled.Interval().Seconds()) {
+			continue // not due yet
 		}
 		if _, err := model.CreateSystemTask(scheduled.Type(), scheduled.NewPayload(), nil); err != nil {
 			activeTask, activeErr := model.GetActiveSystemTask(scheduled.Type())

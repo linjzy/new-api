@@ -34,13 +34,15 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse) 
 	}
 	if event.Response != nil {
 		a.info.ObserveResponseModel(event.Response.Model)
+		// Usage may arrive before the terminal event or on an error envelope.
+		// Preserve it even when the final failure omits its accounting fields.
+		ApplyResponsesUsage(a.usage, event.Response.Usage)
 	}
 	a.started = true
 	ObserveResponsesOutcome(a.info, event)
 	switch event.Type {
 	case "response.completed", "response.done", "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
 		if event.Response != nil {
-			ApplyResponsesUsage(a.usage, event.Response.Usage)
 			if a.outputText.Len() == 0 {
 				// Some upstreams carry the output only on the terminal event.
 				a.outputText.WriteString(relayconvert.ExtractOutputTextFromResponses(event.Response))
@@ -106,6 +108,15 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 	a.usage.TotalTokens = a.usage.PromptTokens + a.usage.CompletionTokens
 	if a.usage.BillingUsage != nil {
 		a.usage.BillingUsage = dto.CloneBillingUsageWithEstimatedCompletion(a.usage.BillingUsage, a.usage.CompletionTokens)
+	}
+	return a.usage
+}
+
+// Usage exposes the accounting facts observed so far. Callers read it before
+// Finish to decide whether an upstream failure already produced billable work.
+func (a *ResponsesUsageAccumulator) Usage() *dto.Usage {
+	if a == nil || a.usage == nil {
+		return &dto.Usage{}
 	}
 	return a.usage
 }
