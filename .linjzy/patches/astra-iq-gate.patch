@@ -22,10 +22,10 @@ index 399a2ab8..bd554f66 100644
  WORKDIR /data
 diff --git a/controller/astra_iq.go b/controller/astra_iq.go
 new file mode 100644
-index 00000000..a2118595
+index 00000000..6f09e1e4
 --- /dev/null
 +++ b/controller/astra_iq.go
-@@ -0,0 +1,546 @@
+@@ -0,0 +1,570 @@
 +package controller
 +
 +import (
@@ -219,12 +219,36 @@ index 00000000..a2118595
 +	return strings.TrimSpace(answer.String()), nil
 +}
 +
-+func probeAstraIQChannel(ctx context.Context, ch *model.Channel, userID int) model.AstraIQResult {
++func probeAstraIQChannel(ctx context.Context, ch *model.Channel, userID int) (result model.AstraIQResult) {
 +	started := time.Now()
-+	result := model.AstraIQResult{Status: "error", Detail: "no_enabled_keys"}
++	result = model.AstraIQResult{Status: "error", Detail: "no_enabled_keys"}
 +	result.Sample.StartedAt = started.Unix()
 +	result.Sample.Endpoint = "/v1/responses"
-+	result.Sample.Client = model.AstraIQClient
++	result.Sample.Profile = model.AstraIQProfile
++	result.Sample.Client = model.AstraIQClient + " (" + model.AstraIQProfile + ")"
++	defer func() {
++		if len(result.Sample.Attempts) == 0 {
++			return
++		}
++		// Log the final grade once per channel, including multi-key failures.
++		// Detailed answers/errors remain in the bounded check history.
++		last := result.Sample.Attempts[len(result.Sample.Attempts)-1]
++		var input, output int
++		knownUsage := true
++		for _, attempt := range result.Sample.Attempts {
++			if attempt.PromptTokens == nil || attempt.CompletionTokens == nil {
++				knownUsage = false
++				continue
++			}
++			input += *attempt.PromptTokens
++			output += *attempt.CompletionTokens
++		}
++		tokens := "unknown"
++		if knownUsage {
++			tokens = fmt.Sprintf("%d/%d", input, output)
++		}
++		common.SysLog(fmt.Sprintf("Astra IQ check: channel=%d checked_at=%d status=%s detail=%s http=%d latency_ms=%d tokens_in_out=%s attempts=%d error_code=%q profile=%s", ch.Id, result.CheckedAt, result.Status, result.Detail, last.HTTPStatus, time.Since(started).Milliseconds(), tokens, len(result.Sample.Attempts), last.ErrorCode, model.AstraIQProfile))
++	}()
 +	if !model.ChannelEligibleForAstraIQ(ch) {
 +		result.Detail = "channel_disabled"
 +		return result
@@ -574,10 +598,10 @@ index 00000000..a2118595
 +}
 diff --git a/controller/astra_iq_codex.go b/controller/astra_iq_codex.go
 new file mode 100644
-index 00000000..be606c0a
+index 00000000..03036d82
 --- /dev/null
 +++ b/controller/astra_iq_codex.go
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,211 @@
 +package controller
 +
 +import (
@@ -659,6 +683,10 @@ index 00000000..be606c0a
 +model_reasoning_effort = "medium"
 +approval_policy = "never"
 +web_search = "disabled"
++[agents]
++enabled = false
++[skills]
++max_context_tokens = 1
 +[features]
 +shell_tool = false
 +unified_exec = false
@@ -687,7 +715,7 @@ index 00000000..be606c0a
 +	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(config), 0600); err != nil {
 +		return testResult{localErr: err}
 +	}
-+	cmd := exec.CommandContext(ctx, binary, "exec", "--json", "--ephemeral", "--skip-git-repo-check", "--sandbox", "read-only", "-C", workspace, "-")
++	cmd := exec.CommandContext(ctx, binary, "exec", "--strict-config", "--json", "--ephemeral", "--skip-git-repo-check", "--sandbox", "read-only", "-C", workspace, "-")
 +	cmd.Dir = workspace
 +	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + dir, "ASTRA_IQ_PROXY_KEY=" + proxyKey}
 +	cmd.Stdin = strings.NewReader(astraIQQuestion)
@@ -787,10 +815,10 @@ index 00000000..be606c0a
 +}
 diff --git a/controller/astra_iq_test.go b/controller/astra_iq_test.go
 new file mode 100644
-index 00000000..1b69ab7c
+index 00000000..f98e7869
 --- /dev/null
 +++ b/controller/astra_iq_test.go
-@@ -0,0 +1,613 @@
+@@ -0,0 +1,684 @@
 +package controller
 +
 +import (
@@ -800,6 +828,7 @@ index 00000000..1b69ab7c
 +	"net/http/httptest"
 +	"os"
 +	"strings"
++	"sync"
 +	"testing"
 +	"time"
 +
@@ -986,6 +1015,72 @@ index 00000000..1b69ab7c
 +			require.NoError(t, db.First(&unchanged, channels[0].Id).Error)
 +			assert.Equal(t, "test-a", unchanged.Key)
 +			assert.True(t, model.AstraIQAllowsChannel(&unchanged, model.AstraIQModel))
++			t.Run("request profile preserves old failure and history", func(t *testing.T) {
++				now := common.GetTimestamp()
++				legacy := model.AstraIQResult{ChannelID: 201, Status: "fail", CheckedAt: now - 10, Version: "candy-21-medium-v1", Fingerprint: model.AstraIQFingerprint(&channels[0]), Answer: "22", HistoryJSON: model.LongText(fmt.Sprintf(`[{"status":"fail","checked_at":%d,"answer":"22","client":"Codex CLI 0.157.1"}]`, now-10))}
++				require.NoError(t, db.Save(&legacy).Error)
++				assert.False(t, model.AstraIQAllowsChannel(&channels[0], model.AstraIQModel), "a profile change must not temporarily allow a failed channel")
++				require.NoError(t, model.SaveAstraIQResult(&channels[0], model.AstraIQResult{Status: "pass", CheckedAt: now, Answer: "21", Sample: model.AstraIQSample{Profile: model.AstraIQProfile, Client: model.AstraIQClient + " (" + model.AstraIQProfile + ")"}}))
++				rows, err := model.GetAstraIQResults([]int{201})
++				require.NoError(t, err)
++				var history []model.AstraIQSample
++				require.NoError(t, common.UnmarshalJsonStr(string(rows[201].HistoryJSON), &history))
++				require.Len(t, history, 2)
++				assert.Equal(t, "22", history[0].Answer)
++				assert.Empty(t, history[0].Profile, "missing profile identifies the original request configuration")
++				assert.Equal(t, model.AstraIQProfile, history[1].Profile)
++				assert.True(t, model.AstraIQAllowsChannel(&channels[0], model.AstraIQModel))
++				engine := gin.New()
++				engine.GET("/checks/:id/:checked_at", GetAstraIQSample)
++				w := httptest.NewRecorder()
++				engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/checks/201/%d", now-10), nil))
++				require.Equal(t, http.StatusOK, w.Code, w.Body.String())
++				assert.Equal(t, "22", gjson.GetBytes(w.Body.Bytes(), "data.sample.answer").String())
++			})
++			t.Run("blocked IQ database read does not hold channel cache lock", func(t *testing.T) {
++				common.MemoryCacheEnabled = true
++				model.InitChannelCache()
++				entered, release, selected := make(chan struct{}), make(chan struct{}), make(chan struct{})
++				var once sync.Once
++				unblock := func() { once.Do(func() { close(release) }) }
++				defer unblock()
++				require.NoError(t, db.Callback().Query().Before("gorm:query").Register("test:astra_block", func(tx *gorm.DB) {
++					if tx.Statement.Table == "options" {
++						select {
++						case entered <- struct{}{}:
++						case <-release:
++							return
++						}
++						<-release
++					}
++				}))
++				defer db.Callback().Query().Remove("test:astra_block")
++				go func() {
++					defer close(selected)
++					_, _ = model.GetRandomSatisfiedChannel("default", model.AstraIQModel, 0, nil)
++				}()
++				select {
++				case <-entered:
++				case <-time.After(5 * time.Second):
++					t.Fatal("IQ query did not begin")
++				}
++				synced := make(chan struct{})
++				go func() { model.InitChannelCache(); close(synced) }()
++				select {
++				case <-synced:
++				case <-time.After(5 * time.Second):
++					unblock()
++					<-selected
++					<-synced
++					t.Fatal("slow IQ storage blocked channel synchronization")
++				}
++				other, err := model.GetRandomSatisfiedChannel("default", "unrelated-model", 0, nil)
++				require.NoError(t, err)
++				require.NotNil(t, other)
++				assert.Equal(t, 201, other.Id)
++				unblock()
++				<-selected
++			})
 +			for _, cached := range []bool{false, true} {
 +				t.Run(fmt.Sprintf("cache=%t", cached), func(t *testing.T) {
 +					common.MemoryCacheEnabled = cached
@@ -1189,6 +1284,8 @@ index 00000000..1b69ab7c
 +		require.NotNil(t, request.Stream)
 +		assert.True(t, *request.Stream)
 +		assert.Contains(t, gjson.GetBytes(request.Input, "@tostr").String(), "最少取出多少个糖果")
++		assert.NotContains(t, string(request.Input), "<multi_agent_role>")
++		assert.NotContains(t, string(request.Input), "<multi_agent_mode>")
 +		seen = append(seen, r.Header.Get("Authorization"))
 +		if r.Header.Get("Authorization") == "Bearer blocked" {
 +			w.WriteHeader(http.StatusForbidden)
@@ -1223,6 +1320,8 @@ index 00000000..1b69ab7c
 +	result := probeAstraIQChannel(context.Background(), ch, user.Id)
 +	assert.Equal(t, "fail", result.Status, result.Detail)
 +	assert.Equal(t, "22", result.Answer)
++	assert.Equal(t, model.AstraIQProfile, result.Sample.Profile)
++	assert.Contains(t, result.Sample.Client, model.AstraIQProfile)
 +	require.Len(t, result.Sample.Attempts, 2)
 +	assert.Equal(t, "21", result.Sample.Attempts[0].Response)
 +	assert.Equal(t, "22", result.Sample.Attempts[1].Response)
@@ -1405,7 +1504,7 @@ index 00000000..1b69ab7c
 +	}
 +}
 diff --git a/controller/channel-test.go b/controller/channel-test.go
-index 1248853a..7b34a477 100644
+index 1248853a..3a16f609 100644
 --- a/controller/channel-test.go
 +++ b/controller/channel-test.go
 @@ -20,6 +20,7 @@ import (
@@ -1499,7 +1598,18 @@ index 1248853a..7b34a477 100644
  
  	err = attachTestBillingRequestInput(info, request)
  	if err != nil {
-@@ -431,6 +474,12 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+@@ -292,7 +335,9 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+ 	//// 创建一个用于日志的 info 副本，移除 ApiKey
+ 	//logInfo := info
+ 	//logInfo.ApiKey = ""
+-	common.SysLog(fmt.Sprintf("testing channel %d with model %s , info %+v ", channel.Id, testModel, info.ToString()))
++	if prompt == "" {
++		common.SysLog(fmt.Sprintf("testing channel %d with model %s , info %+v ", channel.Id, testModel, info.ToString()))
++	}
+ 
+ 	priceData, err := helper.ModelPriceHelper(c, info, 0, request.GetTokenCountMeta())
+ 	if err != nil {
+@@ -431,6 +476,12 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
  		}
  	}
  
@@ -1512,7 +1622,7 @@ index 1248853a..7b34a477 100644
  	requestBody := bytes.NewBuffer(jsonData)
  	c.Request.Body = io.NopCloser(bytes.NewBuffer(jsonData))
  	resp, err := adaptor.DoRequest(c, info, requestBody)
-@@ -442,8 +491,10 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+@@ -442,33 +493,46 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
  		}
  	}
  	var httpResp *http.Response
@@ -1522,8 +1632,29 @@ index 1248853a..7b34a477 100644
 +		attempt.HTTPStatus = httpResp.StatusCode
  		if httpResp.StatusCode != http.StatusOK {
  			err := service.RelayErrorHandler(c.Request.Context(), httpResp, true)
- 			common.SysError(fmt.Sprintf(
-@@ -460,15 +511,21 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+-			common.SysError(fmt.Sprintf(
+-				"channel test bad response: channel_id=%d name=%s type=%d model=%s endpoint_type=%s status=%d err=%v",
+-				channel.Id,
+-				channel.Name,
+-				channel.Type,
+-				testModel,
+-				endpointType,
+-				httpResp.StatusCode,
+-				err,
+-			))
++			if prompt == "" {
++				common.SysError(fmt.Sprintf(
++					"channel test bad response: channel_id=%d name=%s type=%d model=%s endpoint_type=%s status=%d err=%v",
++					channel.Id,
++					channel.Name,
++					channel.Type,
++					testModel,
++					endpointType,
++					httpResp.StatusCode,
++					err,
++				))
++			}
+ 			return testResult{
  				context:     c,
  				localErr:    err,
  				newAPIError: types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError),
@@ -1532,6 +1663,9 @@ index 1248853a..7b34a477 100644
  		}
  	}
  	usageA, respErr := adaptor.DoResponse(c, httpResp, info)
++	if measured, ok := usageA.(*dto.Usage); ok && measured != nil {
++		attempt.PromptTokens, attempt.CompletionTokens = &measured.PromptTokens, &measured.CompletionTokens
++	}
 +	if isStream && info.HasSendResponse() {
 +		firstTokenMS := info.FirstResponseTime.Sub(info.StartTime).Milliseconds()
 +		attempt.FirstTokenMS = &firstTokenMS
@@ -1545,7 +1679,7 @@ index 1248853a..7b34a477 100644
  		}
  	}
  	usage, usageErr := coerceTestUsage(usageA, isStream, info.GetEstimatePromptTokens())
-@@ -477,15 +534,18 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+@@ -477,15 +541,18 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
  			context:     c,
  			localErr:    usageErr,
  			newAPIError: types.NewOpenAIError(usageErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError),
@@ -1565,7 +1699,7 @@ index 1248853a..7b34a477 100644
  		}
  	}
  	if bodyErr := validateTestResponseBody(respBody, isStream); bodyErr != nil {
-@@ -493,6 +553,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+@@ -493,6 +560,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
  			context:     c,
  			localErr:    bodyErr,
  			newAPIError: types.NewOpenAIError(bodyErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError),
@@ -1573,18 +1707,14 @@ index 1248853a..7b34a477 100644
  		}
  	}
  	info.SetEstimatePromptTokens(usage.PromptTokens)
-@@ -515,11 +576,20 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+@@ -515,11 +583,16 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
  		Group:            info.UsingGroup,
  		Other:            other,
  	})
 -	common.SysLog(fmt.Sprintf("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
-+	logBody := respBody
-+	if prompt != "" && len(logBody) > 8<<10 {
-+		// IQ grading reads the whole stream. Log only its tail, which holds the
-+		// answer and terminal events; the head mostly echoes instructions.
-+		logBody = logBody[len(logBody)-(8<<10):]
++	if prompt == "" {
++		common.SysLog(fmt.Sprintf("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
 +	}
-+	common.SysLog(fmt.Sprintf("testing channel #%d, response: \n%s", channel.Id, string(logBody)))
 +	attempt.PromptTokens, attempt.CompletionTokens = &usage.PromptTokens, &usage.CompletionTokens
  	return testResult{
 -		context:     c,
@@ -1626,10 +1756,10 @@ index b86c442d..abf4fd1b 100644
  				return nil
 diff --git a/model/astra_iq.go b/model/astra_iq.go
 new file mode 100644
-index 00000000..c30e317d
+index 00000000..eb0c7d51
 --- /dev/null
 +++ b/model/astra_iq.go
-@@ -0,0 +1,303 @@
+@@ -0,0 +1,334 @@
 +package model
 +
 +import (
@@ -1647,9 +1777,13 @@ index 00000000..c30e317d
 +)
 +
 +const (
-+	AstraIQModel       = "gpt-6-astra"
-+	AstraIQClient      = "Codex CLI 0.157.1"
-+	AstraIQVersion     = "candy-21-medium-v1"
++	AstraIQModel   = "gpt-6-astra"
++	AstraIQClient  = "Codex CLI 0.157.1"
++	AstraIQVersion = "candy-21-medium-v1"
++	// The question and routing judgment remain compatible across request
++	// profiles. Keep the benchmark version/fingerprint so existing failures
++	// stay blocked until a new check completes, and old history is retained.
++	AstraIQProfile     = "minimal-v1"
 +	AstraIQTaskType    = "astra_iq_test"
 +	AstraIQInterval    = 5 * time.Minute
 +	AstraIQHistorySize = 24
@@ -1678,6 +1812,7 @@ index 00000000..c30e317d
 +	LatencyMS int64            `json:"latency_ms,omitempty"`
 +	Endpoint  string           `json:"endpoint,omitempty"`
 +	Client    string           `json:"client,omitempty"`
++	Profile   string           `json:"profile,omitempty"`
 +	Attempts  []AstraIQAttempt `json:"attempts,omitempty"`
 +}
 +
@@ -1816,24 +1951,50 @@ index 00000000..c30e317d
 +	return err == nil && results[ch.Id].Allows(ch, settings)
 +}
 +
-+func filterAstraIQCandidateIDs(ids []int, modelName string) []int {
++type astraIQRoutingSnapshot struct {
++	settings AstraIQSettings
++	results  map[int]AstraIQResult
++}
++
++// Read once per selection, outside channelSyncLock. Load only judgment fields:
++// full answers/history are irrelevant to routing and can be much larger.
++func loadAstraIQRouting(modelName string) (*astraIQRoutingSnapshot, error) {
 +	if !AstraIQRequired(modelName) {
-+		return ids
++		return nil, nil
 +	}
 +	settings, err := GetAstraIQSettings()
 +	if err != nil {
-+		return nil
++		return nil, err
 +	}
 +	if !settings.Enabled || !settings.StopOnFailure {
-+		return ids
++		return nil, nil
 +	}
-+	results, err := GetAstraIQResults(ids)
-+	if err != nil {
-+		return nil
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	var rows []AstraIQResult
++	query := DB.WithContext(ctx).Select("channel_id", "status", "checked_at", "version", "fingerprint")
++	if len(settings.ChannelIDs) > 0 {
++		query = query.Where("channel_id IN ?", settings.ChannelIDs)
++	}
++	if err := query.Find(&rows).Error; err != nil {
++		return nil, err
++	}
++	snapshot := &astraIQRoutingSnapshot{settings: settings, results: make(map[int]AstraIQResult, len(rows))}
++	for _, row := range rows {
++		snapshot.results[row.ChannelID] = row
++	}
++	return snapshot, nil
++}
++
++// Caller holds channelSyncLock. Check the current cached channel fingerprint,
++// including any credentials/configuration changed while the DB was queried.
++func (s *astraIQRoutingSnapshot) filterIDs(ids []int) []int {
++	if s == nil {
++		return ids
 +	}
 +	kept := make([]int, 0, len(ids))
 +	for _, id := range ids {
-+		if results[id].Allows(channelsIDM[id], settings) {
++		if s.results[id].Allows(channelsIDM[id], s.settings) {
 +			kept = append(kept, id)
 +		}
 +	}
@@ -2054,8 +2215,35 @@ index 00000000..a3a16a31
 +		Columns: []clause.Column{{Name: "key"}}, DoUpdates: clause.AssignmentColumns([]string{"value"}),
 +	}).Create(&Option{Key: astraIQSettingsKey, Value: string(value)}).Error
 +}
+diff --git a/model/channel_cache.go b/model/channel_cache.go
+index fa1107ef..ec3f0ef0 100644
+--- a/model/channel_cache.go
++++ b/model/channel_cache.go
+@@ -125,16 +125,20 @@ func GetRandomSatisfiedChannel(
+ 		return GetChannel(group, model, retry, filters)
+ 	}
+ 
++	iq, err := loadAstraIQRouting(model)
++	if err != nil {
++		return nil, fmt.Errorf("Astra IQ routing unavailable: %w", err)
++	}
+ 	channelSyncLock.RLock()
+ 	defer channelSyncLock.RUnlock()
+ 
+ 	// First, try to find channels with the exact model name.
+-	channels, _ := filterCandidateIDs(group2model2channels[group][model], model, filters)
++	channels, _ := filterCandidateIDs(iq.filterIDs(group2model2channels[group][model]), model, filters)
+ 
+ 	// If no channels found, try to find channels with the normalized model name.
+ 	if len(channels) == 0 {
+ 		normalizedModel := ratio_setting.RoutingMatchModelName(model)
+-		channels, _ = filterCandidateIDs(group2model2channels[group][normalizedModel], model, filters)
++		channels, _ = filterCandidateIDs(iq.filterIDs(group2model2channels[group][normalizedModel]), model, filters)
+ 	}
+ 
+ 	if len(channels) == 0 {
 diff --git a/model/channel_constraint.go b/model/channel_constraint.go
-index 34121a7b..b8452657 100644
+index 34121a7b..06073fea 100644
 --- a/model/channel_constraint.go
 +++ b/model/channel_constraint.go
 @@ -22,6 +22,9 @@ func ChannelSatisfiesFilters(ch *Channel, modelName string, filters []dto.Channe
@@ -2068,18 +2256,6 @@ index 34121a7b..b8452657 100644
  	for _, kind := range filterEvalOrder {
  		for _, filter := range filters {
  			if filter.Kind != kind {
-@@ -43,7 +46,10 @@ func filterCandidateIDs(ids []int, modelName string, filters []dto.ChannelFilter
- 	if len(ids) == 0 {
- 		return ids, ""
- 	}
--	kept = ids
-+	kept = filterAstraIQCandidateIDs(ids, modelName)
-+	if len(kept) == 0 {
-+		return kept, "astra_iq"
-+	}
- 	for _, kind := range filterEvalOrder {
- 		kindFilters := filtersByKind(filters, kind)
- 		if len(kindFilters) == 0 {
 diff --git a/model/main.go b/model/main.go
 index 917d4e05..1aae158f 100644
 --- a/model/main.go

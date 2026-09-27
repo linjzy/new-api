@@ -42,6 +42,7 @@ docker() {
 enable_request_gate() { record gate; }
 disable_request_gate() { record ungate; }
 wait_for_connection_drain() { record drain; }
+wait_for_idle_window() { record idle; }
 preflight_deployment() { record preflight; }
 ensure_override_manageable() { :; }
 backup_database() { record backup; }
@@ -64,8 +65,38 @@ deploy_local_and_verify() { record deploy; }
     def test_upgrade_preflights_before_gate_and_cleans_only_after_success(self):
         p,calls=self.run_script('activate_image ghcr.io/linjzy/new-api@sha256:123 v1 upstream patch source commit\n')
         self.assertEqual(p.returncode,0,p.stderr)
-        order=[x for x in calls if x in ("preflight","gate","drain","backup","deploy","public","cleanup")]
-        self.assertEqual(order,["preflight","gate","drain","backup","deploy","public","cleanup"])
+        order=[x for x in calls if x in ("preflight","idle","gate","drain","backup","deploy","public","cleanup")]
+        self.assertEqual(order,["preflight","idle","gate","drain","backup","deploy","public","cleanup"])
+
+    def test_idle_wait_does_not_gate_and_still_drains_after_a_new_arrival(self):
+        body=SCRIPT.read_text();start=body.index('wait_for_idle_window() {');end=body.index('ensure_override_manageable()',start)
+        p,calls=self.run_script(body[start:end]+r'''
+date() { echo 100; }
+IDLE_WAIT_SECONDS=10
+active_app_connections() { echo 0; }
+wait_for_idle_window
+enable_request_gate
+# A request arrived between the idle observation and the gate.
+active_app_connections() { [[ -e "$TEST_DIR/drained" ]] && echo 0 || echo 1; }
+sleep() { record waiting-after-gate; touch "$TEST_DIR/drained"; }
+wait_for_connection_drain test
+record switched
+''')
+        self.assertEqual(p.returncode,0,p.stderr)
+        self.assertEqual(calls,["gate","waiting-after-gate","switched"])
+
+    def test_idle_timeout_falls_back_and_inspection_errors_abort_before_gate(self):
+        body=SCRIPT.read_text();start=body.index('wait_for_idle_window() {');end=body.index('wait_for_connection_drain() {',start)
+        for mode in ("timeout", "error", "invalid"):
+            with self.subTest(mode=mode):
+                setup = {
+                    "timeout": 'date() { [[ -e "$TEST_DIR/expired" ]] && echo 110 || echo 100; }; active_app_connections() { echo 1; }; sleep() { touch "$TEST_DIR/expired"; }',
+                    "error": 'date() { echo 100; }; active_app_connections() { return 1; }',
+                    "invalid": 'date() { echo 100; }; active_app_connections() { echo invalid; }',
+                }[mode]
+                p,calls=self.run_script(body[start:end]+'\nIDLE_WAIT_SECONDS=10\n'+setup+'\nwait_for_idle_window\nenable_request_gate\nwait_for_connection_drain test\n')
+                self.assertEqual(p.returncode == 0,mode == "timeout",p.stderr)
+                self.assertEqual(calls,["gate","drain"] if mode == "timeout" else [])
 
     def test_database_backup_refreshes_only_when_upstream_changes_and_never_replaces_on_failure(self):
         body=SCRIPT.read_text();start=body.index('backup_database() {');end=body.index('active_app_connections()',start)

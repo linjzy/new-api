@@ -2,6 +2,7 @@ package openai
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +20,51 @@ import (
 type customCancelAtHeadersWriter struct {
 	*httptest.ResponseRecorder
 	cancel context.CancelFunc
+}
+
+func TestCustomResponsesTransientFailureClassification(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+	for _, tc := range []struct {
+		name, errorJSON string
+		retry           bool
+	}{
+		{"account concurrency", `{"code":"gateway_concurrency_limit","message":"concurrency limit"}`, true},
+		{"explicitly retryable stream break", `{"code":"upstream_stream_break","message":"interrupted","retryable":true}`, true},
+		{"safe stream break message", `{"code":"upstream_stream_break","message":"Upstream stream ended prematurely; safe to retry"}`, true},
+		{"nonretryable flag wins", `{"code":"upstream_stream_break","message":"Upstream stream ended prematurely; safe to retry","retryable":false}`, false},
+		{"unmarked break", `{"code":"upstream_stream_break","message":"stream interrupted"}`, false},
+		{"generic temporary failure", `{"code":"upstream_error","message":"The service is temporarily unavailable. Please retry later."}`, true},
+		{"generic overload", `{"code":"server_error","message":"Our servers are currently overloaded. Please try again later."}`, true},
+		{"unknown service failure", `{"code":"unknown_error","message":"Upstream service temporarily unavailable"}`, true},
+		{"invalid request is not transient", `{"code":"bad_request","message":"The service is temporarily unavailable. Please retry later."}`, false},
+		{"authentication type wins", `{"code":"unknown_error","type":"authentication_error","message":"The service is temporarily unavailable. Please retry later."}`, false},
+		{"usage limit is not capacity", `{"code":"usage_limit_reached","message":"Please try again later."}`, false},
+		{"arbitrary retry message", `{"code":"unknown_error","message":"Please try again later."}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, envelope := range []string{
+				`{"type":"response.failed","response":{"status":"failed","output":[],"usage":null,"error":%s}}`,
+				`{"type":"error","error":%s}`,
+			} {
+				c, _ := gin.CreateTestContext(httptest.NewRecorder())
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+				info := &relaycommon.RelayInfo{OriginModelName: "review-model", DisablePing: true, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "review-model"}}
+				body := "data: " + fmt.Sprintf(envelope, tc.errorJSON) + "\n\n"
+				resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}
+				usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+				require.NotNil(t, apiErr)
+				require.NotNil(t, usage)
+				assert.Equal(t, http.StatusBadGateway, apiErr.StatusCode, "keep the original public failure status")
+				assert.False(t, c.Writer.Written())
+				assert.Zero(t, usage.TotalTokens)
+				assert.Equal(t, tc.retry, info.ResponsesCapacityFailure)
+				assert.Equal(t, !tc.retry, types.IsSkipRetryError(apiErr))
+			}
+		})
+	}
 }
 
 func (w *customCancelAtHeadersWriter) Header() http.Header {
@@ -73,6 +119,14 @@ func TestCustomResponsesCapacityBoundaries(t *testing.T) {
 			cancelAtHeaders: true,
 			tokens:          12,
 			skipRetry:       true,
+		},
+		{
+			name: "generated tool arguments prevent replay",
+			body: "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{}\"}\n\n" +
+				"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"model_at_capacity\",\"message\":\"capacity\"}}}\n\n",
+			written:   true,
+			tokens:    1,
+			skipRetry: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -33,6 +33,7 @@ ROLLBACK_REF="${ROLLBACK_REPO}:previous"
 DB_CONTAINER="${NEWAPI_DB_CONTAINER:-new-api-postgres}"
 DB_BACKUP_FILE="${NEWAPI_DB_BACKUP_FILE:-/opt/new-api/backups/new-api-before-upgrade.dump}"
 DRAIN_WAIT_SECONDS="${NEWAPI_DRAIN_WAIT_SECONDS:-600}"
+IDLE_WAIT_SECONDS="${NEWAPI_IDLE_WAIT_SECONDS:-120}"
 HEALTH_TIMEOUT_SECONDS="${NEWAPI_HEALTH_TIMEOUT_SECONDS:-180}"
 LOG_RETENTION_DAYS="${NEWAPI_LOG_RETENTION_DAYS:-14}"
 
@@ -360,6 +361,27 @@ enable_request_gate() {
   die "nginx request gate verification failed: expected 503, got $status_code"
 }
 
+# Opportunistic idle wait leaves the public entry open. The post-gate drain is
+# still mandatory: a new request can arrive after observing zero connections.
+wait_for_idle_window() {
+  local deadline active_count
+  [[ "$IDLE_WAIT_SECONDS" =~ ^[0-9]+$ ]] || die "invalid idle wait seconds"
+  deadline=$(($(date +%s) + IDLE_WAIT_SECONDS))
+  log "waiting up to $IDLE_WAIT_SECONDS seconds for a natural idle window"
+  while (($(date +%s) < deadline)); do
+    active_count="$(active_app_connections)" ||
+      die "cannot inspect active connections; service was not changed"
+    [[ "$active_count" =~ ^[0-9]+$ ]] ||
+      die "invalid active connection count; service was not changed"
+    if ((active_count == 0)); then
+      log "natural idle window observed"
+      return 0
+    fi
+    sleep 1
+  done
+  log "natural idle wait expired; falling back to gated connection drain"
+}
+
 wait_for_connection_drain() {
   local phase="$1"
   local deadline active_count
@@ -369,6 +391,8 @@ wait_for_connection_drain() {
   while (($(date +%s) < deadline)); do
     active_count="$(active_app_connections)" ||
       die "cannot inspect active connections; service was not changed"
+    [[ "$active_count" =~ ^[0-9]+$ ]] ||
+      die "invalid active connection count; service was not changed"
     if ((active_count == 0)); then
       log "connection drain confirmed"
       return 0
@@ -576,6 +600,8 @@ activate_image() {
 
   set_phase preflight
   preflight_deployment "$image_ref"
+  set_phase idle_wait
+  wait_for_idle_window
   set_phase gate
   enable_request_gate
   set_phase drain

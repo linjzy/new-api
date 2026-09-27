@@ -16,7 +16,7 @@ index f1e158f..f63f964 100644
  
  	// ContextKeyAuditLogged marks that the current request has already recorded
 diff --git a/controller/relay.go b/controller/relay.go
-index 1c42437e3..0222e91b8 100644
+index 21c9138..a2f25ba 100644
 --- a/controller/relay.go
 +++ b/controller/relay.go
 @@ -90,6 +90,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
@@ -92,7 +92,7 @@ index a1848bc..6baff44 100644
  
  type ChannelConstraints struct {
 diff --git a/middleware/distributor.go b/middleware/distributor.go
-index 87f30c1..db36d2c 100644
+index 4595ca3..2b8305f 100644
 --- a/middleware/distributor.go
 +++ b/middleware/distributor.go
 @@ -124,7 +124,8 @@ func Distribute() func(c *gin.Context) {
@@ -132,7 +132,7 @@ index ecfcb5c..b86c442 100644
  			return nil
  		}
 diff --git a/model/channel_constraint.go b/model/channel_constraint.go
-index 2d31a72..31e96df 100644
+index c3c3e9b..34121a7 100644
 --- a/model/channel_constraint.go
 +++ b/model/channel_constraint.go
 @@ -8,14 +8,16 @@ import (
@@ -179,7 +179,7 @@ index 7e6f762..e17bdec 100644
  		// 处理流式请求的 ping 保活
  		generalSettings := operation_setting.GetGeneralSetting()
 diff --git a/relay/channel/openai/relay_responses.go b/relay/channel/openai/relay_responses.go
-index 3ed0b3b..48dce43 100644
+index 3ed0b3b..f630ac8 100644
 --- a/relay/channel/openai/relay_responses.go
 +++ b/relay/channel/openai/relay_responses.go
 @@ -4,6 +4,7 @@ import (
@@ -319,7 +319,7 @@ index 3ed0b3b..48dce43 100644
  }
  
  func rewriteSGLangResponsesCreatedAt(info *relaycommon.RelayInfo, payload []byte, path string, createdAt dto.IntValue) []byte {
-@@ -113,3 +211,204 @@ func rewriteSGLangResponsesCreatedAt(info *relaycommon.RelayInfo, payload []byte
+@@ -113,3 +211,242 @@ func rewriteSGLangResponsesCreatedAt(info *relaycommon.RelayInfo, payload []byte
  	}
  	return patched
  }
@@ -491,8 +491,12 @@ index 3ed0b3b..48dce43 100644
 +// successful HTTP handshake. Only explicit transient capacity errors can replay.
 +func responsesStreamFailure(event dto.ResponsesStreamResponse) (*types.NewAPIError, bool) {
 +	var upstreamError *types.OpenAIError
++	rawError := event.Error
 +	if event.Response != nil {
 +		upstreamError = event.Response.GetOpenAIError()
++		if upstreamError != nil {
++			rawError = event.Response.Error
++		}
 +	}
 +	if upstreamError == nil {
 +		upstreamError = dto.GetOpenAIError(event.Error)
@@ -521,6 +525,40 @@ index 3ed0b3b..48dce43 100644
 +	}
 +	if capacity {
 +		return types.WithOpenAIError(*upstreamError, http.StatusServiceUnavailable), true
++	}
++	// Preserve the existing 502 response when no alternative is available.
++	// Retry eligibility is independent of the public HTTP status; the caller
++	// still enforces output, usage, cancellation, pinning and retry budgets.
++	transient := code == "gateway_concurrency_limit"
++	message := strings.ToLower(strings.TrimSpace(upstreamError.Message))
++	if code == "upstream_stream_break" {
++		if fields, ok := rawError.(map[string]any); ok {
++			if retryable, present := fields["retryable"]; present {
++				transient = retryable == true
++			} else {
++				transient = message == "upstream stream ended prematurely; safe to retry"
++			}
++		} else {
++			transient = message == "upstream stream ended prematurely; safe to retry"
++		}
++	}
++	switch code {
++	case "", "<nil>", "unknown_error", "server_error", "upstream_error", "service_unavailable":
++		switch strings.ToLower(upstreamError.Type) {
++		case "", "error", "unknown_error", "server_error", "upstream_error":
++			// Match known service failures, never arbitrary "try again" text
++			// from authentication, billing, policy or invalid-request errors.
++			switch strings.TrimSuffix(message, ".") {
++			case "the service is temporarily unavailable. please try again later",
++				"the service is temporarily unavailable. please retry later",
++				"upstream service temporarily unavailable",
++				"our servers are currently overloaded. please try again later":
++				transient = true
++			}
++		}
++	}
++	if transient {
++		return types.WithOpenAIError(*upstreamError, http.StatusBadGateway), true
 +	}
 +	return types.WithOpenAIError(*upstreamError, http.StatusBadGateway, types.ErrOptionWithSkipRetry()), false
 +}
@@ -730,7 +768,7 @@ index c18df43..3f80953 100644
  	Message         string                   `json:"message,omitempty"`
  	Param           string                   `json:"param,omitempty"`
 diff --git a/service/channel_select.go b/service/channel_select.go
-index 9d32d5d..812d50c 100644
+index b89558a..8a569a5 100644
 --- a/service/channel_select.go
 +++ b/service/channel_select.go
 @@ -4,6 +4,7 @@ import (
@@ -741,7 +779,7 @@ index 9d32d5d..812d50c 100644
  
  	"github.com/QuantumNous/new-api/common"
  	"github.com/QuantumNous/new-api/constant"
-@@ -141,6 +142,20 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string,
+@@ -117,6 +118,20 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string,
  	selectGroup := param.TokenGroup
  	userGroup := common.GetContextKeyString(param.Ctx, constant.ContextKeyUserGroup)
  	filters := GetChannelConstraints(param.Ctx).Filters
@@ -762,7 +800,7 @@ index 9d32d5d..812d50c 100644
  
  	if param.TokenGroup == "auto" {
  		autoGroups := GetRequestAutoGroups(param.Ctx, userGroup)
-@@ -163,7 +178,7 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string,
+@@ -139,7 +154,7 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string,
  			autoGroup := autoGroups[i]
  			// Calculate priorityRetry for current group
  			// 计算当前分组的 priorityRetry
@@ -771,7 +809,7 @@ index 9d32d5d..812d50c 100644
  			// If moved to a new group, reset priorityRetry and update startRetryIndex
  			// 如果切换到新分组，重置 priorityRetry 并更新 startRetryIndex
  			if i > startGroupIndex {
-@@ -217,7 +232,7 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string,
+@@ -193,7 +208,7 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string,
  		channel, err = model.GetRandomSatisfiedChannel(
  			param.TokenGroup,
  			param.ModelName,
@@ -781,7 +819,7 @@ index 9d32d5d..812d50c 100644
  		)
  		if err != nil {
 diff --git a/service/log_info_generate.go b/service/log_info_generate.go
-index 8e86deb..51e0924 100644
+index ac4e11b..87e69ff 100644
 --- a/service/log_info_generate.go
 +++ b/service/log_info_generate.go
 @@ -73,6 +73,10 @@ func AppendRelayLogAdminInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo,
