@@ -2325,10 +2325,10 @@ index baaf9142..44adcc05 100644
  	t.Helper()
 diff --git a/web/src/features/channels/components/__tests__/astra-iq-status.test.tsx b/web/src/features/channels/components/__tests__/astra-iq-status.test.tsx
 new file mode 100644
-index 00000000..feb50ed5
+index 00000000..33fa4fef
 --- /dev/null
 +++ b/web/src/features/channels/components/__tests__/astra-iq-status.test.tsx
-@@ -0,0 +1,605 @@
+@@ -0,0 +1,645 @@
 +/*
 +Copyright (C) 2023-2026 QuantumNous
 +
@@ -2668,7 +2668,7 @@ index 00000000..feb50ed5
 +  return client
 +}
 +
-+it('saves the total switch and schedule and reloads their values on reopen', async () => {
++it('saves the schedule and channels and reloads their values on reopen', async () => {
 +  let saved = { ...defaultSettings }
 +  const get = vi.spyOn(api, 'get').mockImplementation(async () => ({
 +    data: { success: true, data: { ...saved, channels: astraChannels } },
@@ -2689,7 +2689,6 @@ index 00000000..feb50ed5
 +    target: { value: '17' },
 +  })
 +  await userEvent.click(screen.getByRole('switch', { name: 'Stop on failure' }))
-+  await userEvent.click(screen.getByRole('switch', { name: 'Enable checks' }))
 +  await userEvent.click(
 +    screen.getByRole('combobox', { name: 'All Astra channels' })
 +  )
@@ -2703,7 +2702,7 @@ index 00000000..feb50ed5
 +    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
 +  )
 +  expect(put).toHaveBeenCalledWith('/api/channel/astra_iq/settings', {
-+    enabled: false,
++    enabled: true,
 +    start_time: '22:00',
 +    end_time: '06:30',
 +    interval_minutes: 17,
@@ -2720,11 +2719,52 @@ index 00000000..feb50ed5
 +  expect(
 +    screen.getByRole('switch', { name: 'Stop on failure' })
 +  ).not.toBeChecked()
-+  expect(
-+    screen.getByRole('switch', { name: 'Enable checks' })
-+  ).not.toBeChecked()
++  expect(screen.getByRole('switch', { name: 'Enable checks' })).toBeChecked()
 +  expect(screen.getByText('#3 openai-krill · Disabled')).toBeVisible()
 +  expect(get).toHaveBeenCalledTimes(2)
++})
++
++it('hides the other settings while checks are off and saves them unchanged', async () => {
++  let saved = { ...defaultSettings }
++  vi.spyOn(api, 'get').mockImplementation(async () => ({
++    data: { success: true, data: { ...saved, channels: astraChannels } },
++  }))
++  const put = vi.spyOn(api, 'put').mockImplementation(async (_url, body) => {
++    saved = body as typeof defaultSettings
++    return { data: { success: true, data: saved } }
++  })
++  await openSettings()
++  const toggle = await screen.findByRole('switch', { name: 'Enable checks' })
++  // An invalid hidden edit must not block turning checks off.
++  fireEvent.change(screen.getByLabelText('Interval (minutes)'), {
++    target: { value: '0' },
++  })
++  await userEvent.click(toggle)
++  const dependent = () => [
++    screen.queryByRole('combobox', { name: 'All Astra channels' }),
++    screen.queryByLabelText('Check start time'),
++    screen.queryByLabelText('End Time'),
++    screen.queryByLabelText('Interval (minutes)'),
++    screen.queryByRole('switch', { name: 'Stop on failure' }),
++  ]
++  expect(dependent()).toEqual([null, null, null, null, null])
++  expect(screen.getByRole('button', { name: 'Cancel' })).toBeVisible()
++  await userEvent.click(toggle)
++  expect(screen.getByLabelText('Interval (minutes)')).toHaveValue(0)
++  await userEvent.click(toggle)
++  await userEvent.click(screen.getByRole('button', { name: 'Save' }))
++  await waitFor(() =>
++    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
++  )
++  expect(put).toHaveBeenCalledWith('/api/channel/astra_iq/settings', {
++    ...defaultSettings,
++    enabled: false,
++  })
++  await userEvent.click(screen.getByRole('button', { name: 'Check settings' }))
++  expect(
++    await screen.findByRole('switch', { name: 'Enable checks' })
++  ).not.toBeChecked()
++  expect(dependent()).toEqual([null, null, null, null, null])
 +})
 +
 +it('rejects a fractional interval before sending a request', async () => {
@@ -2936,10 +2976,10 @@ index 00000000..feb50ed5
 +)
 diff --git a/web/src/features/channels/components/astra-iq-settings.tsx b/web/src/features/channels/components/astra-iq-settings.tsx
 new file mode 100644
-index 00000000..9ea7558a
+index 00000000..7840d2b1
 --- /dev/null
 +++ b/web/src/features/channels/components/astra-iq-settings.tsx
-@@ -0,0 +1,372 @@
+@@ -0,0 +1,387 @@
 +/*
 +Copyright (C) 2023-2026 QuantumNous
 +
@@ -3017,6 +3057,7 @@ index 00000000..9ea7558a
 +const channelsSchema = z.array(
 +  z.object({ id: z.number(), name: z.string(), status: z.number() })
 +)
++const resolveSettings = zodResolver(settingsSchema)
 +type CheckSettings = z.infer<typeof settingsSchema>
 +type CheckChannel = z.infer<typeof channelsSchema>[number]
 +type SettingsResponse = {
@@ -3153,9 +3194,17 @@ index 00000000..9ea7558a
 +}) {
 +  const { t } = useTranslation()
 +  const form = useForm<CheckSettings>({
-+    resolver: zodResolver(settingsSchema),
++    // With checks off the other fields are hidden, so validate and save their
++    // loaded values; unsaved edits stay in the form until checks are back on.
++    resolver: (values, context, options) =>
++      resolveSettings(
++        values.enabled ? values : { ...props.settings, enabled: false },
++        context,
++        options
++      ),
 +    defaultValues: props.settings,
 +  })
++  const enabled = form.watch('enabled')
 +  const options = props.channels.map((channel) => {
 +    let label = `#${channel.id} ${channel.name}`
 +    if (channel.status !== CHANNEL_STATUS.ENABLED) {
@@ -3207,48 +3256,77 @@ index 00000000..9ea7558a
 +            </FormItem>
 +          )}
 +        />
-+        <FormField
-+          control={form.control}
-+          name='channel_ids'
-+          render={({ field }) => (
-+            <FormItem>
-+              <FormLabel>{t('Check channels')}</FormLabel>
-+              <FormControl>
-+                <MultiSelect
-+                  options={options}
-+                  selected={field.value.map(String)}
-+                  onChange={(values) => field.onChange(values.map(Number))}
-+                  placeholder={t('All Astra channels')}
-+                  disabled={props.disabled}
-+                />
-+              </FormControl>
-+              <FormDescription>
-+                {t(
-+                  'Leave empty to check all Astra channels. Unselected channels are not checked and their results do not block calls.'
-+                )}
-+              </FormDescription>
-+              <FormMessage />
-+            </FormItem>
-+          )}
-+        />
-+        <div className='grid grid-cols-2 gap-4'>
-+          {(['start_time', 'end_time'] as const).map((name) => (
++        {enabled && (
++          <>
 +            <FormField
-+              key={name}
 +              control={form.control}
-+              name={name}
++              name='channel_ids'
 +              render={({ field }) => (
 +                <FormItem>
-+                  <FormLabel>
-+                    {name === 'start_time'
-+                      ? t('Check start time')
-+                      : t('End Time')}
-+                  </FormLabel>
++                  <FormLabel>{t('Check channels')}</FormLabel>
++                  <FormControl>
++                    <MultiSelect
++                      options={options}
++                      selected={field.value.map(String)}
++                      onChange={(values) => field.onChange(values.map(Number))}
++                      placeholder={t('All Astra channels')}
++                      disabled={props.disabled}
++                    />
++                  </FormControl>
++                  <FormDescription>
++                    {t(
++                      'Leave empty to check all Astra channels. Unselected channels are not checked and their results do not block calls.'
++                    )}
++                  </FormDescription>
++                  <FormMessage />
++                </FormItem>
++              )}
++            />
++            <div className='grid grid-cols-2 gap-4'>
++              {(['start_time', 'end_time'] as const).map((name) => (
++                <FormField
++                  key={name}
++                  control={form.control}
++                  name={name}
++                  render={({ field }) => (
++                    <FormItem>
++                      <FormLabel>
++                        {name === 'start_time'
++                          ? t('Check start time')
++                          : t('End Time')}
++                      </FormLabel>
++                      <FormControl>
++                        <Input
++                          {...field}
++                          type='time'
++                          step={60}
++                          disabled={props.disabled}
++                        />
++                      </FormControl>
++                      <FormMessage />
++                    </FormItem>
++                  )}
++                />
++              ))}
++            </div>
++            <p className='text-muted-foreground text-xs'>
++              {t(
++                'Equal times mean all day. Overnight schedules are supported.'
++              )}
++            </p>
++            <FormField
++              control={form.control}
++              name='interval_minutes'
++              render={({ field }) => (
++                <FormItem>
++                  <FormLabel>{t('Interval (minutes)')}</FormLabel>
 +                  <FormControl>
 +                    <Input
-+                      {...field}
-+                      type='time'
-+                      step={60}
++                      {...safeNumberFieldProps(field)}
++                      type='number'
++                      min={1}
++                      max={1440}
++                      step={1}
 +                      disabled={props.disabled}
 +                    />
 +                  </FormControl>
@@ -3256,58 +3334,35 @@ index 00000000..9ea7558a
 +                </FormItem>
 +              )}
 +            />
-+          ))}
-+        </div>
-+        <p className='text-muted-foreground text-xs'>
-+          {t('Equal times mean all day. Overnight schedules are supported.')}
-+        </p>
-+        <FormField
-+          control={form.control}
-+          name='interval_minutes'
-+          render={({ field }) => (
-+            <FormItem>
-+              <FormLabel>{t('Interval (minutes)')}</FormLabel>
-+              <FormControl>
-+                <Input
-+                  {...safeNumberFieldProps(field)}
-+                  type='number'
-+                  min={1}
-+                  max={1440}
-+                  step={1}
-+                  disabled={props.disabled}
-+                />
-+              </FormControl>
-+              <FormMessage />
-+            </FormItem>
-+          )}
-+        />
-+        <FormField
-+          control={form.control}
-+          name='stop_on_failure'
-+          render={({ field }) => (
-+            <FormItem className='flex items-center justify-between gap-4 rounded-lg border p-3'>
-+              <div className='space-y-1'>
-+                <FormLabel>{t('Stop on failure')}</FormLabel>
-+                <FormDescription>
-+                  {t(
-+                    'Pause Astra calls after a failed check. Calls without a result are allowed.'
-+                  )}
-+                </FormDescription>
-+              </div>
-+              <FormControl>
-+                <Switch
-+                  name={field.name}
-+                  checked={field.value}
-+                  onCheckedChange={field.onChange}
-+                  onBlur={field.onBlur}
-+                  ref={field.ref}
-+                  disabled={props.disabled}
-+                />
-+              </FormControl>
-+              <FormMessage />
-+            </FormItem>
-+          )}
-+        />
++            <FormField
++              control={form.control}
++              name='stop_on_failure'
++              render={({ field }) => (
++                <FormItem className='flex items-center justify-between gap-4 rounded-lg border p-3'>
++                  <div className='space-y-1'>
++                    <FormLabel>{t('Stop on failure')}</FormLabel>
++                    <FormDescription>
++                      {t(
++                        'Pause Astra calls after a failed check. Calls without a result are allowed.'
++                      )}
++                    </FormDescription>
++                  </div>
++                  <FormControl>
++                    <Switch
++                      name={field.name}
++                      checked={field.value}
++                      onCheckedChange={field.onChange}
++                      onBlur={field.onBlur}
++                      ref={field.ref}
++                      disabled={props.disabled}
++                    />
++                  </FormControl>
++                  <FormMessage />
++                </FormItem>
++              )}
++            />
++          </>
++        )}
 +      </form>
 +    </Form>
 +  )
