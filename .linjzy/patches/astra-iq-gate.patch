@@ -22,10 +22,10 @@ index 399a2ab8..bd554f66 100644
  WORKDIR /data
 diff --git a/controller/astra_iq.go b/controller/astra_iq.go
 new file mode 100644
-index 00000000..69656f39
+index 00000000..a2118595
 --- /dev/null
 +++ b/controller/astra_iq.go
-@@ -0,0 +1,499 @@
+@@ -0,0 +1,546 @@
 +package controller
 +
 +import (
@@ -34,6 +34,7 @@ index 00000000..69656f39
 +	"fmt"
 +	"net/http"
 +	"regexp"
++	"slices"
 +	"strconv"
 +	"strings"
 +	"sync"
@@ -245,9 +246,10 @@ index 00000000..69656f39
 +			result.Status, result.Detail = "pending", "settings_unavailable"
 +			return result
 +		}
-+		if !settings.Active(time.Now()) {
++		if !settings.Active(time.Now()) || !settings.Includes(ch.Id) {
 +			// A partially checked multi-key channel must not become a pass.
-+			// Finish in-flight requests, but do not start another after the window.
++			// Finish in-flight requests, but do not start another after the
++			// window closes or the channel is deselected.
 +			result.Status, result.Detail = "pending", "outside_window"
 +			return result
 +		}
@@ -347,7 +349,7 @@ index 00000000..69656f39
 +	}
 +	jobs := make(chan *model.Channel, len(channels))
 +	for _, ch := range channels {
-+		if model.ChannelEligibleForAstraIQ(ch) {
++		if model.ChannelEligibleForAstraIQ(ch) && settings.Includes(ch.Id) {
 +			jobs <- ch
 +		}
 +	}
@@ -465,11 +467,13 @@ index 00000000..69656f39
 +		common.ApiError(c, err)
 +		return
 +	}
++	// Unselected channels are left out so their cards show no timeline.
++	channels = slices.DeleteFunc(channels, func(ch *model.Channel) bool {
++		return !model.ChannelSupportsAstraIQ(ch) || !settings.Includes(ch.Id)
++	})
 +	ids := make([]int, 0, len(channels))
 +	for _, ch := range channels {
-+		if model.ChannelSupportsAstraIQ(ch) {
-+			ids = append(ids, ch.Id)
-+		}
++		ids = append(ids, ch.Id)
 +	}
 +	results, err := model.GetAstraIQResults(ids)
 +	if err != nil {
@@ -477,9 +481,7 @@ index 00000000..69656f39
 +		return
 +	}
 +	for _, ch := range channels {
-+		if model.ChannelSupportsAstraIQ(ch) {
-+			views[ch.Id] = model.AstraIQResultView(ch, results[ch.Id], settings)
-+		}
++		views[ch.Id] = model.AstraIQResultView(ch, results[ch.Id], settings)
 +	}
 +	runs, err := model.GetAstraIQRuns()
 +	if err != nil {
@@ -489,13 +491,43 @@ index 00000000..69656f39
 +	common.ApiSuccess(c, gin.H{"enabled": true, "interval_minutes": settings.IntervalMinutes, "server_time": common.GetTimestamp(), "runs": runs, "results": views})
 +}
 +
++type astraIQChannelOption struct {
++	ID     int    `json:"id"`
++	Name   string `json:"name"`
++	Status int    `json:"status"`
++}
++
++// Disabled channels stay selectable; checks skip them until re-enabled.
++func astraIQChannelOptions() ([]astraIQChannelOption, error) {
++	var channels []*model.Channel
++	if err := model.DB.Select("id", "name", "status", "models").Order("id").Find(&channels).Error; err != nil {
++		return nil, err
++	}
++	options := make([]astraIQChannelOption, 0, len(channels))
++	for _, ch := range channels {
++		if model.ChannelSupportsAstraIQ(ch) {
++			options = append(options, astraIQChannelOption{ID: ch.Id, Name: ch.Name, Status: ch.Status})
++		}
++	}
++	return options, nil
++}
++
 +func GetAstraIQSettings(c *gin.Context) {
 +	settings, err := model.GetAstraIQSettings()
 +	if err != nil {
 +		common.ApiError(c, err)
 +		return
 +	}
-+	common.ApiSuccess(c, settings)
++	options, err := astraIQChannelOptions()
++	if err != nil {
++		common.ApiError(c, err)
++		return
++	}
++	// The selectable channels are read-only; PUT ignores them.
++	common.ApiSuccess(c, struct {
++		model.AstraIQSettings
++		Channels []astraIQChannelOption `json:"channels"`
++	}{settings, options})
 +}
 +
 +func UpdateAstraIQSettings(c *gin.Context) {
@@ -505,19 +537,34 @@ index 00000000..69656f39
 +		EndTime         string `json:"end_time" binding:"required"`
 +		IntervalMinutes int    `json:"interval_minutes" binding:"required"`
 +		StopOnFailure   *bool  `json:"stop_on_failure" binding:"required"`
++		ChannelIDs      []int  `json:"channel_ids" binding:"required"`
 +	}
 +	if err := c.ShouldBindJSON(&request); err != nil {
 +		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Invalid check settings"})
 +		return
 +	}
++	slices.Sort(request.ChannelIDs)
 +	settings := model.AstraIQSettings{
 +		Enabled:   *request.Enabled,
 +		StartTime: request.StartTime, EndTime: request.EndTime,
 +		IntervalMinutes: request.IntervalMinutes, StopOnFailure: *request.StopOnFailure,
++		ChannelIDs: slices.Compact(request.ChannelIDs),
 +	}
 +	if err := settings.Validate(); err != nil {
 +		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
 +		return
++	}
++	options, err := astraIQChannelOptions()
++	if err != nil {
++		common.ApiError(c, err)
++		return
++	}
++	// A selection that matches no Astra channel would silently stop all checks.
++	for _, id := range settings.ChannelIDs {
++		if !slices.ContainsFunc(options, func(option astraIQChannelOption) bool { return option.ID == id }) {
++			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": model.AstraIQChannelSelectionError})
++			return
++		}
 +	}
 +	if err := model.SaveAstraIQSettings(settings); err != nil {
 +		common.ApiError(c, err)
@@ -740,10 +787,10 @@ index 00000000..be606c0a
 +}
 diff --git a/controller/astra_iq_test.go b/controller/astra_iq_test.go
 new file mode 100644
-index 00000000..52286775
+index 00000000..1b69ab7c
 --- /dev/null
 +++ b/controller/astra_iq_test.go
-@@ -0,0 +1,530 @@
+@@ -0,0 +1,613 @@
 +package controller
 +
 +import (
@@ -849,10 +896,11 @@ index 00000000..52286775
 +				require.NoError(t, err)
 +				assert.True(t, settings.Enabled, "existing saved schedules remain enabled")
 +				assert.Equal(t, 1, settings.IntervalMinutes)
++				assert.Empty(t, settings.ChannelIDs, "existing saved schedules check every channel")
 +				engine := gin.New()
 +				engine.GET("/settings", GetAstraIQSettings)
 +				engine.PUT("/settings", UpdateAstraIQSettings)
-+				valid := `{"enabled":true,"start_time":"22:00","end_time":"06:30","interval_minutes":17,"stop_on_failure":false}`
++				valid := `{"enabled":true,"start_time":"22:00","end_time":"06:30","interval_minutes":17,"stop_on_failure":false,"channel_ids":[]}`
 +				w := httptest.NewRecorder()
 +				engine.ServeHTTP(w, httptest.NewRequest(http.MethodPut, "/settings", strings.NewReader(valid)))
 +				require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -863,6 +911,10 @@ index 00000000..52286775
 +					strings.Replace(valid, ":17,", ":1441,", 1),
 +					strings.Replace(valid, ":17,", ":1.5,", 1),
 +					strings.Replace(valid, `,"stop_on_failure":false`, "", 1),
++					strings.Replace(valid, `,"channel_ids":[]`, "", 1),
++					strings.Replace(valid, "[]", "null", 1),
++					strings.Replace(valid, "[]", "[0]", 1),
++					strings.Replace(valid, "[]", "[999]", 1),
 +					`{}`, `null`,
 +				} {
 +					w = httptest.NewRecorder()
@@ -876,7 +928,7 @@ index 00000000..52286775
 +				w = httptest.NewRecorder()
 +				engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/settings", nil))
 +				require.Equal(t, http.StatusOK, w.Code, w.Body.String())
-+				assert.JSONEq(t, valid, gjson.GetBytes(w.Body.Bytes(), "data").Raw)
++				assert.JSONEq(t, strings.Replace(valid, "}", `,"channels":[]}`, 1), gjson.GetBytes(w.Body.Bytes(), "data").Raw)
 +				require.NoError(t, model.SaveAstraIQSettings(model.DefaultAstraIQSettings()))
 +			})
 +			t.Run("status exposes recent check rounds without internal task data", func(t *testing.T) {
@@ -1005,6 +1057,52 @@ index 00000000..52286775
 +					assert.NotContains(t, string(encoded), "test-a")
 +				})
 +			}
++			t.Run("selected channels limit checks and gating", func(t *testing.T) {
++				require.NoError(t, db.Create(&model.Channel{Id: 203, Name: "other model", Type: 1, Key: "test-c", Status: common.ChannelStatusEnabled, Models: "unrelated-model", Group: "default"}).Error)
++				engine := gin.New()
++				engine.GET("/settings", GetAstraIQSettings)
++				engine.PUT("/settings", UpdateAstraIQSettings)
++				save := func(ids string) *httptest.ResponseRecorder {
++					w := httptest.NewRecorder()
++					body := `{"enabled":true,"start_time":"00:00","end_time":"00:00","interval_minutes":5,"stop_on_failure":true,"channel_ids":` + ids + `}`
++					engine.ServeHTTP(w, httptest.NewRequest(http.MethodPut, "/settings", strings.NewReader(body)))
++					return w
++				}
++				assert.Equal(t, http.StatusBadRequest, save("[203]").Code, "channels without the Astra model cannot be selected")
++				w := save("[202,202]")
++				require.Equal(t, http.StatusOK, w.Code, w.Body.String())
++				assert.JSONEq(t, "[202]", gjson.GetBytes(w.Body.Bytes(), "data.channel_ids").Raw)
++				w = httptest.NewRecorder()
++				engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/settings", nil))
++				require.Equal(t, http.StatusOK, w.Code, w.Body.String())
++				assert.JSONEq(t, `[{"id":201,"name":"high priority","status":1},{"id":202,"name":"fallback","status":1}]`, gjson.GetBytes(w.Body.Bytes(), "data.channels").Raw)
++				assert.NotContains(t, w.Body.String(), "test-a")
++
++				// An unselected channel's earlier failure neither blocks nor shows.
++				require.NoError(t, model.SaveAstraIQResult(&channels[0], model.AstraIQResult{Status: "fail", CheckedAt: common.GetTimestamp(), Answer: "22"}))
++				assert.True(t, model.AstraIQAllowsChannel(&channels[0], model.AstraIQModel))
++				selected, err := model.GetRandomSatisfiedChannel("default", model.AstraIQModel, 0, nil)
++				require.NoError(t, err)
++				require.NotNil(t, selected)
++				assert.Equal(t, 201, selected.Id)
++				w = httptest.NewRecorder()
++				c, _ := gin.CreateTestContext(w)
++				GetAstraIQStatus(c)
++				require.Equal(t, http.StatusOK, w.Code)
++				assert.False(t, gjson.GetBytes(w.Body.Bytes(), "data.results.201").Exists())
++				assert.True(t, gjson.GetBytes(w.Body.Bytes(), "data.results.202").Exists())
++
++				// Selecting it again applies that failure immediately.
++				require.Equal(t, http.StatusOK, save("[201]").Code)
++				assert.False(t, model.AstraIQAllowsChannel(&channels[0], model.AstraIQModel))
++				selected, err = model.GetRandomSatisfiedChannel("default", model.AstraIQModel, 0, nil)
++				require.NoError(t, err)
++				require.NotNil(t, selected)
++				assert.Equal(t, 202, selected.Id)
++				require.Equal(t, http.StatusOK, save("[]").Code)
++				assert.False(t, model.AstraIQAllowsChannel(&channels[0], model.AstraIQModel), "an empty selection checks every channel")
++				require.NoError(t, model.SaveAstraIQSettings(model.DefaultAstraIQSettings()))
++			})
 +			t.Run("delete history without restoring stale approval", func(t *testing.T) {
 +				require.NoError(t, db.Where("channel_id = ?", 201).Delete(&model.AstraIQResult{}).Error)
 +				now := common.GetTimestamp()
@@ -1178,6 +1276,10 @@ index 00000000..52286775
 +	before := len(seen)
 +	assert.Equal(t, "pending", probeAstraIQChannel(context.Background(), ch, user.Id).Status)
 +	assert.Len(t, seen, before, "the total switch must prevent upstream calls")
++	settings.Enabled, settings.ChannelIDs = true, []int{ch.Id + 1}
++	require.NoError(t, model.SaveAstraIQSettings(settings))
++	assert.Equal(t, "pending", probeAstraIQChannel(context.Background(), ch, user.Id).Status)
++	assert.Len(t, seen, before, "a deselected channel must not start another check")
 +	require.NoError(t, model.SaveAstraIQSettings(model.DefaultAstraIQSettings()))
 +	ch.Key = "blocked"
 +
@@ -1208,6 +1310,34 @@ index 00000000..52286775
 +		assert.Equal(t, expectedStatus, w.Code)
 +	}
 +	assert.Len(t, proxyResults, 1)
++
++	// A scheduled round checks only the selected channels.
++	t.Setenv("ASTRA_IQ_ENABLED", "true")
++	require.NoError(t, db.AutoMigrate(&model.AstraIQResult{}, &model.SystemTask{}, &model.SystemTaskLock{}))
++	for _, scoped := range []model.Channel{
++		{Id: 911, Name: "unselected", Type: constant.ChannelTypeOpenAI, Key: "scope-unselected", BaseURL: &upstream.URL, Models: model.AstraIQModel, Group: "default", Status: common.ChannelStatusEnabled},
++		{Id: 912, Name: "selected", Type: constant.ChannelTypeOpenAI, Key: "scope-selected", BaseURL: &upstream.URL, Models: model.AstraIQModel, Group: "default", Status: common.ChannelStatusEnabled},
++	} {
++		require.NoError(t, db.Create(&scoped).Error)
++	}
++	settings.ChannelIDs = []int{912}
++	require.NoError(t, model.SaveAstraIQSettings(settings))
++	task, err := model.CreateSystemTask(model.AstraIQTaskType, nil, nil)
++	require.NoError(t, err)
++	_, claimed, err := model.ClaimSystemTask(task.ID, task.Type, "scope-runner", common.GetTimestamp()+60)
++	require.NoError(t, err)
++	require.True(t, claimed)
++	before = len(seen)
++	astraIQTestHandler{}.Run(context.Background(), task, "scope-runner")
++	assert.Equal(t, []string{"Bearer scope-selected"}, seen[before:])
++	rows, err := model.GetAstraIQResults([]int{911, 912})
++	require.NoError(t, err)
++	assert.NotContains(t, rows, 911)
++	assert.Equal(t, "pass", rows[912].Status)
++	finished, err := model.GetLatestSystemTask(model.AstraIQTaskType)
++	require.NoError(t, err)
++	assert.Equal(t, model.SystemTaskStatusSucceeded, finished.Status)
++	require.NoError(t, model.SaveAstraIQSettings(model.DefaultAstraIQSettings()))
 +}
 +
 +func TestCustomAstraIQHistoryDetails(t *testing.T) {
@@ -1275,7 +1405,7 @@ index 00000000..52286775
 +	}
 +}
 diff --git a/controller/channel-test.go b/controller/channel-test.go
-index 1248853a..33a077dd 100644
+index 1248853a..7b34a477 100644
 --- a/controller/channel-test.go
 +++ b/controller/channel-test.go
 @@ -20,6 +20,7 @@ import (
@@ -1443,10 +1573,18 @@ index 1248853a..33a077dd 100644
  		}
  	}
  	info.SetEstimatePromptTokens(usage.PromptTokens)
-@@ -516,10 +577,13 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+@@ -515,11 +576,20 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+ 		Group:            info.UsingGroup,
  		Other:            other,
  	})
- 	common.SysLog(fmt.Sprintf("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
+-	common.SysLog(fmt.Sprintf("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
++	logBody := respBody
++	if prompt != "" && len(logBody) > 8<<10 {
++		// IQ grading reads the whole stream. Log only its tail, which holds the
++		// answer and terminal events; the head mostly echoes instructions.
++		logBody = logBody[len(logBody)-(8<<10):]
++	}
++	common.SysLog(fmt.Sprintf("testing channel #%d, response: \n%s", channel.Id, string(logBody)))
 +	attempt.PromptTokens, attempt.CompletionTokens = &usage.PromptTokens, &usage.CompletionTokens
  	return testResult{
 -		context:     c,
@@ -1488,7 +1626,7 @@ index b86c442d..abf4fd1b 100644
  				return nil
 diff --git a/model/astra_iq.go b/model/astra_iq.go
 new file mode 100644
-index 00000000..0629e685
+index 00000000..c30e317d
 --- /dev/null
 +++ b/model/astra_iq.go
 @@ -0,0 +1,303 @@
@@ -1640,7 +1778,7 @@ index 00000000..0629e685
 +	// No result (including cleared history or changed credentials) is allowed.
 +	// Only an actual failure blocks calls, and it remains in force outside the
 +	// check window until a new pass, deletion, or disabling this setting.
-+	return !settings.Enabled || !settings.StopOnFailure || !r.applicable(ch) || (r.Status != "fail" && r.Status != "error")
++	return !settings.Enabled || !settings.StopOnFailure || !settings.Includes(ch.Id) || !r.applicable(ch) || (r.Status != "fail" && r.Status != "error")
 +}
 +
 +// Read shared storage at selection time so a failed probe takes effect on every
@@ -1671,7 +1809,7 @@ index 00000000..0629e685
 +	if err != nil {
 +		return false
 +	}
-+	if !settings.Enabled || !settings.StopOnFailure {
++	if !settings.Enabled || !settings.StopOnFailure || !settings.Includes(ch.Id) {
 +		return true
 +	}
 +	results, err := GetAstraIQResults([]int{ch.Id})
@@ -1797,15 +1935,16 @@ index 00000000..0629e685
 +}
 diff --git a/model/astra_iq_settings.go b/model/astra_iq_settings.go
 new file mode 100644
-index 00000000..d9aafe51
+index 00000000..a3a16a31
 --- /dev/null
 +++ b/model/astra_iq_settings.go
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,115 @@
 +package model
 +
 +import (
 +	"context"
 +	"errors"
++	"slices"
 +	"time"
 +
 +	"github.com/QuantumNous/new-api/common"
@@ -1822,10 +1961,13 @@ index 00000000..d9aafe51
 +	EndTime         string `json:"end_time"`
 +	IntervalMinutes int    `json:"interval_minutes"`
 +	StopOnFailure   bool   `json:"stop_on_failure"`
++	// Empty, including settings saved before this field existed, checks every
++	// Astra channel.
++	ChannelIDs []int `json:"channel_ids"`
 +}
 +
 +func DefaultAstraIQSettings() AstraIQSettings {
-+	return AstraIQSettings{Enabled: true, StartTime: "00:00", EndTime: "00:00", IntervalMinutes: 5, StopOnFailure: true}
++	return AstraIQSettings{Enabled: true, StartTime: "00:00", EndTime: "00:00", IntervalMinutes: 5, StopOnFailure: true, ChannelIDs: []int{}}
 +}
 +
 +func (s AstraIQSettings) Validate() error {
@@ -1838,7 +1980,19 @@ index 00000000..d9aafe51
 +	if s.IntervalMinutes < 1 || s.IntervalMinutes > 1440 {
 +		return errors.New("Check interval must be an integer from 1 to 1440")
 +	}
++	for _, id := range s.ChannelIDs {
++		if id <= 0 {
++			return errors.New(AstraIQChannelSelectionError)
++		}
++	}
 +	return nil
++}
++
++const AstraIQChannelSelectionError = "Select only channels that support gpt-6-astra"
++
++// Unselected channels are neither checked nor gated by earlier results.
++func (s AstraIQSettings) Includes(channelID int) bool {
++	return len(s.ChannelIDs) == 0 || slices.Contains(s.ChannelIDs, channelID)
 +}
 +
 +// All nodes use Beijing time. Equal endpoints mean all day; overnight windows
@@ -2171,10 +2325,10 @@ index baaf9142..44adcc05 100644
  	t.Helper()
 diff --git a/web/src/features/channels/components/__tests__/astra-iq-status.test.tsx b/web/src/features/channels/components/__tests__/astra-iq-status.test.tsx
 new file mode 100644
-index 00000000..b3ebc5fc
+index 00000000..feb50ed5
 --- /dev/null
 +++ b/web/src/features/channels/components/__tests__/astra-iq-status.test.tsx
-@@ -0,0 +1,577 @@
+@@ -0,0 +1,605 @@
 +/*
 +Copyright (C) 2023-2026 QuantumNous
 +
@@ -2493,7 +2647,13 @@ index 00000000..b3ebc5fc
 +  end_time: '00:00',
 +  interval_minutes: 5,
 +  stop_on_failure: true,
++  channel_ids: [] as number[],
 +}
++const astraChannels = [
++  { id: 1, name: 'openai-jiji', status: 1 },
++  { id: 3, name: 'openai-krill', status: 2 },
++]
++const settingsData = { ...defaultSettings, channels: astraChannels }
 +
 +async function openSettings() {
 +  const client = new QueryClient({
@@ -2510,9 +2670,9 @@ index 00000000..b3ebc5fc
 +
 +it('saves the total switch and schedule and reloads their values on reopen', async () => {
 +  let saved = { ...defaultSettings }
-+  const get = vi
-+    .spyOn(api, 'get')
-+    .mockImplementation(async () => ({ data: { success: true, data: saved } }))
++  const get = vi.spyOn(api, 'get').mockImplementation(async () => ({
++    data: { success: true, data: { ...saved, channels: astraChannels } },
++  }))
 +  const put = vi.spyOn(api, 'put').mockImplementation(async (_url, body) => {
 +    saved = body as typeof defaultSettings
 +    return { data: { success: true, data: saved } }
@@ -2530,6 +2690,14 @@ index 00000000..b3ebc5fc
 +  })
 +  await userEvent.click(screen.getByRole('switch', { name: 'Stop on failure' }))
 +  await userEvent.click(screen.getByRole('switch', { name: 'Enable checks' }))
++  await userEvent.click(
++    screen.getByRole('combobox', { name: 'All Astra channels' })
++  )
++  await userEvent.click(
++    screen.getByRole('option', { name: '#3 openai-krill · Disabled' })
++  )
++  await userEvent.keyboard('{Escape}')
++  expect(screen.getByRole('dialog')).toBeInTheDocument()
 +  await userEvent.click(screen.getByRole('button', { name: 'Save' }))
 +  await waitFor(() =>
 +    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
@@ -2540,6 +2708,7 @@ index 00000000..b3ebc5fc
 +    end_time: '06:30',
 +    interval_minutes: 17,
 +    stop_on_failure: false,
++    channel_ids: [3],
 +  })
 +  expect(invalidate).toHaveBeenCalledWith({
 +    queryKey: ['channels', 'astra-iq'],
@@ -2554,12 +2723,13 @@ index 00000000..b3ebc5fc
 +  expect(
 +    screen.getByRole('switch', { name: 'Enable checks' })
 +  ).not.toBeChecked()
++  expect(screen.getByText('#3 openai-krill · Disabled')).toBeVisible()
 +  expect(get).toHaveBeenCalledTimes(2)
 +})
 +
 +it('rejects a fractional interval before sending a request', async () => {
 +  vi.spyOn(api, 'get').mockResolvedValue({
-+    data: { success: true, data: defaultSettings },
++    data: { success: true, data: settingsData },
 +  })
 +  const put = vi.spyOn(api, 'put')
 +  await openSettings()
@@ -2576,7 +2746,7 @@ index 00000000..b3ebc5fc
 +it('disables saving after a load failure and allows retry', async () => {
 +  vi.spyOn(api, 'get')
 +    .mockRejectedValueOnce(new Error('offline'))
-+    .mockResolvedValue({ data: { success: true, data: defaultSettings } })
++    .mockResolvedValue({ data: { success: true, data: settingsData } })
 +  await openSettings()
 +  expect(await screen.findByText('Check settings unavailable')).toBeVisible()
 +  expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
@@ -2587,14 +2757,14 @@ index 00000000..b3ebc5fc
 +
 +it('preserves edits after a save failure and permits retry', async () => {
 +  vi.spyOn(api, 'get').mockResolvedValue({
-+    data: { success: true, data: defaultSettings },
++    data: { success: true, data: settingsData },
 +  })
 +  const put = vi
 +    .spyOn(api, 'put')
 +    .mockResolvedValueOnce({
 +      data: { success: false, message: 'Cannot save check settings' },
 +    })
-+    .mockResolvedValue({ data: { success: true, data: defaultSettings } })
++    .mockResolvedValue({ data: { success: true, data: settingsData } })
 +  await openSettings()
 +  fireEvent.change(await screen.findByLabelText('Interval (minutes)'), {
 +    target: { value: '20' },
@@ -2624,10 +2794,12 @@ index 00000000..b3ebc5fc
 +    },
 +  })
 +  vi.spyOn(api, 'get').mockResolvedValue({
-+    data: { success: true, data: defaultSettings },
++    data: { success: true, data: { ...settingsData, channel_ids: [1, 9] } },
 +  })
 +  await openSettings()
 +  expect(await screen.findByLabelText('Interval (minutes)')).toBeDisabled()
++  expect(screen.getByText('#1 openai-jiji')).toBeVisible()
++  expect(screen.getByText('#9')).toBeVisible()
 +  expect(screen.getByLabelText('Check start time')).toBeDisabled()
 +  expect(
 +    screen.getByRole('switch', { name: 'Stop on failure' })
@@ -2687,7 +2859,7 @@ index 00000000..b3ebc5fc
 +  }
 +)
 +
-+it('leaves skipped intervals blank and hides the timeline when checks are off', async () => {
++it('leaves skipped intervals blank and hides the timeline for unchecked channels', async () => {
 +  const client = renderStatus()
 +  const timeline = screen.getByRole('group')
 +  const buttons = within(timeline).getAllByRole('button')
@@ -2709,6 +2881,16 @@ index 00000000..b3ebc5fc
 +  expect(
 +    within(await screen.findByRole('group')).getAllByRole('button')
 +  ).toHaveLength(2)
++  // Channels outside the selected check scope have no result entry.
++  await act(async () =>
++    client.setQueryData(['channels', 'astra-iq'], {
++      ...statusData,
++      results: {},
++    })
++  )
++  await waitFor(() =>
++    expect(screen.queryByRole('group')).not.toBeInTheDocument()
++  )
 +})
 +
 +it.each([
@@ -2754,10 +2936,10 @@ index 00000000..b3ebc5fc
 +)
 diff --git a/web/src/features/channels/components/astra-iq-settings.tsx b/web/src/features/channels/components/astra-iq-settings.tsx
 new file mode 100644
-index 00000000..cd540101
+index 00000000..9ea7558a
 --- /dev/null
 +++ b/web/src/features/channels/components/astra-iq-settings.tsx
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,372 @@
 +/*
 +Copyright (C) 2023-2026 QuantumNous
 +
@@ -2787,6 +2969,7 @@ index 00000000..cd540101
 +import { Dialog } from '@/components/dialog'
 +import { ErrorState } from '@/components/error-state'
 +import { LoadingState } from '@/components/loading-state'
++import { MultiSelect } from '@/components/multi-select'
 +import { Button } from '@/components/ui/button'
 +import {
 +  Form,
@@ -2813,6 +2996,8 @@ index 00000000..cd540101
 +} from '@/lib/server-error-message'
 +import { useAuthStore } from '@/stores/auth-store'
 +
++import { CHANNEL_STATUS, CHANNEL_STATUS_LABELS } from '../constants'
++
 +const timeSchema = z
 +  .string()
 +  .regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Use HH:mm for check times')
@@ -2826,12 +3011,18 @@ index 00000000..cd540101
 +    .min(1, 'Check interval must be an integer from 1 to 1440')
 +    .max(1440, 'Check interval must be an integer from 1 to 1440'),
 +  stop_on_failure: z.boolean(),
++  channel_ids: z.array(z.number().int().positive()),
 +})
++// Channels configured with gpt-6-astra, returned alongside the settings.
++const channelsSchema = z.array(
++  z.object({ id: z.number(), name: z.string(), status: z.number() })
++)
 +type CheckSettings = z.infer<typeof settingsSchema>
++type CheckChannel = z.infer<typeof channelsSchema>[number]
 +type SettingsResponse = {
 +  success: boolean
 +  message?: string
-+  data: CheckSettings
++  data: CheckSettings & { channels: CheckChannel[] }
 +}
 +const endpoint = '/api/channel/astra_iq/settings'
 +const queryKey = ['channels', 'astra-iq-settings']
@@ -2869,7 +3060,11 @@ index 00000000..cd540101
 +    queryKey,
 +    queryFn: async ({ signal }) => {
 +      const response = await api.get<SettingsResponse>(endpoint, { signal })
-+      return settingsSchema.parse(requireServerSuccess(response.data).data)
++      const { channels, ...settings } = requireServerSuccess(response.data).data
++      return {
++        settings: settingsSchema.parse(settings),
++        channels: channelsSchema.parse(channels),
++      }
 +    },
 +    gcTime: 0,
 +    refetchOnWindowFocus: false,
@@ -2896,7 +3091,7 @@ index 00000000..cd540101
 +      }}
 +      title={t('Check settings')}
 +      description={t(
-+        'Applies to all Astra channels. Daily schedule in Beijing time (UTC+8).'
++        'Settings apply to every checked channel. Daily schedule in Beijing time (UTC+8).'
 +      )}
 +      contentClassName='sm:max-w-md'
 +      contentHeight='auto'
@@ -2935,7 +3130,8 @@ index 00000000..cd540101
 +      {query.isSuccess && (
 +        <SettingsForm
 +          key={query.dataUpdatedAt}
-+          settings={query.data}
++          settings={query.data.settings}
++          channels={query.data.channels}
 +          disabled={!canWrite || query.isFetching || mutation.isPending}
 +          onSave={(values) => mutation.mutate(values)}
 +        />
@@ -2951,6 +3147,7 @@ index 00000000..cd540101
 +
 +function SettingsForm(props: {
 +  settings: CheckSettings
++  channels: CheckChannel[]
 +  disabled: boolean
 +  onSave: (settings: CheckSettings) => void
 +}) {
@@ -2959,6 +3156,23 @@ index 00000000..cd540101
 +    resolver: zodResolver(settingsSchema),
 +    defaultValues: props.settings,
 +  })
++  const options = props.channels.map((channel) => {
++    let label = `#${channel.id} ${channel.name}`
++    if (channel.status !== CHANNEL_STATUS.ENABLED) {
++      const status =
++        CHANNEL_STATUS_LABELS[
++          channel.status as keyof typeof CHANNEL_STATUS_LABELS
++        ] ?? 'Unknown'
++      label += ` · ${t(status)}`
++    }
++    return { value: String(channel.id), label }
++  })
++  // Keep saved channels that lost gpt-6-astra visible so they can be removed.
++  for (const id of props.settings.channel_ids) {
++    if (!props.channels.some((channel) => channel.id === id)) {
++      options.push({ value: String(id), label: `#${id}` })
++    }
++  }
 +  return (
 +    <Form {...form}>
 +      <form
@@ -2990,6 +3204,30 @@ index 00000000..cd540101
 +                  disabled={props.disabled}
 +                />
 +              </FormControl>
++            </FormItem>
++          )}
++        />
++        <FormField
++          control={form.control}
++          name='channel_ids'
++          render={({ field }) => (
++            <FormItem>
++              <FormLabel>{t('Check channels')}</FormLabel>
++              <FormControl>
++                <MultiSelect
++                  options={options}
++                  selected={field.value.map(String)}
++                  onChange={(values) => field.onChange(values.map(Number))}
++                  placeholder={t('All Astra channels')}
++                  disabled={props.disabled}
++                />
++              </FormControl>
++              <FormDescription>
++                {t(
++                  'Leave empty to check all Astra channels. Unselected channels are not checked and their results do not block calls.'
++                )}
++              </FormDescription>
++              <FormMessage />
 +            </FormItem>
 +          )}
 +        />
@@ -3076,10 +3314,10 @@ index 00000000..cd540101
 +}
 diff --git a/web/src/features/channels/components/astra-iq-status.tsx b/web/src/features/channels/components/astra-iq-status.tsx
 new file mode 100644
-index 00000000..138fbc9d
+index 00000000..1e982614
 --- /dev/null
 +++ b/web/src/features/channels/components/astra-iq-status.tsx
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,147 @@
 +/*
 +Copyright (C) 2023-2026 QuantumNous
 +
@@ -3151,6 +3389,9 @@ index 00000000..138fbc9d
 +  })
 +  if (query.data?.enabled === false) return null
 +  const result = query.data?.results[String(props.channelId)]
++  // Channels outside the selected check scope have no result entry. An open
++  // detail dialog stays until it is closed.
++  if (query.isSuccess && !result && !selected) return null
 +  const history = query.isError ? [] : (result?.history?.slice(-24) ?? [])
 +  const samples = astraIQTimeline(
 +    history,
@@ -3790,10 +4031,10 @@ index a34d037f..25df9888 100644
          <SectionPageLayout.Actions>
 diff --git a/web/src/features/channels/lib/astra-iq.ts b/web/src/features/channels/lib/astra-iq.ts
 new file mode 100644
-index 00000000..5ba6107e
+index 00000000..be183259
 --- /dev/null
 +++ b/web/src/features/channels/lib/astra-iq.ts
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,131 @@
 +/*
 +Copyright (C) 2023-2026 QuantumNous
 +
@@ -3923,23 +4164,13 @@ index 00000000..5ba6107e
 +  if (status === 'pass') return 'Astra IQ passed'
 +  if (status === 'fail') return 'Astra IQ wrong answer'
 +  if (status === 'error') return 'Astra IQ request failed'
-+  if (status === 'expired') return 'Astra IQ expired'
 +  return 'Astra IQ pending'
 +}
 diff --git a/web/src/i18n/locales/en.json b/web/src/i18n/locales/en.json
-index 8ce9da22..52c81bc1 100644
+index 8ce9da22..918c7203 100644
 --- a/web/src/i18n/locales/en.json
 +++ b/web/src/i18n/locales/en.json
-@@ -2618,7 +2618,7 @@
-     "footer.columns.related.links.oneApi": "One API",
-     "footer.columns.related.title": "Related Projects",
-     "footer.defaultCopyright": "All rights reserved.",
--    "footer.new\u0061pi.projectAttributionSuffix": "All rights reserved. Designed and developed by the project contributors.",
-+    "footer.newapi.projectAttributionSuffix": "All rights reserved. Designed and developed by the project contributors.",
-     "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.",
-     "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment",
-     "For private deployments, format: https://fastgpt.run/api/openapi": "For private deployments, format: https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,64 @@
+@@ -6777,6 +6777,61 @@
      "Zhipu": "Zhipu",
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V4",
@@ -3947,10 +4178,8 @@ index 8ce9da22..52c81bc1 100644
 +    "Zoom": "Zoom",
 +    "Astra IQ": "Astra IQ",
 +    "Astra IQ check details": "Astra IQ check details",
-+    "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.": "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.",
 +    "Astra IQ details unavailable": "Astra IQ details unavailable",
 +    "Astra IQ disabled channel": "Astra IQ disabled channel",
-+    "Astra IQ expired": "Astra IQ expired",
 +    "Astra IQ passed": "Astra IQ passed",
 +    "Astra IQ pending": "Astra IQ pending",
 +    "Astra IQ request failed": "Astra IQ request failed",
@@ -3961,17 +4190,12 @@ index 8ce9da22..52c81bc1 100644
 +    "Detailed metrics were not saved for this older check.": "Detailed metrics were not saved for this older check.",
 +    "Expected answer": "Expected answer",
 +    "Input / Output tokens": "Input / Output tokens",
-+    "Last 24 checks: green passed, red wrong answer, amber error, gray untested.": "Last 24 checks: green passed, red wrong answer, amber error, gray untested.",
-+    "Latest answer": "Latest answer",
 +    "Model response": "Model response",
 +    "No completed model response": "No completed model response",
 +    "Question sent to model": "Question sent to model",
-+    "Recent pass rate": "Recent pass rate",
-+    "Request timeout": "Request timeout",
 +    "Time to first token": "Time to first token",
 +    "View check details": "View check details",
 +    "Upstream rejected the official Codex client.": "Upstream rejected the official Codex client.",
-+    "Official Codex client did not complete this check.": "Official Codex client did not complete this check.",
 +    "Delete this check": "Delete this check",
 +    "Delete all checks": "Delete all checks",
 +    "Delete this check?": "Delete this check?",
@@ -3981,7 +4205,7 @@ index 8ce9da22..52c81bc1 100644
 +    "Check start time": "Start time",
 +    "Interval (minutes)": "Interval (minutes)",
 +    "Stop on failure": "Stop on failure",
-+    "Applies to all Astra channels. Daily schedule in Beijing time (UTC+8).": "Applies to all Astra channels. Daily schedule in Beijing time (UTC+8).",
++    "Settings apply to every checked channel. Daily schedule in Beijing time (UTC+8).": "Settings apply to every checked channel. Daily schedule in Beijing time (UTC+8).",
 +    "Equal times mean all day. Overnight schedules are supported.": "Equal times mean all day. Overnight schedules are supported.",
 +    "Pause Astra calls after a failed check. Calls without a result are allowed.": "Pause Astra calls after a failed check. Calls without a result are allowed.",
 +    "Check settings unavailable": "Check settings unavailable",
@@ -4002,23 +4226,18 @@ index 8ce9da22..52c81bc1 100644
 +    "The upstream response contained no final answer.": "The upstream response contained no final answer.",
 +    "The upstream response ended before completion.": "The upstream response ended before completion.",
 +    "This channel has no enabled keys.": "This channel has no enabled keys.",
-+    "The request failed. This older check has no saved error details.": "The request failed. This older check has no saved error details."
++    "The request failed. This older check has no saved error details.": "The request failed. This older check has no saved error details.",
++    "Check channels": "Check channels",
++    "All Astra channels": "All Astra channels",
++    "Leave empty to check all Astra channels. Unselected channels are not checked and their results do not block calls.": "Leave empty to check all Astra channels. Unselected channels are not checked and their results do not block calls.",
++    "Select only channels that support gpt-6-astra": "Select only channels that support gpt-6-astra"
    }
  }
 diff --git a/web/src/i18n/locales/fr.json b/web/src/i18n/locales/fr.json
-index a239f206..bbbaaa21 100644
+index a239f206..6771097a 100644
 --- a/web/src/i18n/locales/fr.json
 +++ b/web/src/i18n/locales/fr.json
-@@ -2618,7 +2618,7 @@
-     "footer.columns.related.links.oneApi": "One API",
-     "footer.columns.related.title": "Projets liés",
-     "footer.defaultCopyright": "Tous droits réservés.",
--    "footer.new\u0061pi.projectAttributionSuffix": "Tous droits réservés. Conçu et développé par les contributeurs du projet.",
-+    "footer.newapi.projectAttributionSuffix": "Tous droits réservés. Conçu et développé par les contributeurs du projet.",
-     "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "Pour les canaux personnalisés avancés, ceci ne s’applique qu’aux routes /v1/responses sans conversion de protocole.",
-     "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "Pour les canaux ajoutés après le 10 mai 2025, pas besoin de supprimer \".\" des noms de modèles lors du déploiement",
-     "For private deployments, format: https://fastgpt.run/api/openapi": "Pour les déploiements privés, format : https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,64 @@
+@@ -6777,6 +6777,61 @@
      "Zhipu": "Zhipu",
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V4",
@@ -4026,10 +4245,8 @@ index a239f206..bbbaaa21 100644
 +    "Zoom": "Zoom",
 +    "Astra IQ": "Astra IQ",
 +    "Astra IQ check details": "Astra IQ check details",
-+    "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.": "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.",
 +    "Astra IQ details unavailable": "Astra IQ details unavailable",
 +    "Astra IQ disabled channel": "Astra IQ disabled channel",
-+    "Astra IQ expired": "Astra IQ expired",
 +    "Astra IQ passed": "Astra IQ passed",
 +    "Astra IQ pending": "Astra IQ pending",
 +    "Astra IQ request failed": "Astra IQ request failed",
@@ -4040,17 +4257,12 @@ index a239f206..bbbaaa21 100644
 +    "Detailed metrics were not saved for this older check.": "Detailed metrics were not saved for this older check.",
 +    "Expected answer": "Expected answer",
 +    "Input / Output tokens": "Input / Output tokens",
-+    "Last 24 checks: green passed, red wrong answer, amber error, gray untested.": "Last 24 checks: green passed, red wrong answer, amber error, gray untested.",
-+    "Latest answer": "Latest answer",
 +    "Model response": "Model response",
 +    "No completed model response": "No completed model response",
 +    "Question sent to model": "Question sent to model",
-+    "Recent pass rate": "Recent pass rate",
-+    "Request timeout": "Request timeout",
 +    "Time to first token": "Time to first token",
 +    "View check details": "View check details",
 +    "Upstream rejected the official Codex client.": "Le fournisseur a refusé le client officiel Codex.",
-+    "Official Codex client did not complete this check.": "Le client officiel Codex n’a pas terminé ce contrôle.",
 +    "Delete this check": "Supprimer ce résultat",
 +    "Delete all checks": "Supprimer tous les résultats",
 +    "Delete this check?": "Supprimer ce résultat de test ?",
@@ -4060,7 +4272,7 @@ index a239f206..bbbaaa21 100644
 +    "Check start time": "Heure de début",
 +    "Interval (minutes)": "Intervalle (minutes)",
 +    "Stop on failure": "Arrêt si échec",
-+    "Applies to all Astra channels. Daily schedule in Beijing time (UTC+8).": "Pour tous les canaux Astra. Horaire quotidien de Pékin (UTC+8).",
++    "Settings apply to every checked channel. Daily schedule in Beijing time (UTC+8).": "Pour tous les canaux testés. Horaire quotidien de Pékin (UTC+8).",
 +    "Equal times mean all day. Overnight schedules are supported.": "Des heures identiques signifient toute la journée. Les plages peuvent passer minuit.",
 +    "Pause Astra calls after a failed check. Calls without a result are allowed.": "Suspendre les appels Astra après un échec. Sans résultat, les appels sont autorisés.",
 +    "Check settings unavailable": "Réglages des tests indisponibles",
@@ -4081,23 +4293,18 @@ index a239f206..bbbaaa21 100644
 +    "The upstream response contained no final answer.": "La réponse amont ne contient pas de réponse finale.",
 +    "The upstream response ended before completion.": "La réponse amont s’est interrompue avant la fin.",
 +    "This channel has no enabled keys.": "Ce canal n’a aucune clé activée.",
-+    "The request failed. This older check has no saved error details.": "La requête a échoué. Aucun détail d’erreur n’a été enregistré pour cet ancien test."
++    "The request failed. This older check has no saved error details.": "La requête a échoué. Aucun détail d’erreur n’a été enregistré pour cet ancien test.",
++    "Check channels": "Canaux testés",
++    "All Astra channels": "Tous les canaux Astra",
++    "Leave empty to check all Astra channels. Unselected channels are not checked and their results do not block calls.": "Laissez vide pour tester tous les canaux Astra. Les canaux non sélectionnés ne sont pas testés et leurs résultats ne bloquent pas les appels.",
++    "Select only channels that support gpt-6-astra": "Sélectionnez uniquement des canaux prenant en charge gpt-6-astra"
    }
  }
 diff --git a/web/src/i18n/locales/ja.json b/web/src/i18n/locales/ja.json
-index e3e09261..bdf0b470 100644
+index e3e09261..4046682e 100644
 --- a/web/src/i18n/locales/ja.json
 +++ b/web/src/i18n/locales/ja.json
-@@ -2618,7 +2618,7 @@
-     "footer.columns.related.links.oneApi": "1つのAPI",
-     "footer.columns.related.title": "関連プロジェクト",
-     "footer.defaultCopyright": "すべての権利を留保します。",
--    "footer.new\u0061pi.projectAttributionSuffix": "すべての権利を留保します。プロジェクトコントリビューターにより設計・開発されています。",
-+    "footer.newapi.projectAttributionSuffix": "すべての権利を留保します。プロジェクトコントリビューターにより設計・開発されています。",
-     "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "高度なカスタムチャネルでは、プロトコル変換を行わない /v1/responses ルートにのみ適用されます。",
-     "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "2025 年 5 月 10 日以降に追加されたチャネルの場合、デプロイ時にモデル名から「.」を削除する必要はありません",
-     "For private deployments, format: https://fastgpt.run/api/openapi": "プライベートデプロイメントの場合、形式: https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,64 @@
+@@ -6777,6 +6777,61 @@
      "Zhipu": "Zhipu",
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V 4",
@@ -4105,10 +4312,8 @@ index e3e09261..bdf0b470 100644
 +    "Zoom": "ズーム",
 +    "Astra IQ": "Astra IQ",
 +    "Astra IQ check details": "Astra IQ check details",
-+    "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.": "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.",
 +    "Astra IQ details unavailable": "Astra IQ details unavailable",
 +    "Astra IQ disabled channel": "Astra IQ disabled channel",
-+    "Astra IQ expired": "Astra IQ expired",
 +    "Astra IQ passed": "Astra IQ passed",
 +    "Astra IQ pending": "Astra IQ pending",
 +    "Astra IQ request failed": "Astra IQ request failed",
@@ -4119,17 +4324,12 @@ index e3e09261..bdf0b470 100644
 +    "Detailed metrics were not saved for this older check.": "Detailed metrics were not saved for this older check.",
 +    "Expected answer": "Expected answer",
 +    "Input / Output tokens": "Input / Output tokens",
-+    "Last 24 checks: green passed, red wrong answer, amber error, gray untested.": "Last 24 checks: green passed, red wrong answer, amber error, gray untested.",
-+    "Latest answer": "Latest answer",
 +    "Model response": "Model response",
 +    "No completed model response": "No completed model response",
 +    "Question sent to model": "Question sent to model",
-+    "Recent pass rate": "Recent pass rate",
-+    "Request timeout": "Request timeout",
 +    "Time to first token": "Time to first token",
 +    "View check details": "View check details",
 +    "Upstream rejected the official Codex client.": "上流が公式 Codex クライアントを拒否しました。",
-+    "Official Codex client did not complete this check.": "公式 Codex クライアントはこの検査を完了できませんでした。",
 +    "Delete this check": "この結果を削除",
 +    "Delete all checks": "すべての結果を削除",
 +    "Delete this check?": "この検査結果を削除しますか？",
@@ -4139,7 +4339,7 @@ index e3e09261..bdf0b470 100644
 +    "Check start time": "開始時刻",
 +    "Interval (minutes)": "間隔（分）",
 +    "Stop on failure": "失敗時に停止",
-+    "Applies to all Astra channels. Daily schedule in Beijing time (UTC+8).": "すべての Astra チャネルに適用。北京時間（UTC+8）で毎日実行します。",
++    "Settings apply to every checked channel. Daily schedule in Beijing time (UTC+8).": "検査対象のすべてのチャネルに適用。北京時間（UTC+8）で毎日実行します。",
 +    "Equal times mean all day. Overnight schedules are supported.": "同じ時刻は終日を意味します。日付をまたぐ時間帯も設定できます。",
 +    "Pause Astra calls after a failed check. Calls without a result are allowed.": "検査失敗後に Astra 呼び出しを停止します。結果がない場合は許可します。",
 +    "Check settings unavailable": "検査設定を読み込めません",
@@ -4160,23 +4360,18 @@ index e3e09261..bdf0b470 100644
 +    "The upstream response contained no final answer.": "上流の応答に最終回答がありません。",
 +    "The upstream response ended before completion.": "上流の応答が完了前に終了しました。",
 +    "This channel has no enabled keys.": "このチャネルに有効なキーがありません。",
-+    "The request failed. This older check has no saved error details.": "リクエストに失敗しました。この古い検査にはエラー詳細が保存されていません。"
++    "The request failed. This older check has no saved error details.": "リクエストに失敗しました。この古い検査にはエラー詳細が保存されていません。",
++    "Check channels": "検査対象チャネル",
++    "All Astra channels": "すべての Astra チャネル",
++    "Leave empty to check all Astra channels. Unselected channels are not checked and their results do not block calls.": "未選択の場合はすべての Astra チャネルを検査します。選択外のチャネルは検査せず、その結果で呼び出しを制限しません。",
++    "Select only channels that support gpt-6-astra": "gpt-6-astra に対応するチャネルのみ選択できます"
    }
  }
 diff --git a/web/src/i18n/locales/ru.json b/web/src/i18n/locales/ru.json
-index af18b036..3dee51ea 100644
+index af18b036..ccf73c05 100644
 --- a/web/src/i18n/locales/ru.json
 +++ b/web/src/i18n/locales/ru.json
-@@ -2618,7 +2618,7 @@
-     "footer.columns.related.links.oneApi": "Один API",
-     "footer.columns.related.title": "Связанные проекты",
-     "footer.defaultCopyright": "Все права защищены.",
--    "footer.new\u0061pi.projectAttributionSuffix": "Все права защищены. Разработано участниками проекта.",
-+    "footer.newapi.projectAttributionSuffix": "Все права защищены. Разработано участниками проекта.",
-     "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "Для расширенных пользовательских каналов это действует только для маршрутов /v1/responses без преобразования протокола.",
-     "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "Для каналов, добавленных после 10 мая 2025 г., не нужно удалять \".\" из имён моделей при развёртывании",
-     "For private deployments, format: https://fastgpt.run/api/openapi": "Для частных развертываний, формат: https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,64 @@
+@@ -6777,6 +6777,61 @@
      "Zhipu": "Zhipu",
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V4",
@@ -4184,10 +4379,8 @@ index af18b036..3dee51ea 100644
 +    "Zoom": "Zoom",
 +    "Astra IQ": "Astra IQ",
 +    "Astra IQ check details": "Astra IQ check details",
-+    "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.": "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.",
 +    "Astra IQ details unavailable": "Astra IQ details unavailable",
 +    "Astra IQ disabled channel": "Astra IQ disabled channel",
-+    "Astra IQ expired": "Astra IQ expired",
 +    "Astra IQ passed": "Astra IQ passed",
 +    "Astra IQ pending": "Astra IQ pending",
 +    "Astra IQ request failed": "Astra IQ request failed",
@@ -4198,17 +4391,12 @@ index af18b036..3dee51ea 100644
 +    "Detailed metrics were not saved for this older check.": "Detailed metrics were not saved for this older check.",
 +    "Expected answer": "Expected answer",
 +    "Input / Output tokens": "Input / Output tokens",
-+    "Last 24 checks: green passed, red wrong answer, amber error, gray untested.": "Last 24 checks: green passed, red wrong answer, amber error, gray untested.",
-+    "Latest answer": "Latest answer",
 +    "Model response": "Model response",
 +    "No completed model response": "No completed model response",
 +    "Question sent to model": "Question sent to model",
-+    "Recent pass rate": "Recent pass rate",
-+    "Request timeout": "Request timeout",
 +    "Time to first token": "Time to first token",
 +    "View check details": "View check details",
 +    "Upstream rejected the official Codex client.": "Сервис отклонил официальный клиент Codex.",
-+    "Official Codex client did not complete this check.": "Официальный клиент Codex не завершил эту проверку.",
 +    "Delete this check": "Удалить этот результат",
 +    "Delete all checks": "Удалить все результаты",
 +    "Delete this check?": "Удалить этот результат проверки?",
@@ -4218,7 +4406,7 @@ index af18b036..3dee51ea 100644
 +    "Check start time": "Время начала",
 +    "Interval (minutes)": "Интервал (минуты)",
 +    "Stop on failure": "Отключать при сбое",
-+    "Applies to all Astra channels. Daily schedule in Beijing time (UTC+8).": "Для всех каналов Astra. Ежедневно по времени Пекина (UTC+8).",
++    "Settings apply to every checked channel. Daily schedule in Beijing time (UTC+8).": "Для всех проверяемых каналов. Ежедневно по времени Пекина (UTC+8).",
 +    "Equal times mean all day. Overnight schedules are supported.": "Одинаковое время означает весь день. Поддерживается переход через полночь.",
 +    "Pause Astra calls after a failed check. Calls without a result are allowed.": "Приостанавливать вызовы Astra после неудачной проверки. Без результата вызовы разрешены.",
 +    "Check settings unavailable": "Настройки проверок недоступны",
@@ -4239,23 +4427,18 @@ index af18b036..3dee51ea 100644
 +    "The upstream response contained no final answer.": "Ответ сервера не содержит итогового ответа.",
 +    "The upstream response ended before completion.": "Ответ сервера оборвался до завершения.",
 +    "This channel has no enabled keys.": "У этого канала нет включённых ключей.",
-+    "The request failed. This older check has no saved error details.": "Запрос не выполнен. Для этой старой проверки подробности ошибки не сохранены."
++    "The request failed. This older check has no saved error details.": "Запрос не выполнен. Для этой старой проверки подробности ошибки не сохранены.",
++    "Check channels": "Каналы для проверки",
++    "All Astra channels": "Все каналы Astra",
++    "Leave empty to check all Astra channels. Unselected channels are not checked and their results do not block calls.": "Оставьте пустым, чтобы проверять все каналы Astra. Невыбранные каналы не проверяются, и их результаты не блокируют вызовы.",
++    "Select only channels that support gpt-6-astra": "Выбирайте только каналы с поддержкой gpt-6-astra"
    }
  }
 diff --git a/web/src/i18n/locales/vi.json b/web/src/i18n/locales/vi.json
-index c7d3e719..90c92276 100644
+index c7d3e719..48fd6fd3 100644
 --- a/web/src/i18n/locales/vi.json
 +++ b/web/src/i18n/locales/vi.json
-@@ -2618,7 +2618,7 @@
-     "footer.columns.related.links.oneApi": "One API",
-     "footer.columns.related.title": "Các Dự Án Liên Quan",
-     "footer.defaultCopyright": "Bản quyền được bảo lưu.",
--    "footer.new\u0061pi.projectAttributionSuffix": "Bản quyền được bảo lưu. Được thiết kế và phát triển bởi các cộng tác viên dự án.",
-+    "footer.newapi.projectAttributionSuffix": "Bản quyền được bảo lưu. Được thiết kế và phát triển bởi các cộng tác viên dự án.",
-     "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "Với kênh tùy chỉnh nâng cao, thiết lập này chỉ áp dụng cho các route /v1/responses không chuyển đổi giao thức.",
-     "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "Đối với các kênh được thêm sau ngày 10 tháng 5 năm 2025, không cần loại bỏ \".\" khỏi tên mô hình trong quá trình triển khai",
-     "For private deployments, format: https://fastgpt.run/api/openapi": "Đối với các triển khai riêng tư, định dạng: https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,64 @@
+@@ -6777,6 +6777,61 @@
      "Zhipu": "Zhipu",
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V4",
@@ -4263,10 +4446,8 @@ index c7d3e719..90c92276 100644
 +    "Zoom": "Zoom",
 +    "Astra IQ": "Astra IQ",
 +    "Astra IQ check details": "Astra IQ check details",
-+    "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.": "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.",
 +    "Astra IQ details unavailable": "Astra IQ details unavailable",
 +    "Astra IQ disabled channel": "Astra IQ disabled channel",
-+    "Astra IQ expired": "Astra IQ expired",
 +    "Astra IQ passed": "Astra IQ passed",
 +    "Astra IQ pending": "Astra IQ pending",
 +    "Astra IQ request failed": "Astra IQ request failed",
@@ -4277,17 +4458,12 @@ index c7d3e719..90c92276 100644
 +    "Detailed metrics were not saved for this older check.": "Detailed metrics were not saved for this older check.",
 +    "Expected answer": "Expected answer",
 +    "Input / Output tokens": "Input / Output tokens",
-+    "Last 24 checks: green passed, red wrong answer, amber error, gray untested.": "Last 24 checks: green passed, red wrong answer, amber error, gray untested.",
-+    "Latest answer": "Latest answer",
 +    "Model response": "Model response",
 +    "No completed model response": "No completed model response",
 +    "Question sent to model": "Question sent to model",
-+    "Recent pass rate": "Recent pass rate",
-+    "Request timeout": "Request timeout",
 +    "Time to first token": "Time to first token",
 +    "View check details": "View check details",
 +    "Upstream rejected the official Codex client.": "Dịch vụ từ chối ứng dụng Codex chính thức.",
-+    "Official Codex client did not complete this check.": "Ứng dụng Codex chính thức chưa hoàn tất lần kiểm tra này.",
 +    "Delete this check": "Xóa kết quả này",
 +    "Delete all checks": "Xóa tất cả kết quả",
 +    "Delete this check?": "Xóa kết quả kiểm tra này?",
@@ -4297,7 +4473,7 @@ index c7d3e719..90c92276 100644
 +    "Check start time": "Giờ bắt đầu",
 +    "Interval (minutes)": "Khoảng cách (phút)",
 +    "Stop on failure": "Dừng khi thất bại",
-+    "Applies to all Astra channels. Daily schedule in Beijing time (UTC+8).": "Áp dụng cho mọi kênh Astra. Chạy hằng ngày theo giờ Bắc Kinh (UTC+8).",
++    "Settings apply to every checked channel. Daily schedule in Beijing time (UTC+8).": "Áp dụng cho mọi kênh được kiểm tra. Chạy hằng ngày theo giờ Bắc Kinh (UTC+8).",
 +    "Equal times mean all day. Overnight schedules are supported.": "Hai giờ giống nhau nghĩa là cả ngày. Hỗ trợ khoảng thời gian qua nửa đêm.",
 +    "Pause Astra calls after a failed check. Calls without a result are allowed.": "Tạm dừng gọi Astra sau kiểm tra thất bại. Cho phép gọi khi chưa có kết quả.",
 +    "Check settings unavailable": "Không tải được cài đặt kiểm tra",
@@ -4318,23 +4494,18 @@ index c7d3e719..90c92276 100644
 +    "The upstream response contained no final answer.": "Phản hồi từ nguồn không có đáp án cuối cùng.",
 +    "The upstream response ended before completion.": "Phản hồi từ nguồn kết thúc trước khi hoàn tất.",
 +    "This channel has no enabled keys.": "Kênh này không có khóa đang bật.",
-+    "The request failed. This older check has no saved error details.": "Yêu cầu thất bại. Lần kiểm tra cũ này không lưu chi tiết lỗi."
++    "The request failed. This older check has no saved error details.": "Yêu cầu thất bại. Lần kiểm tra cũ này không lưu chi tiết lỗi.",
++    "Check channels": "Kênh kiểm tra",
++    "All Astra channels": "Tất cả kênh Astra",
++    "Leave empty to check all Astra channels. Unselected channels are not checked and their results do not block calls.": "Để trống để kiểm tra mọi kênh Astra. Kênh không được chọn sẽ không được kiểm tra và kết quả của nó không chặn lệnh gọi.",
++    "Select only channels that support gpt-6-astra": "Chỉ chọn kênh hỗ trợ gpt-6-astra"
    }
  }
 diff --git a/web/src/i18n/locales/zh-TW.json b/web/src/i18n/locales/zh-TW.json
-index 3eca7eea..b6844bef 100644
+index 3eca7eea..811bb282 100644
 --- a/web/src/i18n/locales/zh-TW.json
 +++ b/web/src/i18n/locales/zh-TW.json
-@@ -2618,7 +2618,7 @@
-     "footer.columns.related.links.oneApi": "One API",
-     "footer.columns.related.title": "相關項目",
-     "footer.defaultCopyright": "版權所有。",
--    "footer.new\u0061pi.projectAttributionSuffix": "版權所有，由項目貢獻者設計與開發。",
-+    "footer.newapi.projectAttributionSuffix": "版權所有，由項目貢獻者設計與開發。",
-     "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "進階自訂渠道僅對 /v1/responses 且不做協定轉換的路由生效。",
-     "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "對於 2025 年 5 月 10 日之後新增的渠道，在部署時無需從模型名稱中移除 \".\"",
-     "For private deployments, format: https://fastgpt.run/api/openapi": "對於私有部署，格式為：https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,64 @@
+@@ -6777,6 +6777,61 @@
      "Zhipu": "智譜",
      "Zhipu GLM": "智譜GLM",
      "Zhipu V4": "智譜 V4",
@@ -4342,10 +4513,8 @@ index 3eca7eea..b6844bef 100644
 +    "Zoom": "縮放",
 +    "Astra IQ": "Astra IQ",
 +    "Astra IQ check details": "Astra IQ check details",
-+    "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.": "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.",
 +    "Astra IQ details unavailable": "Astra IQ details unavailable",
 +    "Astra IQ disabled channel": "Astra IQ disabled channel",
-+    "Astra IQ expired": "Astra IQ expired",
 +    "Astra IQ passed": "Astra IQ passed",
 +    "Astra IQ pending": "Astra IQ pending",
 +    "Astra IQ request failed": "Astra IQ request failed",
@@ -4356,17 +4525,12 @@ index 3eca7eea..b6844bef 100644
 +    "Detailed metrics were not saved for this older check.": "Detailed metrics were not saved for this older check.",
 +    "Expected answer": "Expected answer",
 +    "Input / Output tokens": "Input / Output tokens",
-+    "Last 24 checks: green passed, red wrong answer, amber error, gray untested.": "Last 24 checks: green passed, red wrong answer, amber error, gray untested.",
-+    "Latest answer": "Latest answer",
 +    "Model response": "Model response",
 +    "No completed model response": "No completed model response",
 +    "Question sent to model": "Question sent to model",
-+    "Recent pass rate": "Recent pass rate",
-+    "Request timeout": "Request timeout",
 +    "Time to first token": "Time to first token",
 +    "View check details": "View check details",
 +    "Upstream rejected the official Codex client.": "上游拒絕了官方 Codex 用戶端。",
-+    "Official Codex client did not complete this check.": "官方 Codex 用戶端未完成本次檢測。",
 +    "Delete this check": "刪除此筆結果",
 +    "Delete all checks": "刪除全部結果",
 +    "Delete this check?": "刪除此筆檢測結果？",
@@ -4376,7 +4540,7 @@ index 3eca7eea..b6844bef 100644
 +    "Check start time": "開始時間",
 +    "Interval (minutes)": "間隔（分鐘）",
 +    "Stop on failure": "失敗停用",
-+    "Applies to all Astra channels. Daily schedule in Beijing time (UTC+8).": "適用於所有 Astra 渠道，按北京時間（UTC+8）每天執行。",
++    "Settings apply to every checked channel. Daily schedule in Beijing time (UTC+8).": "設定適用於所有檢測渠道，按北京時間（UTC+8）每天執行。",
 +    "Equal times mean all day. Overnight schedules are supported.": "時間相同表示全天，支援跨午夜。",
 +    "Pause Astra calls after a failed check. Calls without a result are allowed.": "檢測失敗後暫停 Astra 呼叫；無結果時允許呼叫。",
 +    "Check settings unavailable": "檢測設定載入失敗",
@@ -4397,23 +4561,18 @@ index 3eca7eea..b6844bef 100644
 +    "The upstream response contained no final answer.": "上游回應中沒有最終答案。",
 +    "The upstream response ended before completion.": "上游回應未完成就已結束。",
 +    "This channel has no enabled keys.": "此渠道沒有已啟用的金鑰。",
-+    "The request failed. This older check has no saved error details.": "請求失敗。這條舊記錄未儲存具體錯誤詳情。"
++    "The request failed. This older check has no saved error details.": "請求失敗。這條舊記錄未儲存具體錯誤詳情。",
++    "Check channels": "檢測渠道",
++    "All Astra channels": "全部 Astra 渠道",
++    "Leave empty to check all Astra channels. Unselected channels are not checked and their results do not block calls.": "不選擇則檢測全部 Astra 渠道；未選中的渠道不檢測，其結果也不限制呼叫。",
++    "Select only channels that support gpt-6-astra": "只能選擇支援 gpt-6-astra 的渠道"
    }
  }
 diff --git a/web/src/i18n/locales/zh.json b/web/src/i18n/locales/zh.json
-index 23de155c..33cde2e8 100644
+index 23de155c..51f086ef 100644
 --- a/web/src/i18n/locales/zh.json
 +++ b/web/src/i18n/locales/zh.json
-@@ -2618,7 +2618,7 @@
-     "footer.columns.related.links.oneApi": "One API",
-     "footer.columns.related.title": "相关项目",
-     "footer.defaultCopyright": "版权所有。",
--    "footer.new\u0061pi.projectAttributionSuffix": "版权所有，由项目贡献者设计与开发。",
-+    "footer.newapi.projectAttributionSuffix": "版权所有，由项目贡献者设计与开发。",
-     "For advanced custom channels this applies only to /v1/responses routes without protocol conversion.": "高级自定义渠道仅对 /v1/responses 且不做协议转换的路由生效。",
-     "For channels added after May 10, 2025, no need to remove \".\" from model names during deployment": "对于 2025 年 5 月 10 日之后添加的渠道，在部署时无需从模型名称中移除 \".\"",
-     "For private deployments, format: https://fastgpt.run/api/openapi": "对于私有部署，格式为：https://fastgpt.run/api/openapi",
-@@ -6777,6 +6777,64 @@
+@@ -6777,6 +6777,61 @@
      "Zhipu": "智谱",
      "Zhipu GLM": "智谱GLM",
      "Zhipu V4": "智谱 V4",
@@ -4421,10 +4580,8 @@ index 23de155c..33cde2e8 100644
 +    "Zoom": "缩放",
 +    "Astra IQ": "Astra 智力检测",
 +    "Astra IQ check details": "Astra 检测详情",
-+    "Astra IQ checks every 5 minutes at medium reasoning; only the latest passing result permits routing.": "每 5 分钟以 medium 推理强度检测，仅最新一次通过的渠道参与 Astra 路由。",
 +    "Astra IQ details unavailable": "暂时无法读取检测详情",
 +    "Astra IQ disabled channel": "渠道已停用，暂停检测",
-+    "Astra IQ expired": "待复检",
 +    "Astra IQ passed": "通过",
 +    "Astra IQ pending": "待检测",
 +    "Astra IQ request failed": "检测异常",
@@ -4435,17 +4592,12 @@ index 23de155c..33cde2e8 100644
 +    "Detailed metrics were not saved for this older check.": "此历史记录未保存完整请求详情。",
 +    "Expected answer": "正确答案",
 +    "Input / Output tokens": "输入 / 输出 Token",
-+    "Last 24 checks: green passed, red wrong answer, amber error, gray untested.": "最近 24 次：绿色通过，红色答错，橙色异常，灰色未检测。",
-+    "Latest answer": "最近答案",
 +    "Model response": "模型回复",
 +    "No completed model response": "未收到完整的模型回复",
 +    "Question sent to model": "发送给模型的题目",
-+    "Recent pass rate": "最近检测通过率",
-+    "Request timeout": "请求超时",
 +    "Time to first token": "首字延迟",
 +    "View check details": "点击查看检测详情",
 +    "Upstream rejected the official Codex client.": "上游拒绝了官方 Codex 客户端。",
-+    "Official Codex client did not complete this check.": "官方 Codex 客户端未完成本次检测。",
 +    "Delete this check": "删除此次结果",
 +    "Delete all checks": "删除全部结果",
 +    "Delete this check?": "删除此次检测结果？",
@@ -4455,7 +4607,7 @@ index 23de155c..33cde2e8 100644
 +    "Check start time": "开始时间",
 +    "Interval (minutes)": "间隔（分钟）",
 +    "Stop on failure": "失败停用",
-+    "Applies to all Astra channels. Daily schedule in Beijing time (UTC+8).": "适用于所有 Astra 渠道，按北京时间（UTC+8）每天执行。",
++    "Settings apply to every checked channel. Daily schedule in Beijing time (UTC+8).": "设置适用于所有检测渠道，按北京时间（UTC+8）每天执行。",
 +    "Equal times mean all day. Overnight schedules are supported.": "时间相同表示全天，支持跨午夜。",
 +    "Pause Astra calls after a failed check. Calls without a result are allowed.": "检测失败后暂停 Astra 调用；无结果时允许调用。",
 +    "Check settings unavailable": "检测设置加载失败",
@@ -4476,6 +4628,10 @@ index 23de155c..33cde2e8 100644
 +    "The upstream response contained no final answer.": "上游响应中没有最终答案。",
 +    "The upstream response ended before completion.": "上游响应未完成就已结束。",
 +    "This channel has no enabled keys.": "此渠道没有已启用的密钥。",
-+    "The request failed. This older check has no saved error details.": "请求失败。这条旧记录未保存具体错误详情。"
++    "The request failed. This older check has no saved error details.": "请求失败。这条旧记录未保存具体错误详情。",
++    "Check channels": "检测渠道",
++    "All Astra channels": "全部 Astra 渠道",
++    "Leave empty to check all Astra channels. Unselected channels are not checked and their results do not block calls.": "不选择则检测全部 Astra 渠道；未选中的渠道不检测，其结果也不限制调用。",
++    "Select only channels that support gpt-6-astra": "只能选择支持 gpt-6-astra 的渠道"
    }
  }
