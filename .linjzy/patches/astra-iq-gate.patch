@@ -22,10 +22,10 @@ index 399a2ab8..bd554f66 100644
  WORKDIR /data
 diff --git a/controller/astra_iq.go b/controller/astra_iq.go
 new file mode 100644
-index 00000000..a2118595
+index 00000000..b1528011
 --- /dev/null
 +++ b/controller/astra_iq.go
-@@ -0,0 +1,546 @@
+@@ -0,0 +1,597 @@
 +package controller
 +
 +import (
@@ -33,7 +33,6 @@ index 00000000..a2118595
 +	"errors"
 +	"fmt"
 +	"net/http"
-+	"regexp"
 +	"slices"
 +	"strconv"
 +	"strings"
@@ -49,16 +48,67 @@ index 00000000..a2118595
 +	"gorm.io/gorm"
 +)
 +
-+const astraIQQuestion = `在一个黑色的袋子里放有三种口味的糖果，每种糖果有两种不同的形状（圆形和五角星形，不同的形状靠手感可以分辨）。现已知不同口味的糖和不同形状的数量统计如下表。参赛者需要在活动前决定摸出的糖果数目，那么，最少取出多少个糖果才能保证手中同时拥有不同形状的苹果味和桃子味的糖？（同时手中有圆形苹果味匹配五角星桃子味糖果，或者有圆形桃子味匹配五角星苹果味糖果都满足要求）
-+苹果味 桃子味 西瓜味
-+圆形 7 9 8
-+五角星形 7 6 4
++const astraIQQuestion = `不允许联网、运行代码或调用任何外部工具，请独立推理。每一问都要给出答案和取法，并证明不能更少。
 +
-+请只输出最终答案的一个整数，不要输出解释、分析过程或其他内容。`
++活动方最初往一个黑色袋子里装了五种口味（苹果、桃子、西瓜、葡萄、柠檬）、三种形状（圆形、五角星形、心形）的糖果，数量如下，其中圆形西瓜的数量漏记了，但已知装袋时西瓜味糖果一共 15 颗：
 +
-+var astraIQAnswerPattern = regexp.MustCompile(`^(?:(?:答案|最少|至少)(?:是|为)?[:：]?\s*)?21(?:\s*(?:个|颗)(?:糖果)?)?[。.!！]?$`)
++形状 苹果 桃子 西瓜 葡萄 柠檬
++圆形 5 3 ? 4 8
++五角星形 4 3 8 2 7
++心形 6 8 5 3 4
++
++活动开始前，工作人员为试吃取走了全部葡萄味心形、2 颗柠檬味圆形和 2 颗桃子味五角星，这些糖没有放回。
++
++糖果的糖纸颜色按口味区分，但袋子全黑，看不到。圆形、五角星、心形分别重 4 克、5 克、6 克，但摸的时候无法称重。手感方面，圆形可以和另外两种形状区分，五角星和心形摸起来完全一样。例外的是，柠檬味五角星因为糖纸加厚，摸起来和圆形一模一样，但它仍然是五角星。柠檬味圆形的糖纸也加厚了；西瓜味心形的糖纸有浅浅的压花，但太浅摸不出来。口味无法靠手感判断。
++
++手中能挑出一颗圆形、一颗五角星、一颗心形，且三者口味两两不同，即为成功。“保证”指无论运气多差都能成功。
++
++第 1 问：参赛者必须在开始前决定摸几颗“摸起来是圆形的糖”、几颗“摸起来不是圆形的糖”，过程中不能调整。最少一共要摸多少颗才能保证成功？怎么分配？
++
++第 2 问：改为一颗一颗地摸，每颗拿出来后立刻能看到它的口味和形状，每次都可以根据已摸到的糖决定下一颗摸哪一类。有人认为：“自适应的最好做法是先把圆感糖摸到满意，再只摸非圆感糖；这样做和第 1 问一样要 32 颗，所以自适应没有帮助。”这说法哪里对、哪里错？最少需要摸多少？
++
++第 3 问：成功条件追加一条，三颗糖中必须有一颗葡萄味。分别在第 1 问和第 2 问的规则下，最少要摸多少颗？
++
++用 R 表示“摸起来是圆形的糖”，N 表示“摸起来不是圆形的糖”。先逐问给出答案、取法和不能更少的证明。最后单独一行输出“最终答案：”及一个由 8 个整数组成的 JSON 数组，严格按以下顺序填写，不要省略任何一项：
++[第1问最少总数, 第1问R数量, 第1问N数量, 第2问最少总数, 第3问固定规则最少总数, 第3问固定规则R数量, 第3问固定规则N数量, 第3问自适应规则最少总数]`
++
++const astraIQExpectedAnswer = "[32,8,24,29,40,24,16,38]"
++
++const astraIQExpectedSolution = `第1问：32 颗，8R + 24N。
++第2问：29 颗。先摸 N 到出现第一颗心形，再根据已出现的五角星/心形口味决定转摸 R 或继续摸 N；自适应有帮助。
++第3问固定规则：40 颗，24R + 16N。
++第3问自适应规则：38 颗。先摸 N，直到首次出现心形或葡萄五角星，再按结果分支。
++最终答案：[32,8,24,29,40,24,16,38]`
 +
 +var astraIQEmptyAnswer = errors.New("empty_answer")
++
++// The final summary has one slot for every required quantity. Never search the
++// explanation for matching numbers: an example or a partial answer cannot pass.
++func gradeAstraIQAnswer(answer string) (string, bool) {
++	summary := strings.TrimSpace(answer)
++	// Accept a fenced final array as well as the requested plain final line.
++	summary = strings.TrimSpace(strings.TrimSuffix(summary, "```"))
++	arrayStart := strings.LastIndexByte(summary, '[')
++	if arrayStart < 0 {
++		return strings.TrimSpace(summary[strings.LastIndexByte(summary, '\n')+1:]), false
++	}
++	prefixStart := strings.LastIndexByte(summary[:arrayStart], '\n') + 1
++	prefix := strings.Trim(summary[prefixStart:arrayStart], "*` \t\r")
++	if prefix != "" && prefix != "最终答案：" && prefix != "最终答案:" {
++		return summary, false
++	}
++	summary = strings.Trim(summary[arrayStart:], "*` \t\r\n")
++	var values []int
++	if err := common.UnmarshalJsonStr(summary, &values); err != nil {
++		return summary, false
++	}
++	encoded, err := common.Marshal(values)
++	if err != nil {
++		return summary, false
++	}
++	summary = string(encoded)
++	return summary, summary == astraIQExpectedAnswer
++}
 +
 +func setAstraIQPrompt(request dto.Request, prompt string) error {
 +	switch r := request.(type) {
@@ -204,7 +254,7 @@ index 00000000..a2118595
 +	}
 +	var answer strings.Builder
 +	for _, item := range response.Get("output").Array() {
-+		if item.Get("type").String() != "message" || item.Get("role").String() != "assistant" {
++		if item.Get("type").String() != "message" || item.Get("role").String() != "assistant" || item.Get("phase").String() == "commentary" {
 +			continue
 +		}
 +		for _, part := range item.Get("content").Array() {
@@ -299,8 +349,9 @@ index 00000000..a2118595
 +			break
 +		}
 +		attempt.Response = string([]rune(answer)[:min(len([]rune(answer)), 8192)])
-+		result.Answer = string([]rune(answer)[:min(len([]rune(answer)), 128)])
-+		if !astraIQAnswerPattern.MatchString(strings.Trim(answer, "`* \r\n\t")) {
++		summary, passed := gradeAstraIQAnswer(answer)
++		result.Answer = string([]rune(summary)[:min(len([]rune(summary)), 128)])
++		if !passed {
 +			result.Status, result.Detail = "fail", "wrong_answer"
 +			attempt.Status, attempt.Detail = result.Status, result.Detail
 +			result.Sample.Attempts = append(result.Sample.Attempts, attempt)
@@ -416,7 +467,7 @@ index 00000000..a2118595
 +			if len(sample.Attempts) == 0 && checkedAt == row.CheckedAt {
 +				sample.Answer, sample.Detail, sample.LatencyMS = row.Answer, row.Detail, row.LatencyMS
 +			}
-+			common.ApiSuccess(c, gin.H{"sample": sample, "question": astraIQQuestion, "expected_answer": "21", "model": model.AstraIQModel, "reasoning_effort": "medium"})
++			common.ApiSuccess(c, gin.H{"sample": sample, "question": astraIQQuestion, "expected_answer": astraIQExpectedSolution, "model": model.AstraIQModel, "reasoning_effort": "medium"})
 +			return
 +		}
 +	}
@@ -787,10 +838,10 @@ index 00000000..be606c0a
 +}
 diff --git a/controller/astra_iq_test.go b/controller/astra_iq_test.go
 new file mode 100644
-index 00000000..1b69ab7c
+index 00000000..ccd12280
 --- /dev/null
 +++ b/controller/astra_iq_test.go
-@@ -0,0 +1,613 @@
+@@ -0,0 +1,670 @@
 +package controller
 +
 +import (
@@ -825,28 +876,69 @@ index 00000000..1b69ab7c
 +
 +func (astraIQLegacyRow) TableName() string { return "astra_iq_results" }
 +
++func TestCustomAstraIQRequiresEveryAnswer(t *testing.T) {
++	for _, tc := range []struct {
++		name, answer string
++		passed       bool
++	}{
++		{"all correct", "[32,8,24,29,40,24,16,38]", true},
++		{"explanation and final summary", "取法与证明在前。\n最终答案： [32, 8, 24, 29, 40, 24, 16, 38]\n", true},
++		{"fenced final summary", "```json\n[32,8,24,29,40,24,16,38]\n```", true},
++		{"markdown final summary", "**最终答案：** `[32,8,24,29,40,24,16,38]`", true},
++		{"multiline array", "最终答案:\n[\n32, 8, 24, 29,\n40, 24, 16, 38\n]", true},
++		{"wrong first minimum", "[31,8,24,29,40,24,16,38]", false},
++		{"wrong first R", "[32,9,24,29,40,24,16,38]", false},
++		{"wrong first N", "[32,8,23,29,40,24,16,38]", false},
++		{"wrong adaptive minimum", "[32,8,24,32,40,24,16,38]", false},
++		{"wrong grape fixed minimum", "[32,8,24,29,39,24,16,38]", false},
++		{"wrong grape R", "[32,8,24,29,40,23,16,38]", false},
++		{"wrong grape N", "[32,8,24,29,40,24,17,38]", false},
++		{"wrong grape adaptive minimum", "[32,8,24,29,40,24,16,37]", false},
++		{"only four minima", "[32,29,40,38]", false},
++		{"missing answer", "[32,8,24,29,40,24,16]", false},
++		{"extra answer", "[32,8,24,29,40,24,16,38,0]", false},
++		{"old answer", "21", false},
++		{"unanswered question", "[第1问最少总数, 第1问R数量, 第1问N数量, 第2问最少总数, 第3问固定规则最少总数, 第3问固定规则R数量, 第3问固定规则N数量, 第3问自适应规则最少总数]", false},
++		{"correct example is not final", "示例：[32,8,24,29,40,24,16,38]\n最终答案：[32,8,24,32,40,24,16,38]", false},
++		{"example alone is not an answer", "示例：[32,8,24,29,40,24,16,38]", false},
++		{"ambiguous answer", "[32,8,24,29,40,24,16,38] 或 [32,8,24,32,40,24,16,38]", false},
++		{"quoted numbers", `["32",8,24,29,40,24,16,38]`, false},
++		{"fractional number", "[32.5,8,24,29,40,24,16,38]", false},
++		{"null answer", "null", false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			summary, passed := gradeAstraIQAnswer(tc.answer)
++			assert.Equal(t, tc.passed, passed)
++			if passed {
++				assert.Equal(t, "[32,8,24,29,40,24,16,38]", summary)
++			}
++		})
++	}
++}
++
 +func TestCustomAstraIQGradesOnlyCompletedAssistantAnswers(t *testing.T) {
 +	for _, tc := range []struct {
 +		name, body      string
 +		passed, invalid bool
 +	}{
-+		{"chat correct", `{"choices":[{"message":{"role":"assistant","content":"21"},"finish_reason":"stop"}]}`, true, false},
++		{"chat correct", `{"choices":[{"message":{"role":"assistant","content":"[32,8,24,29,40,24,16,38]"},"finish_reason":"stop"}]}`, true, false},
 +		{"wrong", `{"choices":[{"message":{"content":"22"},"finish_reason":"stop"}]}`, false, false},
-+		{"not substring", `{"choices":[{"message":{"content":"121"},"finish_reason":"stop"}]}`, false, false},
-+		{"reasoning cannot pass", `{"choices":[{"message":{"content":"22","reasoning_content":"21"},"finish_reason":"stop"}]}`, false, false},
-+		{"ambiguous answer", `{"choices":[{"message":{"content":"21或22"},"finish_reason":"stop"}]}`, false, false},
-+		{"truncated", `{"choices":[{"message":{"content":"21"},"finish_reason":"length"}]}`, false, true},
-+		{"refusal", `{"choices":[{"message":{"refusal":"21"},"finish_reason":"stop"}]}`, false, true},
-+		{"responses correct", `{"status":"completed","output":[{"type":"reasoning","content":[]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"21"}]}]}`, true, false},
-+		{"responses unfinished", `{"status":"incomplete","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"21"}]}]}`, false, true},
-+		{"split chat stream", "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"2\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"1\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n", true, false},
-+		{"cut stream", "data: {\"choices\":[{\"delta\":{\"content\":\"21\"}}]}\n", false, true},
-+		{"error stream", "data: {\"error\":{\"message\":\"21\"}}\n", false, true},
-+		{"completed responses stream", "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"error\":null,\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"21\"}]}]}}\n\n", true, false},
-+		{"responses error without error object", "event: error\ndata: {\"type\":\"error\",\"message\":\"21\"}\n\n", false, true},
-+		{"completed with final message event and empty output", "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"final_answer\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"21\"}]}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n", true, false},
-+		{"final message without completed response", "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"21\"}]}}\n\n", false, true},
-+		{"commentary cannot substitute final answer", "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"commentary\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"21\"}]}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n", false, true},
++		{"not substring", `{"choices":[{"message":{"content":"1[32,8,24,29,40,24,16,38]"},"finish_reason":"stop"}]}`, false, false},
++		{"reasoning cannot pass", `{"choices":[{"message":{"content":"22","reasoning_content":"[32,8,24,29,40,24,16,38]"},"finish_reason":"stop"}]}`, false, false},
++		{"ambiguous answer", `{"choices":[{"message":{"content":"[32,8,24,29,40,24,16,38]或22"},"finish_reason":"stop"}]}`, false, false},
++		{"truncated", `{"choices":[{"message":{"content":"[32,8,24,29,40,24,16,38]"},"finish_reason":"length"}]}`, false, true},
++		{"refusal", `{"choices":[{"message":{"refusal":"[32,8,24,29,40,24,16,38]"},"finish_reason":"stop"}]}`, false, true},
++		{"responses correct", `{"status":"completed","output":[{"type":"reasoning","content":[]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"[32,8,24,29,40,24,16,38]"}]}]}`, true, false},
++		{"responses commentary is not final", `{"status":"completed","output":[{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"[32,8,24,29,40,24,16,38]"}]}]}`, false, true},
++		{"responses unfinished", `{"status":"incomplete","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"[32,8,24,29,40,24,16,38]"}]}]}`, false, true},
++		{"split chat stream", "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"[32,8,24,\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"29,40,24,16,38]\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n", true, false},
++		{"cut stream", "data: {\"choices\":[{\"delta\":{\"content\":\"[32,8,24,29,40,24,16,38]\"}}]}\n", false, true},
++		{"error stream", "data: {\"error\":{\"message\":\"[32,8,24,29,40,24,16,38]\"}}\n", false, true},
++		{"completed responses stream", "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"error\":null,\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"[32,8,24,29,40,24,16,38]\"}]}]}}\n\n", true, false},
++		{"responses error without error object", "event: error\ndata: {\"type\":\"error\",\"message\":\"[32,8,24,29,40,24,16,38]\"}\n\n", false, true},
++		{"completed with final message event and empty output", "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"final_answer\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"[32,8,24,29,40,24,16,38]\"}]}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n", true, false},
++		{"final message without completed response", "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"[32,8,24,29,40,24,16,38]\"}]}}\n\n", false, true},
++		{"commentary cannot substitute final answer", "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"commentary\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"[32,8,24,29,40,24,16,38]\"}]}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n", false, true},
 +	} {
 +		t.Run(tc.name, func(t *testing.T) {
 +			answer, err := astraIQAnswer([]byte(tc.body))
@@ -855,7 +947,8 @@ index 00000000..1b69ab7c
 +				return
 +			}
 +			require.NoError(t, err)
-+			assert.Equal(t, tc.passed, astraIQAnswerPattern.MatchString(answer))
++			_, passed := gradeAstraIQAnswer(answer)
++			assert.Equal(t, tc.passed, passed)
 +		})
 +	}
 +}
@@ -873,7 +966,13 @@ index 00000000..1b69ab7c
 +	require.NoError(t, setAstraIQPrompt(response, astraIQQuestion))
 +	require.NotNil(t, response.Reasoning)
 +	assert.Equal(t, "medium", response.Reasoning.Effort)
-+	assert.NotContains(t, string(response.Input), "21")
++	assert.Contains(t, string(response.Input), "第 3 问")
++	assert.Contains(t, string(response.Input), "圆形 5 3 ? 4 8")
++	assert.Contains(t, string(response.Input), "全部葡萄味心形")
++	assert.NotContains(t, string(response.Input), "[32,8,24,29,40,24,16,38]")
++	for _, withheldAnswer := range []string{"29", "40", "38", "8R", "24R"} {
++		assert.NotContains(t, string(response.Input), withheldAnswer, "the prompt must not supply the answers")
++	}
 +}
 +
 +func TestCustomAstraIQDatabaseAndRouting(t *testing.T) {
@@ -964,7 +1063,7 @@ index 00000000..1b69ab7c
 +			for range 2 {
 +				require.NoError(t, db.AutoMigrate(&model.AstraIQResult{}))
 +			}
-+			require.NoError(t, model.SaveAstraIQResult(&channels[0], model.AstraIQResult{Status: "pass", CheckedAt: common.GetTimestamp(), Answer: "21"}))
++			require.NoError(t, model.SaveAstraIQResult(&channels[0], model.AstraIQResult{Status: "pass", CheckedAt: common.GetTimestamp(), Answer: "[32,8,24,29,40,24,16,38]"}))
 +			assert.True(t, model.AstraIQAllowsChannel(&channels[0], model.AstraIQModel))
 +			require.NoError(t, db.Migrator().DropTable(&model.AstraIQResult{}))
 +			require.NoError(t, db.AutoMigrate(&astraIQLegacyRow{}))
@@ -978,7 +1077,7 @@ index 00000000..1b69ab7c
 +			largeRows, err := model.GetAstraIQResults([]int{channels[0].Id})
 +			require.NoError(t, err)
 +			assert.Greater(t, len(largeRows[channels[0].Id].HistoryJSON), 65535, "detailed history must fit beyond MySQL TEXT capacity")
-+			require.NoError(t, model.SaveAstraIQResult(&channels[0], model.AstraIQResult{Status: "pass", CheckedAt: common.GetTimestamp(), Answer: "21"}))
++			require.NoError(t, model.SaveAstraIQResult(&channels[0], model.AstraIQResult{Status: "pass", CheckedAt: common.GetTimestamp(), Answer: "[32,8,24,29,40,24,16,38]"}))
 +			for range 2 {
 +				require.NoError(t, db.AutoMigrate(&model.AstraIQResult{}))
 +			}
@@ -1107,9 +1206,9 @@ index 00000000..1b69ab7c
 +				require.NoError(t, db.Where("channel_id = ?", 201).Delete(&model.AstraIQResult{}).Error)
 +				now := common.GetTimestamp()
 +				for _, result := range []model.AstraIQResult{
-+					{Status: "pass", CheckedAt: now - 30, Answer: "21"},
++					{Status: "pass", CheckedAt: now - 30, Answer: "[32,8,24,29,40,24,16,38]"},
 +					{Status: "fail", CheckedAt: now - 20, Answer: "29"},
-+					{Status: "pass", CheckedAt: now - 10, Answer: "21"},
++					{Status: "pass", CheckedAt: now - 10, Answer: "[32,8,24,29,40,24,16,38]"},
 +				} {
 +					require.NoError(t, model.SaveAstraIQResult(&channels[0], result))
 +				}
@@ -1147,7 +1246,7 @@ index 00000000..1b69ab7c
 +						assert.Empty(t, view.Answer)
 +					}
 +				}
-+				require.NoError(t, model.SaveAstraIQResult(&channels[0], model.AstraIQResult{Status: "pass", CheckedAt: now, Answer: "21"}))
++				require.NoError(t, model.SaveAstraIQResult(&channels[0], model.AstraIQResult{Status: "pass", CheckedAt: now, Answer: "[32,8,24,29,40,24,16,38]"}))
 +				rows, err := model.GetAstraIQResults([]int{201})
 +				require.NoError(t, err)
 +				assert.Len(t, model.AstraIQResultView(&channels[0], rows[201], model.DefaultAstraIQSettings()).History, 1, "new checks must not resurrect deleted history")
@@ -1188,7 +1287,7 @@ index 00000000..1b69ab7c
 +		assert.Equal(t, "medium", request.Reasoning.Effort)
 +		require.NotNil(t, request.Stream)
 +		assert.True(t, *request.Stream)
-+		assert.Contains(t, gjson.GetBytes(request.Input, "@tostr").String(), "最少取出多少个糖果")
++		assert.Contains(t, gjson.GetBytes(request.Input, "@tostr").String(), "第 3 问")
 +		seen = append(seen, r.Header.Get("Authorization"))
 +		if r.Header.Get("Authorization") == "Bearer blocked" {
 +			w.WriteHeader(http.StatusForbidden)
@@ -1205,9 +1304,9 @@ index 00000000..1b69ab7c
 +			fmt.Fprint(w, "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"rate_limit_error\",\"code\":\"usage_limit_reached\",\"message\":\"The usage limit has been reached. api_key=fixture-stream-secret\"}}}\n\n")
 +			return
 +		}
-+		answer := "21"
++		answer := "[32,8,24,29,40,24,16,38]"
 +		if r.Header.Get("Authorization") == "Bearer wrong" {
-+			answer = "22"
++			answer = "[32,8,24,29,40,24,16,37]"
 +		}
 +		w.Header().Set("Content-Type", "text/event-stream")
 +		fmt.Fprint(w, "data: {\"type\":\"response.created\",\"response\":{\"id\":\"test\",\"status\":\"in_progress\",\"output\":[]}}\n\n")
@@ -1222,10 +1321,10 @@ index 00000000..1b69ab7c
 +	ch := &model.Channel{Id: 901, Type: constant.ChannelTypeOpenAI, Key: "correct\nwrong", BaseURL: &upstream.URL, Models: model.AstraIQModel, Group: "default", Status: common.ChannelStatusEnabled, ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeySize: 2}}
 +	result := probeAstraIQChannel(context.Background(), ch, user.Id)
 +	assert.Equal(t, "fail", result.Status, result.Detail)
-+	assert.Equal(t, "22", result.Answer)
++	assert.Equal(t, "[32,8,24,29,40,24,16,37]", result.Answer)
 +	require.Len(t, result.Sample.Attempts, 2)
-+	assert.Equal(t, "21", result.Sample.Attempts[0].Response)
-+	assert.Equal(t, "22", result.Sample.Attempts[1].Response)
++	assert.Equal(t, "[32,8,24,29,40,24,16,38]", result.Sample.Attempts[0].Response)
++	assert.Equal(t, "[32,8,24,29,40,24,16,37]", result.Sample.Attempts[1].Response)
 +	require.NotNil(t, result.Sample.Attempts[0].PromptTokens)
 +	assert.Equal(t, 100, *result.Sample.Attempts[0].PromptTokens)
 +	assert.NotNil(t, result.Sample.Attempts[0].FirstTokenMS)
@@ -1301,7 +1400,7 @@ index 00000000..1b69ab7c
 +		assert.Empty(t, proxyResults)
 +	}
 +	for _, expectedStatus := range []int{http.StatusForbidden, http.StatusTooManyRequests} {
-+		r := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-6-astra","input":[{"role":"user","content":"最少取出多少个糖果"}],"reasoning":{"effort":"medium"},"stream":true}`))
++		r := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-6-astra","input":[{"role":"user","content":"第 3 问"}],"reasoning":{"effort":"medium"},"stream":true}`))
 +		r.Header.Set("Authorization", "Bearer one-time-test-key")
 +		r.Header.Set("User-Agent", "codex-test-boundary")
 +		r.Header.Set("originator", "test-boundary")
@@ -1346,7 +1445,7 @@ index 00000000..1b69ab7c
 +	ch := &model.Channel{Id: 908, Key: "private-key", Models: model.AstraIQModel}
 +	first := model.AstraIQResult{Status: "error", CheckedAt: 100, LatencyMS: 1234, Sample: model.AstraIQSample{Endpoint: "/v1/responses", Attempts: []model.AstraIQAttempt{{KeyIndex: 1, Status: "error", ErrorMessage: "The service is temporarily unavailable.", ErrorCode: "service_unavailable", ErrorType: "upstream_error", HTTPStatus: 200}}}}
 +	require.NoError(t, model.SaveAstraIQResult(ch, first))
-+	require.NoError(t, model.SaveAstraIQResult(ch, model.AstraIQResult{Status: "pass", CheckedAt: 200, Answer: "21"}))
++	require.NoError(t, model.SaveAstraIQResult(ch, model.AstraIQResult{Status: "pass", CheckedAt: 200, Answer: "[32,8,24,29,40,24,16,38]"}))
 +	rows, err := model.GetAstraIQResults([]int{ch.Id})
 +	require.NoError(t, err)
 +	assert.Empty(t, model.AstraIQResultView(ch, rows[ch.Id], model.DefaultAstraIQSettings()).History[0].Attempts, "polling endpoint must not carry all historical responses")
@@ -1365,9 +1464,18 @@ index 00000000..1b69ab7c
 +			assert.Equal(t, "The service is temporarily unavailable.", gjson.GetBytes(w.Body.Bytes(), "data.sample.attempts.0.error_message").String())
 +			assert.Equal(t, "service_unavailable", gjson.GetBytes(w.Body.Bytes(), "data.sample.attempts.0.error_code").String())
 +			assert.Equal(t, astraIQQuestion, gjson.GetBytes(w.Body.Bytes(), "data.question").String())
++			assert.Equal(t, astraIQExpectedSolution, gjson.GetBytes(w.Body.Bytes(), "data.expected_answer").String())
 +			assert.Equal(t, "medium", gjson.GetBytes(w.Body.Bytes(), "data.reasoning_effort").String())
 +		}
 +	}
++	oldResult := rows[ch.Id]
++	oldResult.Version, oldResult.Answer = "candy-21-medium-v1", "21"
++	view := model.AstraIQResultView(ch, oldResult, model.DefaultAstraIQSettings())
++	assert.Equal(t, "pending", view.Status)
++	assert.Empty(t, view.History, "the previous question's green segments must not appear for the new question")
++	assert.Empty(t, view.Answer)
++	assert.Zero(t, view.PassRate)
++	assert.True(t, view.Allowed, "a new question keeps the existing untested routing behavior")
 +}
 +
 +func TestCustomAstraIQDailySchedule(t *testing.T) {
@@ -1626,10 +1734,10 @@ index b86c442d..abf4fd1b 100644
  				return nil
 diff --git a/model/astra_iq.go b/model/astra_iq.go
 new file mode 100644
-index 00000000..c30e317d
+index 00000000..1850c180
 --- /dev/null
 +++ b/model/astra_iq.go
-@@ -0,0 +1,303 @@
+@@ -0,0 +1,307 @@
 +package model
 +
 +import (
@@ -1649,7 +1757,7 @@ index 00000000..c30e317d
 +const (
 +	AstraIQModel       = "gpt-6-astra"
 +	AstraIQClient      = "Codex CLI 0.157.1"
-+	AstraIQVersion     = "candy-21-medium-v1"
++	AstraIQVersion     = "candy-three-questions-medium-v2"
 +	AstraIQTaskType    = "astra_iq_test"
 +	AstraIQInterval    = 5 * time.Minute
 +	AstraIQHistorySize = 24
@@ -1911,6 +2019,10 @@ index 00000000..c30e317d
 +}
 +
 +func AstraIQResultView(ch *Channel, r AstraIQResult, settings AstraIQSettings) AstraIQView {
++	// A previous question's green history is not evidence for this question.
++	if r.Version != AstraIQVersion {
++		r = AstraIQResult{}
++	}
 +	view := AstraIQView{AstraIQResult: r, History: []AstraIQSample{}}
 +	view.ChannelID = ch.Id
 +	view.Allowed = r.Allows(ch, settings)
