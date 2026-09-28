@@ -3152,7 +3152,7 @@ index 00000000..33fa4fef
 +)
 diff --git a/web/src/features/channels/components/astra-iq-settings.tsx b/web/src/features/channels/components/astra-iq-settings.tsx
 new file mode 100644
-index 00000000..7840d2b1
+index 00000000..a0e6a5b9
 --- /dev/null
 +++ b/web/src/features/channels/components/astra-iq-settings.tsx
 @@ -0,0 +1,387 @@
@@ -3458,14 +3458,14 @@ index 00000000..7840d2b1
 +                </FormItem>
 +              )}
 +            />
-+            <div className='grid grid-cols-2 gap-4'>
++            <div className='grid grid-cols-1 gap-4 sm:grid-cols-2'>
 +              {(['start_time', 'end_time'] as const).map((name) => (
 +                <FormField
 +                  key={name}
 +                  control={form.control}
 +                  name={name}
 +                  render={({ field }) => (
-+                    <FormItem>
++                    <FormItem className='min-w-0'>
 +                      <FormLabel>
 +                        {name === 'start_time'
 +                          ? t('Check start time')
