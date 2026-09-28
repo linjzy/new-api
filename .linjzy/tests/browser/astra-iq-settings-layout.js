@@ -22,9 +22,13 @@ async function astraIQSettingsLayout(page) {
       )
       const layout = await dialog.evaluate((node) => {
         const rect = node.getBoundingClientRect()
+        const viewportWidth = document.documentElement.clientWidth
         const controls = ['start_time', 'end_time'].map((name) => {
           const input = node.querySelector(`input[name="${name}"]`)
           const box = input.getBoundingClientRect()
+          const field = input.closest('[data-slot="form-item"]')
+          const fieldBox = field.getBoundingClientRect()
+          const style = getComputedStyle(input)
           return {
             name,
             value: input.value,
@@ -34,9 +38,12 @@ async function astraIQSettingsLayout(page) {
             bottom: box.bottom,
             clientWidth: input.clientWidth,
             scrollWidth: input.scrollWidth,
+            fieldLeft: fieldBox.left,
+            fieldRight: fieldBox.right,
+            appearance: style.appearance,
           }
         })
-        return { left: rect.left, right: rect.right, controls }
+        return { left: rect.left, right: rect.right, viewportWidth, controls }
       })
       const [first, second] = layout.controls
       if (first.value !== '22:00' || second.value !== '06:30') {
@@ -56,9 +63,20 @@ async function astraIQSettingsLayout(page) {
         throw new Error(`${width}px: desktop time controls must share a row`)
       }
       for (const control of layout.controls) {
+        // iOS native time controls can ignore border-box width with padding:
+        // https://bugs.webkit.org/show_bug.cgi?id=301648
+        if (control.appearance !== 'none') {
+          throw new Error(
+            `${width}px: native time appearance can override CSS sizing`
+          )
+        }
         if (
+          control.left < 0 ||
+          control.right > layout.viewportWidth ||
           control.left < layout.left ||
           control.right > layout.right ||
+          control.left < control.fieldLeft ||
+          control.right > control.fieldRight ||
           control.scrollWidth > control.clientWidth
         ) {
           throw new Error(`${width}px: ${control.name} overflows its container`)

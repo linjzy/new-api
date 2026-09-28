@@ -3152,10 +3152,10 @@ index 00000000..33fa4fef
 +)
 diff --git a/web/src/features/channels/components/astra-iq-settings.tsx b/web/src/features/channels/components/astra-iq-settings.tsx
 new file mode 100644
-index 00000000..a0e6a5b9
+index 00000000..7a21effd
 --- /dev/null
 +++ b/web/src/features/channels/components/astra-iq-settings.tsx
-@@ -0,0 +1,387 @@
+@@ -0,0 +1,389 @@
 +/*
 +Copyright (C) 2023-2026 QuantumNous
 +
@@ -3458,14 +3458,15 @@ index 00000000..a0e6a5b9
 +                </FormItem>
 +              )}
 +            />
-+            <div className='grid grid-cols-1 gap-4 sm:grid-cols-2'>
++            {/* iOS time controls can overrun width: 100% when padded. */}
++            <div className='grid min-w-0 grid-cols-1 gap-4 sm:grid-cols-2'>
 +              {(['start_time', 'end_time'] as const).map((name) => (
 +                <FormField
 +                  key={name}
 +                  control={form.control}
 +                  name={name}
 +                  render={({ field }) => (
-+                    <FormItem className='min-w-0'>
++                    <FormItem className='min-w-0 grid-cols-1'>
 +                      <FormLabel>
 +                        {name === 'start_time'
 +                          ? t('Check start time')
@@ -3475,6 +3476,7 @@ index 00000000..a0e6a5b9
 +                        <Input
 +                          {...field}
 +                          type='time'
++                          className='w-auto max-w-full appearance-none justify-self-stretch'
 +                          step={60}
 +                          disabled={props.disabled}
 +                        />
