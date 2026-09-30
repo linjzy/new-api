@@ -336,6 +336,8 @@ func migrateDB() error {
 
 	err := DB.AutoMigrate(
 		&Channel{},
+		&AstraIQResult{},
+		&AstraIQModelRun{},
 		&Token{},
 		&User{},
 		&UserSession{},
@@ -372,6 +374,9 @@ func migrateDB() error {
 		&AuthzRole{},
 	)
 	if err != nil {
+		return err
+	}
+	if err := MigrateAstraIQResults(DB); err != nil {
 		return err
 	}
 	if err := InitializeUserAuthVersions(); err != nil {

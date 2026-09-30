@@ -35,6 +35,13 @@ import type {
 // Generic API Helpers
 // ============================================================================
 
+// Log queries own their error toast and stop auto-refresh on failure. Keep
+// authentication refresh/redirect behavior in the shared client unchanged.
+const logRequestConfig = {
+  skipBusinessError: true,
+  skipErrorHandler: true,
+} satisfies ApiRequestConfig
+
 function buildApiPath(endpoint: string, isAdmin: boolean): string {
   return isAdmin ? endpoint : `${endpoint}/self`
 }
@@ -51,7 +58,7 @@ async function fetchLogs<T>(
     ...params,
   })
   const path = buildApiPath(endpoint, isAdmin)
-  const res = await api.get(`${path}?${queryParams}`)
+  const res = await api.get(`${path}?${queryParams}`, logRequestConfig)
   return res.data
 }
 
@@ -64,7 +71,7 @@ async function fetchLogStats<T>(
     params as unknown as Record<string, unknown>
   )
   const path = buildApiPath(endpoint, isAdmin)
-  const res = await api.get(`${path}/stat?${queryParams}`)
+  const res = await api.get(`${path}/stat?${queryParams}`, logRequestConfig)
   return res.data
 }
 

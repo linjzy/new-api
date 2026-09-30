@@ -193,6 +193,9 @@ type RelayInfo struct {
 	FinalRequestRelayFormat types.RelayFormat
 
 	StreamStatus *StreamStatus
+	// Distinguishes a protocol failure from a successful HTTP 200 for affinity.
+	ResponsesStreamError     *types.NewAPIError
+	ResponsesCapacityFailure bool
 	// PerformanceOutputTokens is captured by settlement and sampled once at
 	// the request boundary, independently of billing success or failure.
 	PerformanceOutputTokens      int64

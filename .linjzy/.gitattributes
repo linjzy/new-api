@@ -1,0 +1,2 @@
+# Empty diff context lines contain one space; validate the applied source too.
+patches/*.patch whitespace=-blank-at-eol,-space-before-tab

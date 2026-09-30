@@ -51,6 +51,31 @@ func TestChannelStatusRoutesRegisterWithoutConflict(t *testing.T) {
 	})
 }
 
+func TestCustomAstraIQDeletionRequiresWritePermission(t *testing.T) {
+	for _, path := range []string{"/astra_iq/:id", "/astra_iq/:id/:checked_at"} {
+		assertChannelRoutePermission(t, http.MethodDelete, path, authz.ChannelWrite, controller.DeleteAstraIQResults)
+	}
+	engine := gin.New()
+	registerChannelRoutes(engine.Group("/api"))
+	for _, path := range []string{"/api/channel/astra_iq/201", "/api/channel/astra_iq/201/100"} {
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, path, nil))
+		assert.Equal(t, http.StatusUnauthorized, w.Code)
+	}
+}
+
+func TestCustomAstraIQSettingsRequireChannelPermissions(t *testing.T) {
+	assertChannelRoutePermission(t, http.MethodGet, "/astra_iq/settings", authz.ChannelRead, controller.GetAstraIQSettings)
+	assertChannelRoutePermission(t, http.MethodPut, "/astra_iq/settings", authz.ChannelWrite, controller.UpdateAstraIQSettings)
+	engine := gin.New()
+	registerChannelRoutes(engine.Group("/api"))
+	for _, method := range []string{http.MethodGet, http.MethodPut} {
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, httptest.NewRequest(method, "/api/channel/astra_iq/settings", nil))
+		assert.Equal(t, http.StatusUnauthorized, w.Code)
+	}
+}
+
 func assertChannelRoutePermission(t *testing.T, method string, path string, permission authz.Permission, handler any) {
 	t.Helper()
 	for _, route := range channelPermissionRoutes {
