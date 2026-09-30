@@ -2,8 +2,8 @@
 // dialog open and checks enabled. Edits are restored; settings are never saved.
 async function astraIQSettingsLayout(page) {
   const dialog = page.getByRole('dialog')
-  const start = dialog.locator('input[name="start_time"]')
-  const end = dialog.locator('input[name="end_time"]')
+  const start = dialog.locator('input[name$="start_time"]')
+  const end = dialog.locator('input[name$="end_time"]')
   await start.waitFor({ state: 'visible' })
   const viewport = page.viewportSize()
   const original = [await start.inputValue(), await end.inputValue()]
@@ -24,7 +24,7 @@ async function astraIQSettingsLayout(page) {
         const rect = node.getBoundingClientRect()
         const viewportWidth = document.documentElement.clientWidth
         const controls = ['start_time', 'end_time'].map((name) => {
-          const input = node.querySelector(`input[name="${name}"]`)
+          const input = node.querySelector(`input[name$="${name}"]`)
           const box = input.getBoundingClientRect()
           const field = input.closest('[data-slot="form-item"]')
           const fieldBox = field.getBoundingClientRect()
