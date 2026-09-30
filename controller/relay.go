@@ -90,6 +90,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if newAPIError != nil {
 			service.RecordRequestPolicyTermination(c, newAPIError)
 			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
+			// The upstream SSE failure has already been sent. Appending JSON
+			// would corrupt the stream, and its HTTP status cannot be replaced.
+			if common.GetContextKeyBool(c, constant.ContextKeyResponsesStreamFailed) && c.Writer.Written() {
+				return
+			}
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:
@@ -162,6 +167,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		relayInfo.RetryIndex = retryParam.GetRetry()
 		channel, channelErr := getChannel(c, relayInfo, retryParam)
 		if channelErr != nil {
+			// A capacity retry that finds no further channel reports the original
+			// capacity error instead of the exhausted-candidate error.
+			if relayInfo.LastError != nil && common.GetContextKeyBool(c, constant.ContextKeyResponsesCapacityRetried) {
+				newAPIError = relayInfo.LastError
+				break
+			}
 			logger.LogError(c, channelErr.Error())
 			newAPIError = channelErr
 			break
@@ -198,15 +209,25 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if newAPIError == nil {
 			service.MarkRequestPolicySuccess(c, relayInfo.StreamStatus)
 			relayInfo.LastError = nil
+			common.SetContextKey(c, constant.ContextKeyResponsesStreamFailed, false)
 			return
 		}
 
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
 		relayInfo.LastError = newAPIError
+		if relayInfo.ResponsesCapacityFailure {
+			common.SetContextKey(c, constant.ContextKeyResponsesCapacityRetried, true)
+		}
 
 		decision := service.DecideRelayRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry())
 		service.RecordPolicyFailure(c, channel.Id, newAPIError, decision)
 		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError, relayInfo)
+
+		// Channel failover must stop once the response is committed or the
+		// client has cancelled the request.
+		if c.Writer.Written() || (c.Request != nil && c.Request.Context().Err() != nil) {
+			break
+		}
 
 		if decision.Action != "retry" {
 			break

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -31,10 +32,11 @@ func withSystemTaskRegistry(t *testing.T, handlers ...SystemTaskHandler) {
 }
 
 type stubScheduledHandler struct {
-	taskType string
-	enabled  bool
-	interval time.Duration
-	onRun    func(ctx context.Context, task *model.SystemTask, runnerID string)
+	taskType  string
+	enabled   bool
+	interval  time.Duration
+	fromStart bool
+	onRun     func(ctx context.Context, task *model.SystemTask, runnerID string)
 }
 
 type stubSystemTaskRunResult struct {
@@ -54,6 +56,70 @@ func (h *stubScheduledHandler) Run(ctx context.Context, task *model.SystemTask, 
 func (h *stubScheduledHandler) Enabled() bool           { return h.enabled }
 func (h *stubScheduledHandler) Interval() time.Duration { return h.interval }
 func (h *stubScheduledHandler) NewPayload() any         { return nil }
+func (h *stubScheduledHandler) ScheduleFromStart() bool { return h.fromStart }
+
+func TestCustomAstraIQSchedulerIncludesProbeDuration(t *testing.T) {
+	for _, fromStart := range []bool{false, true} {
+		t.Run(map[bool]string{false: "existing completion cadence", true: "IQ start cadence"}[fromStart], func(t *testing.T) {
+			truncate(t)
+			handler := &stubScheduledHandler{taskType: model.AstraIQTaskType, enabled: true, interval: model.AstraIQInterval, fromStart: fromStart}
+			withSystemTaskRegistry(t, handler)
+			task, err := model.CreateSystemTask(handler.taskType, nil, nil)
+			require.NoError(t, err)
+			_, claimed, err := model.ClaimSystemTask(task.ID, handler.taskType, "iq-runner", common.GetTimestamp()+60)
+			require.NoError(t, err)
+			require.True(t, claimed)
+			require.NoError(t, model.FinishSystemTask(task.TaskID, "iq-runner", model.SystemTaskStatusSucceeded, nil, ""))
+			require.NoError(t, model.DB.Model(&model.SystemTask{}).Where("id = ?", task.ID).Update("created_at", common.GetTimestamp()-int64(model.AstraIQInterval.Seconds())).Error)
+			runSystemTaskScheduler()
+			expected := int64(1)
+			if fromStart {
+				expected = 2
+			}
+			assert.Equal(t, expected, countSystemTasks(t, handler.taskType))
+			runSystemTaskScheduler()
+			assert.Equal(t, expected, countSystemTasks(t, handler.taskType), "never overlap active probes")
+		})
+	}
+}
+
+type stubWindowHandler struct {
+	stubScheduledHandler
+	due bool
+	err error
+}
+
+func (h *stubWindowHandler) ScheduleDue(now, lastRun int64) (bool, error) {
+	return h.due, h.err
+}
+
+func TestCustomAstraIQSchedulerHonorsWindowForFirstAndLaterRuns(t *testing.T) {
+	truncate(t)
+	handler := &stubWindowHandler{stubScheduledHandler: stubScheduledHandler{taskType: model.AstraIQTaskType, enabled: true, interval: 24 * time.Hour, fromStart: true}}
+	withSystemTaskRegistry(t, handler)
+	runSystemTaskScheduler()
+	assert.Zero(t, countSystemTasks(t, handler.taskType), "no first run outside the window")
+	handler.due, handler.err = true, errors.New("settings unavailable")
+	runSystemTaskScheduler()
+	assert.Zero(t, countSystemTasks(t, handler.taskType), "configuration errors must not launch probes")
+	handler.err = nil
+	runSystemTaskScheduler()
+	require.Equal(t, int64(1), countSystemTasks(t, handler.taskType))
+	runSystemTaskScheduler()
+	assert.Equal(t, int64(1), countSystemTasks(t, handler.taskType), "active runs remain deduplicated")
+	task, err := model.GetLatestSystemTask(handler.taskType)
+	require.NoError(t, err)
+	_, claimed, err := model.ClaimSystemTask(task.ID, task.Type, "window-runner", common.GetTimestamp()+60)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.NoError(t, model.FinishSystemTask(task.TaskID, "window-runner", model.SystemTaskStatusSucceeded, nil, ""))
+	handler.due = false
+	runSystemTaskScheduler()
+	assert.Equal(t, int64(1), countSystemTasks(t, handler.taskType))
+	handler.due = true
+	runSystemTaskScheduler()
+	assert.Equal(t, int64(2), countSystemTasks(t, handler.taskType), "reopening a daily window can override the default interval")
+}
 
 func countSystemTasks(t *testing.T, taskType string) int64 {
 	t.Helper()
