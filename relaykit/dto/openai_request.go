@@ -109,6 +109,25 @@ type GeneralOpenAIRequest struct {
 	ReasoningSplit json.RawMessage `json:"reasoning_split,omitempty"`
 	// vLLM
 	ThinkingTokenBudget json.RawMessage `json:"thinking_token_budget,omitempty"`
+	IncludeReasoning    json.RawMessage `json:"include_reasoning,omitempty"`
+	MinP                json.RawMessage `json:"min_p,omitempty"`
+	RepetitionPenalty   json.RawMessage `json:"repetition_penalty,omitempty"`
+	StructuredOutputs   json.RawMessage `json:"structured_outputs,omitempty"`
+	ReturnTokenIds      json.RawMessage `json:"return_token_ids,omitempty"`
+	// SGLang OpenAI-compatible sampling and reasoning controls (v0.5.19).
+	// Native /generate sampling_params and server routing controls are not chat fields.
+	MinTokens            *uint           `json:"min_tokens,omitempty"`
+	SeparateReasoning    json.RawMessage `json:"separate_reasoning,omitempty"`
+	StreamReasoning      json.RawMessage `json:"stream_reasoning,omitempty"`
+	Regex                json.RawMessage `json:"regex,omitempty"`
+	EBNF                 json.RawMessage `json:"ebnf,omitempty"`
+	StopTokenIDs         json.RawMessage `json:"stop_token_ids,omitempty"`
+	StopRegex            json.RawMessage `json:"stop_regex,omitempty"`
+	NoStopTrim           json.RawMessage `json:"no_stop_trim,omitempty"`
+	IgnoreEOS            json.RawMessage `json:"ignore_eos,omitempty"`
+	SkipSpecialTokens    json.RawMessage `json:"skip_special_tokens,omitempty"`
+	ContinueFinalMessage json.RawMessage `json:"continue_final_message,omitempty"`
+	CacheSalt            json.RawMessage `json:"cache_salt,omitempty"`
 
 	// Internal conversion state; never serialized to an upstream protocol.
 	ReasoningConversion *ReasoningConversionState `json:"-"`
@@ -369,7 +388,7 @@ const CustomType = "custom"
 type ToolCallRequest struct {
 	ID       string          `json:"id,omitempty"`
 	Type     string          `json:"type"`
-	Function FunctionRequest `json:"function,omitempty"`
+	Function FunctionRequest `json:"function"`
 	Custom   json.RawMessage `json:"custom,omitempty"`
 }
 
@@ -386,6 +405,9 @@ type StreamOptions struct {
 	// IncludeObfuscation is only for /v1/responses stream payload.
 	// This field is filtered by default and can be enabled via channel setting allow_include_obfuscation.
 	IncludeObfuscation bool `json:"include_obfuscation,omitempty"`
+	// ContinuousUsageStats is a vLLM stream_options extension that emits
+	// usage on intermediate chunks. Optional so an explicit false is kept.
+	// ContinuousUsageStats *bool `json:"continuous_usage_stats,omitempty"`
 }
 
 func (r *GeneralOpenAIRequest) GetMaxTokens() uint {
@@ -620,7 +642,7 @@ func (m *Message) StringContent() string {
 	case string:
 		return m.Content.(string)
 	case []any:
-		var contentStr string
+		var contentStr strings.Builder
 		for _, contentItem := range m.Content.([]any) {
 			contentMap, ok := contentItem.(map[string]any)
 			if !ok {
@@ -628,11 +650,11 @@ func (m *Message) StringContent() string {
 			}
 			if contentMap["type"] == ContentTypeText {
 				if subStr, ok := contentMap["text"].(string); ok {
-					contentStr += subStr
+					contentStr.WriteString(subStr)
 				}
 			}
 		}
-		return contentStr
+		return contentStr.String()
 	}
 
 	return ""
@@ -727,7 +749,7 @@ func (m *Message) ParseContent() []MediaContent {
 			switch v := imageUrl.(type) {
 			case string:
 				temp.Url = v
-			case map[string]interface{}:
+			case map[string]any:
 				url, ok1 := v["url"].(string)
 				detail, ok2 := v["detail"].(string)
 				if ok2 {
@@ -743,7 +765,7 @@ func (m *Message) ParseContent() []MediaContent {
 			})
 
 		case ContentTypeInputAudio:
-			if audioData, ok := contentItem["input_audio"].(map[string]interface{}); ok {
+			if audioData, ok := contentItem["input_audio"].(map[string]any); ok {
 				data, ok1 := audioData["data"].(string)
 				format, ok2 := audioData["format"].(string)
 				if ok1 && ok2 {
@@ -758,7 +780,7 @@ func (m *Message) ParseContent() []MediaContent {
 				}
 			}
 		case ContentTypeFile:
-			if fileData, ok := contentItem["file"].(map[string]interface{}); ok {
+			if fileData, ok := contentItem["file"].(map[string]any); ok {
 				fileId, ok3 := fileData["file_id"].(string)
 				if ok3 {
 					contentList = append(contentList, MediaContent{
@@ -1029,6 +1051,14 @@ type OpenAIResponsesRequest struct {
 	// qwen
 	EnableThinking json.RawMessage `json:"enable_thinking,omitempty"`
 	ThinkingBudget json.RawMessage `json:"thinking_budget,omitempty"`
+	// vLLM
+	ChatTemplateKwargs json.RawMessage `json:"chat_template_kwargs,omitempty"`
+	// SGLang Responses sampling extensions.
+	TopK              json.RawMessage `json:"top_k,omitempty"`
+	MinP              json.RawMessage `json:"min_p,omitempty"`
+	RepetitionPenalty json.RawMessage `json:"repetition_penalty,omitempty"`
+	Stop              json.RawMessage `json:"stop,omitempty"`
+	CacheSalt         json.RawMessage `json:"cache_salt,omitempty"`
 	// perplexity
 	Preset json.RawMessage `json:"preset,omitempty"`
 

@@ -92,8 +92,8 @@ type User struct {
 	WeChatId             string                     `json:"wechat_id" gorm:"column:wechat_id;index"`
 	TelegramId           string                     `json:"telegram_id" gorm:"column:telegram_id;index"`
 	VerificationCode     string                     `json:"verification_code" gorm:"-:all"`                         // this field is only for Email verification, don't save it to database!
-	AccessToken          *string                    `json:"-" gorm:"type:char(32);column:access_token;uniqueIndex"` // this token is for system management
-	AccessTokenCreatedAt *int64                     `json:"-" gorm:"type:bigint;column:access_token_created_at"`
+	AccessToken          *string                    `json:"-" gorm:"type:char(32);column:access_token;uniqueIndex"` // Deprecated: 旧版面板访问令牌，仅在升级后的过渡期内使用；删除 users.access_token 列时一并移除。
+	AccessTokenCreatedAt *int64                     `json:"-" gorm:"type:bigint;column:access_token_created_at"`    // Deprecated: 旧版面板访问令牌，仅在升级后的过渡期内使用；删除 users.access_token 列时一并移除。
 	Quota                int                        `json:"quota" gorm:"type:int;default:0"`
 	UsedQuota            int                        `json:"used_quota" gorm:"type:int;default:0;column:used_quota"` // used quota
 	RequestCount         int                        `json:"request_count" gorm:"type:int;default:0;"`               // request number
@@ -130,6 +130,7 @@ func (user *User) ToBaseUser() *UserBase {
 	return cache
 }
 
+// Deprecated: 旧版面板访问令牌，仅在升级后的过渡期内使用；删除 users.access_token 列时一并移除。
 func (user *User) GetAccessToken() string {
 	if user.AccessToken == nil {
 		return ""
@@ -137,29 +138,14 @@ func (user *User) GetAccessToken() string {
 	return *user.AccessToken
 }
 
+// Deprecated: 旧版面板访问令牌，仅在升级后的过渡期内使用；删除 users.access_token 列时一并移除。
 func (user *User) SetAccessToken(token string) {
 	user.AccessToken = &token
 }
 
-// UpdateUserAccessToken rotates a dashboard personal access token without
-// writing a stale user snapshot back over concurrently updated fields.
-func UpdateUserAccessToken(id int, token string) error {
-	if id == 0 {
-		return errors.New("id 为空！")
-	}
-	result := DB.Model(&User{}).Where("id = ?", id).Updates(map[string]interface{}{
-		"access_token": token, "access_token_created_at": common.GetTimestamp(),
-	})
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
-	}
-	return nil
-}
-
 // RevokeUserAccessToken returns the generation actually revoked under the row lock.
+//
+// Deprecated: 旧版面板访问令牌，仅在升级后的过渡期内使用；删除 users.access_token 列时一并移除。
 func RevokeUserAccessToken(id int) (string, error) {
 	var tokenRef string
 	err := DB.Transaction(func(tx *gorm.DB) error {
@@ -171,7 +157,7 @@ func RevokeUserAccessToken(id int) (string, error) {
 		if tokenRef == "" {
 			return nil
 		}
-		return tx.Model(&User{}).Where("id = ?", id).Updates(map[string]interface{}{"access_token": nil, "access_token_created_at": nil}).Error
+		return tx.Model(&User{}).Where("id = ?", id).Updates(map[string]any{"access_token": nil, "access_token_created_at": nil}).Error
 	})
 	return tokenRef, err
 }
@@ -237,17 +223,17 @@ func UpdateUserBindColumn(userId int, column string, value string) error {
 
 // 根据用户角色生成默认的边栏配置
 func generateDefaultSidebarConfigForRole(userRole int) string {
-	defaultConfig := map[string]interface{}{}
+	defaultConfig := map[string]any{}
 
 	// 聊天区域 - 所有用户都可以访问
-	defaultConfig["chat"] = map[string]interface{}{
+	defaultConfig["chat"] = map[string]any{
 		"enabled":    true,
 		"playground": true,
 		"chat":       true,
 	}
 
 	// 控制台区域 - 所有用户都可以访问
-	defaultConfig["console"] = map[string]interface{}{
+	defaultConfig["console"] = map[string]any{
 		"enabled":    true,
 		"detail":     true,
 		"token":      true,
@@ -257,7 +243,7 @@ func generateDefaultSidebarConfigForRole(userRole int) string {
 	}
 
 	// 个人中心区域 - 所有用户都可以访问
-	defaultConfig["personal"] = map[string]interface{}{
+	defaultConfig["personal"] = map[string]any{
 		"enabled":  true,
 		"topup":    true,
 		"personal": true,
@@ -266,7 +252,7 @@ func generateDefaultSidebarConfigForRole(userRole int) string {
 	// 管理员区域 - 根据角色决定
 	if userRole == common.RoleAdminUser {
 		// 管理员可以访问管理员区域，但不能访问系统设置
-		defaultConfig["admin"] = map[string]interface{}{
+		defaultConfig["admin"] = map[string]any{
 			"enabled":    true,
 			"channel":    true,
 			"models":     true,
@@ -276,7 +262,7 @@ func generateDefaultSidebarConfigForRole(userRole int) string {
 		}
 	} else if userRole == common.RoleRootUser {
 		// 超级管理员可以访问所有功能
-		defaultConfig["admin"] = map[string]interface{}{
+		defaultConfig["admin"] = map[string]any{
 			"enabled":    true,
 			"channel":    true,
 			"models":     true,
@@ -470,14 +456,14 @@ func SearchUsers(keyword string, group string, role *int, status *int, startIdx 
 
 	// 构建搜索条件
 	likeCondition := "username LIKE ? OR email LIKE ? OR display_name LIKE ?"
-	likeArgs := []interface{}{"%" + keyword + "%", "%" + keyword + "%", "%" + keyword + "%"}
+	likeArgs := []any{"%" + keyword + "%", "%" + keyword + "%", "%" + keyword + "%"}
 
 	// 尝试将关键字转换为整数ID
 	keywordInt, err := strconv.Atoi(keyword)
 	if err == nil {
 		// 如果是数字，同时搜索ID和其他字段
 		likeCondition = "id = ? OR " + likeCondition
-		likeArgs = append([]interface{}{keywordInt}, likeArgs...)
+		likeArgs = append([]any{keywordInt}, likeArgs...)
 	}
 
 	query = query.Where("("+likeCondition+")", likeArgs...)
@@ -563,24 +549,28 @@ func GetUserIdByAffCode(affCode string) (int, error) {
 	return user.Id, err
 }
 
-func DeleteUserById(id int) (err error) {
+// DeleteUserById soft-deletes a user and returns how many scoped access tokens
+// were deleted with it.
+func DeleteUserById(id int) (int64, error) {
 	if id == 0 {
-		return errors.New("id 为空！")
+		return 0, errors.New("id 为空！")
 	}
 	user := User{Id: id}
 	return user.Delete()
 }
 
-func HardDeleteUserById(id int) error {
+// HardDeleteUserById permanently deletes a user and returns how many scoped
+// access tokens were deleted with it.
+func HardDeleteUserById(id int) (int64, error) {
 	if id == 0 {
-		return errors.New("id 为空！")
+		return 0, errors.New("id 为空！")
 	}
 	user := User{Id: id}
 	return user.HardDelete()
 }
 
 func inviteUser(inviterId int) error {
-	result := DB.Model(&User{}).Where("id = ?", inviterId).Updates(map[string]interface{}{
+	result := DB.Model(&User{}).Where("id = ?", inviterId).Updates(map[string]any{
 		"aff_count":   gorm.Expr("aff_count + ?", 1),
 		"aff_quota":   gorm.Expr("aff_quota + ?", common.QuotaForInviter),
 		"aff_history": gorm.Expr("aff_history + ?", common.QuotaForInviter),
@@ -887,7 +877,7 @@ func (user *User) EditWithTx(tx *gorm.DB, updatePassword bool) error {
 	}
 
 	newUser := *user
-	updates := map[string]interface{}{
+	updates := map[string]any{
 		"username":     newUser.Username,
 		"display_name": newUser.DisplayName,
 		"group":        newUser.Group,
@@ -953,20 +943,21 @@ func (user *User) ClearBinding(bindingType string) error {
 	return updateUserCache(*user)
 }
 
-func (user *User) Delete() error {
+func (user *User) Delete() (int64, error) {
 	return user.delete(nil)
 }
 
-func DeleteUserForSession(identity AuthSessionIdentity) error {
+func DeleteUserForSession(identity AuthSessionIdentity) (int64, error) {
 	user := User{Id: identity.UserID}
 	return user.delete(&identity)
 }
 
-func (user *User) delete(identity *AuthSessionIdentity) error {
+func (user *User) delete(identity *AuthSessionIdentity) (int64, error) {
 	if user.Id == 0 {
-		return errors.New("id 为空！")
+		return 0, errors.New("id 为空！")
 	}
 	var nextAuthVersion int64
+	var revokedAccessTokens int64
 	if err := DB.Transaction(func(tx *gorm.DB) error {
 		if identity != nil {
 			if err := ValidateAuthSessionWithTx(tx, *identity); err != nil {
@@ -985,28 +976,37 @@ func (user *User) delete(identity *AuthSessionIdentity) error {
 		if err != nil {
 			return err
 		}
+		revokedAccessTokens, err = DeleteUserAccessTokensWithTx(tx, user.Id)
+		if err != nil {
+			return err
+		}
 		return tx.Delete(user).Error
 	}); err != nil {
-		return err
+		return 0, err
 	}
 	if err := publishCommittedUserAuthVersion(user.Id, nextAuthVersion); err != nil {
-		return err
+		return revokedAccessTokens, err
 	}
 	if _, err := RevokeAllUserSessions(user.Id, "user_deleted"); err != nil {
-		return err
+		return revokedAccessTokens, err
 	}
-	return invalidateUserCache(user.Id)
+	return revokedAccessTokens, invalidateUserCache(user.Id)
 }
 
-func (user *User) HardDelete() error {
+func (user *User) HardDelete() (int64, error) {
 	if user.Id == 0 {
-		return errors.New("id 为空！")
+		return 0, errors.New("id 为空！")
 	}
 	var tokens []Token
 	var deletedAuthVersion int64
+	var revokedAccessTokens int64
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		var err error
 		deletedAuthVersion, err = IncrementUserAuthVersionWithTx(tx, user.Id)
+		if err != nil {
+			return err
+		}
+		revokedAccessTokens, err = DeleteUserAccessTokensWithTx(tx, user.Id)
 		if err != nil {
 			return err
 		}
@@ -1021,7 +1021,7 @@ func (user *User) HardDelete() error {
 		return tx.Unscoped().Delete(user).Error
 	})
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if err := publishCommittedUserAuthVersion(user.Id, deletedAuthVersion); err != nil {
 		common.SysError(fmt.Sprintf("failed to publish auth tombstone after hard deleting user %d: %v", user.Id, err))
@@ -1032,7 +1032,7 @@ func (user *User) HardDelete() error {
 	if err := invalidateUserCache(user.Id); err != nil {
 		common.SysError(fmt.Sprintf("failed to invalidate user cache after hard deleting user %d: %v", user.Id, err))
 	}
-	return nil
+	return revokedAccessTokens, nil
 }
 
 func deleteUserAuthenticationData(tx *gorm.DB, userId int) error {
@@ -1104,14 +1104,6 @@ func (user *User) FillUserByGitHubId() error {
 	}
 	DB.Where(User{GitHubId: user.GitHubId}).First(user)
 	return nil
-}
-
-// UpdateGitHubId updates the user's GitHub ID (used for migration from login to numeric ID)
-func (user *User) UpdateGitHubId(newGitHubId string) error {
-	if user.Id == 0 {
-		return errors.New("user id is empty")
-	}
-	return DB.Model(user).Update("github_id", newGitHubId).Error
 }
 
 func (user *User) FillUserByDiscordId() error {
@@ -1233,9 +1225,16 @@ func IsAdmin(userId int) bool {
 	return user.Role >= common.RoleAdminUser
 }
 
+// ValidateAccessToken resolves a legacy plaintext access token. After the
+// transition deadline it rejects every value without querying the database.
+//
+// Deprecated: 旧版面板访问令牌，仅在升级后的过渡期内使用；删除 users.access_token 列时一并移除。
 func ValidateAccessToken(token string) (*User, error) {
 	if token == "" {
 		return nil, nil
+	}
+	if LegacyAccessTokensRetired(common.GetTimestamp()) {
+		return nil, ErrLegacyAccessTokenRetired
 	}
 	token = strings.Replace(token, "Bearer ", "", 1)
 	user := &User{}
@@ -1459,7 +1458,7 @@ func UpdateUserUsedQuota(id int, quota int) {
 
 func updateUserUsedQuotaAndRequestCount(id int, quota int, count int) {
 	err := DB.Model(&User{}).Where("id = ?", id).Updates(
-		map[string]interface{}{
+		map[string]any{
 			"used_quota":    gorm.Expr("used_quota + ?", quota),
 			"request_count": gorm.Expr("request_count + ?", count),
 		},
@@ -1481,7 +1480,7 @@ func updateUserQuotaUsedQuotaAndRequestCount(id int, quota int, usedQuota int, r
 	}
 
 	err := DB.Model(&User{}).Where("id = ?", id).Updates(
-		map[string]interface{}{
+		map[string]any{
 			"quota":         gorm.Expr("quota + ?", quota),
 			"used_quota":    gorm.Expr("used_quota + ?", usedQuota),
 			"request_count": gorm.Expr("request_count + ?", requestCount),

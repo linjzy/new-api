@@ -205,7 +205,7 @@ func TestConvertResponseDirectAndMultiHopConverters(t *testing.T) {
 	assert.Equal(t, "text", claudeValue.Content[0].Type)
 	assert.Equal(t, "tool_use", claudeValue.Content[1].Type)
 	assert.Equal(t, "lookup", claudeValue.Content[1].Name)
-	assert.Equal(t, map[string]interface{}{"q": "x"}, claudeValue.Content[1].Input)
+	assert.Equal(t, map[string]any{"q": "x"}, claudeValue.Content[1].Input)
 	assert.Equal(t, 11, toClaude.Usage.TotalTokens)
 
 	toGemini, err := ConvertResponse(nil, &convmeta.Values{ChannelMetaAttached: true, UpstreamModelName: "gemini-test"}, types.RelayFormatGemini, responses)
@@ -223,7 +223,7 @@ func TestConvertResponseDirectAndMultiHopConverters(t *testing.T) {
 	assert.Equal(t, "hello", geminiValue.Candidates[0].Content.Parts[0].Text)
 	require.NotNil(t, geminiValue.Candidates[0].Content.Parts[1].FunctionCall)
 	assert.Equal(t, "lookup", geminiValue.Candidates[0].Content.Parts[1].FunctionCall.FunctionName)
-	assert.Equal(t, map[string]interface{}{"q": "x"}, geminiValue.Candidates[0].Content.Parts[1].FunctionCall.Arguments)
+	assert.Equal(t, map[string]any{"q": "x"}, geminiValue.Candidates[0].Content.Parts[1].FunctionCall.Arguments)
 	assert.Equal(t, 11, toGemini.Usage.TotalTokens)
 }
 
@@ -284,7 +284,7 @@ func TestConvertResponseProviderToOAIChatUsage(t *testing.T) {
 		Model:      "claude-test",
 		StopReason: "end_turn",
 		Content: []dto.ClaudeMediaMessage{
-			{Type: "tool_use", Id: "toolu_1", Name: "lookup", Input: map[string]interface{}{"q": "x"}},
+			{Type: "tool_use", Id: "toolu_1", Name: "lookup", Input: map[string]any{"q": "x"}},
 		},
 		Usage: &dto.ClaudeUsage{
 			InputTokens:              10,
@@ -326,7 +326,7 @@ func TestConvertResponseProviderToOAIChatUsage(t *testing.T) {
 				Content: dto.GeminiChatContent{
 					Parts: []dto.GeminiPart{
 						{Text: "hello"},
-						{FunctionCall: &dto.FunctionCall{FunctionName: "lookup", Arguments: map[string]interface{}{"q": "x"}}},
+						{FunctionCall: &dto.FunctionCall{FunctionName: "lookup", Arguments: map[string]any{"q": "x"}}},
 					},
 				},
 			},
@@ -698,4 +698,42 @@ func textRegistryResponsesResponse() *dto.OpenAIResponsesResponse {
 
 func respPtr[T any](value T) *T {
 	return &value
+}
+
+func TestConvertChatResponseToResponsesRestoresRecordedCustomTools(t *testing.T) {
+	info := &convmeta.Values{ResponsesTools: &convmeta.ResponsesToolState{CustomToolNames: map[string]struct{}{"exec": {}}}}
+	message := dto.Message{Role: "assistant"}
+	message.SetToolCalls([]dto.ToolCallRequest{{ID: "call_exec", Type: "function", Function: dto.FunctionRequest{Name: "exec", Arguments: `{"input":"ls"}`}}})
+
+	result, err := ConvertResponse(nil, info, types.RelayFormatOpenAIResponses, &dto.OpenAITextResponse{
+		Id:      "chatcmpl_1",
+		Model:   "gpt-test",
+		Choices: []dto.OpenAITextResponseChoice{{Message: message, FinishReason: "tool_calls"}},
+	})
+	require.NoError(t, err)
+	responses, ok := result.Value.(*dto.OpenAIResponsesResponse)
+	require.True(t, ok)
+	require.Len(t, responses.Output, 1)
+	assert.Equal(t, "custom_tool_call", responses.Output[0].Type)
+	assert.Equal(t, `"ls"`, string(responses.Output[0].Input))
+
+	state, err := NewResponseStreamState(types.RelayFormatOpenAI, types.RelayFormatOpenAIResponses, ResponseStreamOptions{ID: "resp_1", Model: "gpt-test"})
+	require.NoError(t, err)
+	index := 0
+	chunks, err := ConvertStreamResponseChunk(nil, info, state, &dto.ChatCompletionsStreamResponse{
+		Id:    "chatcmpl_1",
+		Model: "gpt-test",
+		Choices: []dto.ChatCompletionsStreamResponseChoice{{Delta: dto.ChatCompletionsStreamResponseChoiceDelta{
+			ToolCalls: []dto.ToolCallResponse{{Index: &index, ID: "call_exec", Type: "function", Function: dto.FunctionResponse{Name: "exec", Arguments: `{"input":"ls"}`}}},
+		}}},
+	})
+	require.NoError(t, err)
+	var added *ChatToResponsesStreamEvent
+	for _, chunk := range chunks {
+		if event, ok := chunk.Value.(ChatToResponsesStreamEvent); ok && event.Type == "response.output_item.added" {
+			added = &event
+		}
+	}
+	require.NotNil(t, added)
+	assert.Equal(t, "custom_tool_call", added.Payload.Item.Type)
 }

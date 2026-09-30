@@ -130,7 +130,7 @@ func TestSecurityAccountDeletionAcceptsEitherFactorAndRevokesSessions(t *testing
 			}
 			otherSession, err := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "second-session")
 			require.NoError(t, err)
-			require.NoError(t, model.UpdateUserAccessToken(user.Id, "account-delete-access-token"))
+			require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", user.Id).Update("access_token", "account-delete-access-token").Error)
 			response := securityEnrollmentRequest("DELETE", "/api/user/self", "", proof, identity, DeleteSelf)
 			var result securityEnrollmentResponse
 			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
@@ -195,7 +195,8 @@ func TestSecurityAccountDeletionRechecksTransactionAndConsumesFailedProof(t *tes
 				assert.Contains(t, response.Body.String(), "SECURITY_PROOF_CONSUMED")
 			}
 			if scenario != "write failure" {
-				assert.Error(t, model.DeleteUserForSession(identity))
+				_, err := model.DeleteUserForSession(identity)
+				assert.Error(t, err)
 			}
 			_, err := model.GetUserById(user.Id, false)
 			require.NoError(t, err)
@@ -411,7 +412,7 @@ func TestSecurityAccountProfileReadsPasswordStatusInOneQuery(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			user, identity := setupSecurityEnrollmentTest(t)
-			updates := map[string]interface{}{"access_token": "private-profile-token", "remark": "private-profile-remark"}
+			updates := map[string]any{"access_token": "private-profile-token", "remark": "private-profile-remark"}
 			if !hasPassword {
 				updates["password"] = ""
 			}
@@ -433,8 +434,8 @@ func TestSecurityAccountProfileReadsPasswordStatusInOneQuery(t *testing.T) {
 
 			response := securityEnrollmentRequest(http.MethodGet, "/api/user/self", "", "", identity, GetSelf)
 			var result struct {
-				Success bool                   `json:"success"`
-				Data    map[string]interface{} `json:"data"`
+				Success bool           `json:"success"`
+				Data    map[string]any `json:"data"`
 			}
 			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
 			require.True(t, result.Success, response.Body.String())
@@ -825,7 +826,7 @@ func TestSecurityAccountUnbindPreservesUsableLoginMethod(t *testing.T) {
 			common.PasswordLoginEnabled = scenario != "disabled password"
 			require.NoError(t, model.DB.Create(&model.UserOAuthBinding{UserId: user.Id, ProviderId: 31, ProviderUserId: "linked-subject"}).Error)
 			if scenario != "password" && scenario != "disabled password" {
-				require.NoError(t, model.DB.Model(user).Updates(map[string]interface{}{"password": "", "email": "verified@example.com"}).Error)
+				require.NoError(t, model.DB.Model(user).Updates(map[string]any{"password": "", "email": "verified@example.com"}).Error)
 			}
 			if scenario == "passkey" || scenario == "disabled passkey" {
 				require.NoError(t, model.DB.Create(&model.PasskeyCredential{UserID: user.Id, CredentialID: "existing-key", PublicKey: "public-key"}).Error)

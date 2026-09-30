@@ -64,6 +64,7 @@ var auditRouteActions = map[string]string{
 
 	// 兑换码
 	"PUT /api/redemption/":           "redemption.update",
+	"POST /api/redemption/batch":     "redemption.delete_batch",
 	"DELETE /api/redemption/:id":     "redemption.delete",
 	"DELETE /api/redemption/invalid": "redemption.delete_invalid",
 
@@ -150,7 +151,7 @@ func finishAdminAudit(c *gin.Context, writer *auditResponseWriter) {
 	}
 
 	// op.params 为语言无关参数，供前端 i18n 渲染；generic 时携带 method/route。
-	opParams := map[string]interface{}{}
+	opParams := map[string]any{}
 	if action == "generic" {
 		opParams["method"] = method
 		opParams["route"] = route
@@ -267,9 +268,8 @@ func AccessTokenAudit() gin.HandlerFunc {
 		if present {
 			_, internal, _ := service.ParseDashboardAccessToken(raw)
 			if !internal {
-				user, err := model.ValidateAccessToken(raw)
-				if err == nil && user != nil && user.Id > 0 {
-					beginAccessTokenAudit(c, user, raw)
+				if lookup := lookupAccessToken(c, raw); lookup.user != nil {
+					beginAccessTokenAudit(c, lookup.user, lookup.ref)
 					defer finishAccessTokenAudit(c)
 				}
 			}
@@ -278,16 +278,30 @@ func AccessTokenAudit() gin.HandlerFunc {
 	}
 }
 
-func beginAccessTokenAudit(c *gin.Context, user *model.User, token string) {
+func beginAccessTokenAudit(c *gin.Context, user *model.UserBase, tokenRef string) {
 	if _, exists := c.Get(accessTokenAuditContextKey); exists {
 		return
 	}
 	writer := &auditResponseWriter{ResponseWriter: c.Writer, body: bytes.NewBuffer(nil), maxSize: 64 * 1024}
 	c.Writer = writer
 	c.Set(accessTokenAuditContextKey, &accessTokenRequestAudit{
-		entry:  model.AuditLog{UserId: user.Id, Username: user.Username, ActorRole: user.Role, Category: model.AuditCategoryAccessToken, AuthMethod: "access_token", TokenRef: model.AccessTokenFingerprint(token), CreatedAt: common.GetTimestamp(), EventId: common.NewRequestId()},
+		entry:  model.AuditLog{UserId: user.Id, Username: user.Username, ActorRole: user.Role, Category: model.AuditCategoryAccessToken, AuthMethod: "access_token", TokenRef: tokenRef, CreatedAt: common.GetTimestamp(), EventId: common.NewRequestId()},
 		writer: writer,
 	})
+}
+
+// setAccessTokenAuditParam adds non-secret context, such as why a token was
+// rejected, to the current request's access audit entry.
+func setAccessTokenAuditParam(c *gin.Context, key string, value any) {
+	stored, _ := c.Get(accessTokenAuditContextKey)
+	audit, ok := stored.(*accessTokenRequestAudit)
+	if !ok {
+		return
+	}
+	if audit.entry.Other.Op == nil {
+		audit.entry.Other.Op = &model.AuditOperation{Params: model.AuditFields{}}
+	}
+	audit.entry.Other.Op.Params[key] = value
 }
 
 func finishAccessTokenAudit(c *gin.Context) {
