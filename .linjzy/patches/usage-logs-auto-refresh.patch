@@ -1,5 +1,5 @@
 diff --git a/web/src/features/usage-logs/api.ts b/web/src/features/usage-logs/api.ts
-index 793010be4..bcc1ccc7e 100644
+index 793010b..bcc1ccc 100644
 --- a/web/src/features/usage-logs/api.ts
 +++ b/web/src/features/usage-logs/api.ts
 @@ -35,6 +35,13 @@ import type {
@@ -35,7 +35,7 @@ index 793010be4..bcc1ccc7e 100644
  }
  
 diff --git a/web/src/features/usage-logs/components/common-logs-stats.tsx b/web/src/features/usage-logs/components/common-logs-stats.tsx
-index 91b82af7d..06f671af6 100644
+index 91b82af..e5cea1a 100644
 --- a/web/src/features/usage-logs/components/common-logs-stats.tsx
 +++ b/web/src/features/usage-logs/components/common-logs-stats.tsx
 @@ -18,7 +18,9 @@ For commercial licensing, please contact support@quantumnous.com
@@ -59,7 +59,7 @@ index 91b82af7d..06f671af6 100644
  import { buildApiParams } from '../lib/utils'
  import { useLogsViewScope, useUsageLogsContext } from './usage-logs-provider'
  
-@@ -52,9 +58,15 @@ export function CommonLogsStats() {
+@@ -52,10 +58,17 @@ export function CommonLogsStats() {
    const { t } = useTranslation()
    const { isAdminView: isAdmin } = useLogsViewScope()
    const searchParams = route.useSearch()
@@ -75,9 +75,11 @@ index 91b82af7d..06f671af6 100644
 +    errorUpdatedAt,
 +  } = useQuery({
      queryKey: ['usage-logs-stats', isAdmin, searchParams],
++    meta: { errorToast: false },
      queryFn: async () => {
        const params = buildApiParams({
-@@ -69,13 +81,31 @@ export function CommonLogsStats() {
+         page: 1,
+@@ -69,13 +82,31 @@ export function CommonLogsStats() {
          ? requireServerSuccess(await getLogStats(params))
          : requireServerSuccess(await getUserLogStats(params))
  
@@ -113,7 +115,7 @@ index 91b82af7d..06f671af6 100644
      return (
        <div className='flex items-center gap-2'>
 diff --git a/web/src/features/usage-logs/components/dialogs/details-dialog.tsx b/web/src/features/usage-logs/components/dialogs/details-dialog.tsx
-index 3172244c9..d8dc600e9 100644
+index 3172244..d8dc600 100644
 --- a/web/src/features/usage-logs/components/dialogs/details-dialog.tsx
 +++ b/web/src/features/usage-logs/components/dialogs/details-dialog.tsx
 @@ -479,6 +479,17 @@ export function DetailsDialog(props: DetailsDialogProps) {
@@ -192,7 +194,7 @@ index 3172244c9..d8dc600e9 100644
          )}
  
 diff --git a/web/src/features/usage-logs/components/usage-logs-provider.tsx b/web/src/features/usage-logs/components/usage-logs-provider.tsx
-index 930634c4e..77689c785 100644
+index 930634c..77689c7 100644
 --- a/web/src/features/usage-logs/components/usage-logs-provider.tsx
 +++ b/web/src/features/usage-logs/components/usage-logs-provider.tsx
 @@ -46,6 +46,8 @@ interface UsageLogsContextValue {
@@ -222,7 +224,7 @@ index 930634c4e..77689c785 100644
          setViewScope,
        }}
 diff --git a/web/src/features/usage-logs/components/usage-logs-table.tsx b/web/src/features/usage-logs/components/usage-logs-table.tsx
-index c4d520e83..7e428e8fd 100644
+index c4d520e..99af284 100644
 --- a/web/src/features/usage-logs/components/usage-logs-table.tsx
 +++ b/web/src/features/usage-logs/components/usage-logs-table.tsx
 @@ -18,9 +18,14 @@ For commercial licensing, please contact support@quantumnous.com
@@ -242,17 +244,17 @@ index c4d520e83..7e428e8fd 100644
  
  import {
    DataTablePage,
-@@ -43,6 +48,10 @@ import {
+@@ -42,6 +47,10 @@ import {
+   LOG_TYPE_ALL_VALUE,
    LOG_TYPE_ENUM,
  } from '../constants'
- import { shouldShowBillingSource } from '../lib/billing-source'
 +import {
 +  getUsageLogsRefetchInterval,
 +  USAGE_LOGS_AUTO_REFRESH_ERROR_TOAST_ID,
 +} from '../lib/auto-refresh'
+ import { shouldShowBillingSource } from '../lib/billing-source'
  import { useColumnsByCategory } from '../lib/columns'
  import { parseLogOther } from '../lib/format'
- import { fetchLogsByCategory } from '../lib/utils'
 @@ -50,7 +59,11 @@ import type { LogCategory } from '../types'
  import { CommonLogsFilterBar } from './common-logs-filter-bar'
  import { TaskLogsFilterBar } from './task-logs-filter-bar'
@@ -274,16 +276,17 @@ index c4d520e83..7e428e8fd 100644
    const isMobile = useMediaQuery('(max-width: 640px)')
    const searchParams = route.useSearch()
    const userId = useAuthStore((state) => state.auth.user?.id)
-@@ -160,7 +174,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
+@@ -160,7 +174,8 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
      ],
    })
  
 -  const { data, isLoading, isFetching } = useQuery({
 +  const { data, isLoading, isFetching, error, errorUpdatedAt } = useQuery({
++    meta: { errorToast: false },
      queryKey: [
        'logs',
        logCategory,
-@@ -196,8 +210,36 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
+@@ -196,8 +211,36 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
        }
        return undefined
      },
@@ -320,7 +323,7 @@ index c4d520e83..7e428e8fd 100644
    const logs = data?.items || []
    const columns = useColumnsByCategory(
      logCategory,
-@@ -217,7 +259,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
+@@ -217,7 +260,7 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
      ),
      pagination,
      enableRowSelection: false,
@@ -330,7 +333,7 @@ index c4d520e83..7e428e8fd 100644
      manualPagination: true,
      manualFiltering: true,
 diff --git a/web/src/features/usage-logs/constants.ts b/web/src/features/usage-logs/constants.ts
-index 95f2647ce..39994e784 100644
+index 95f2647..39994e7 100644
 --- a/web/src/features/usage-logs/constants.ts
 +++ b/web/src/features/usage-logs/constants.ts
 @@ -44,6 +44,9 @@ export const DEFAULT_LOGS_DATA = {
@@ -344,7 +347,7 @@ index 95f2647ce..39994e784 100644
  // Log Type Enum
  // ============================================================================
 diff --git a/web/src/features/usage-logs/index.tsx b/web/src/features/usage-logs/index.tsx
-index b0f911b71..8ab57ef05 100644
+index b0f911b..8ab57ef 100644
 --- a/web/src/features/usage-logs/index.tsx
 +++ b/web/src/features/usage-logs/index.tsx
 @@ -16,12 +16,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
@@ -446,7 +449,7 @@ index b0f911b71..8ab57ef05 100644
            <div className='flex h-full min-h-0 flex-col gap-4'>
 diff --git a/web/src/features/usage-logs/lib/auto-refresh.ts b/web/src/features/usage-logs/lib/auto-refresh.ts
 new file mode 100644
-index 000000000..40d8486b9
+index 0000000..40d8486
 --- /dev/null
 +++ b/web/src/features/usage-logs/lib/auto-refresh.ts
 @@ -0,0 +1,35 @@
