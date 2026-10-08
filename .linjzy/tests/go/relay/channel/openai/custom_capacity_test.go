@@ -15,11 +15,53 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 type customCancelAtHeadersWriter struct {
 	*httptest.ResponseRecorder
 	cancel context.CancelFunc
+}
+
+func TestCustomResponsesTerminalPreservesVendorToolUsage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+	for _, tc := range []struct {
+		name, eventType, status, errorJSON string
+		failed                             bool
+	}{
+		{name: "completed response", eventType: "response.completed", status: "completed", errorJSON: "null"},
+		{name: "billed capacity failure", eventType: "response.failed", status: "failed", errorJSON: `{"code":"model_at_capacity","message":"capacity"}`, failed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			info := &relaycommon.RelayInfo{
+				OriginModelName: "review-model",
+				DisablePing:     true,
+				ChannelMeta:     &relaycommon.ChannelMeta{UpstreamModelName: "review-model"},
+				VendorToolUsage: func(raw []byte) map[string]int {
+					return map[string]int{"web_search": int(gjson.GetBytes(raw, "response.usage.num_search_queries").Int())}
+				},
+			}
+			body := fmt.Sprintf("data: {\"type\":%q,\"response\":{\"status\":%q,\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"total_tokens\":12,\"num_search_queries\":3},\"error\":%s}}\n\n", tc.eventType, tc.status, tc.errorJSON)
+			resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}
+			usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+			require.NotNil(t, usage)
+			assert.Equal(t, 12, usage.TotalTokens)
+			require.NotNil(t, info.ResponsesUsageInfo)
+			require.Contains(t, info.BuiltInTools, "web_search")
+			assert.Equal(t, 3, info.BuiltInTools["web_search"].CallCount)
+			if tc.failed {
+				require.NotNil(t, apiErr)
+				assert.True(t, types.IsSkipRetryError(apiErr))
+			} else {
+				assert.Nil(t, apiErr)
+			}
+		})
+	}
 }
 
 func TestCustomResponsesTransientFailureClassification(t *testing.T) {

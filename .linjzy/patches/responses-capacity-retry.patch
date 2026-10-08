@@ -179,7 +179,7 @@ index 7e6f762..e17bdec 100644
  		// 处理流式请求的 ping 保活
  		generalSettings := operation_setting.GetGeneralSetting()
 diff --git a/relay/channel/openai/relay_responses.go b/relay/channel/openai/relay_responses.go
-index 3ed0b3b..f630ac8 100644
+index 0104b14..fcaa86a 100644
 --- a/relay/channel/openai/relay_responses.go
 +++ b/relay/channel/openai/relay_responses.go
 @@ -4,6 +4,7 @@ import (
@@ -190,7 +190,7 @@ index 3ed0b3b..f630ac8 100644
  
  	"github.com/QuantumNous/new-api/common"
  	"github.com/QuantumNous/new-api/constant"
-@@ -78,26 +79,123 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
+@@ -76,26 +77,123 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
  	defer service.CloseResponseBodyGracefully(resp)
  
  	accumulator := service.NewResponsesUsageAccumulator(info)
@@ -223,7 +223,7 @@ index 3ed0b3b..f630ac8 100644
 -		sendResponsesStreamData(c, streamResponse, data)
 +		// Accounting runs before the commit decision: usage carried by a terminal
 +		// failure counts as work that must not be replayed.
- 		accumulator.Observe(&streamResponse)
+ 		accumulator.Observe(&streamResponse, common.StringToByteSlice(data))
 -	})
 +
 +		failure, capacityFailure := responsesStreamFailure(streamResponse)
@@ -319,7 +319,7 @@ index 3ed0b3b..f630ac8 100644
  }
  
  func rewriteSGLangResponsesCreatedAt(info *relaycommon.RelayInfo, payload []byte, path string, createdAt dto.IntValue) []byte {
-@@ -113,3 +211,242 @@ func rewriteSGLangResponsesCreatedAt(info *relaycommon.RelayInfo, payload []byte
+@@ -111,3 +209,242 @@ func rewriteSGLangResponsesCreatedAt(info *relaycommon.RelayInfo, payload []byte
  	}
  	return patched
  }
@@ -563,19 +563,19 @@ index 3ed0b3b..f630ac8 100644
 +	return types.WithOpenAIError(*upstreamError, http.StatusBadGateway, types.ErrOptionWithSkipRetry()), false
 +}
 diff --git a/relay/common/relay_info.go b/relay/common/relay_info.go
-index 675815a..7da2621 100644
+index c15b7f6..a164e95 100644
 --- a/relay/common/relay_info.go
 +++ b/relay/common/relay_info.go
-@@ -193,6 +193,9 @@ type RelayInfo struct {
+@@ -192,6 +192,9 @@ type RelayInfo struct {
  	FinalRequestRelayFormat types.RelayFormat
  
  	StreamStatus *StreamStatus
 +	// Distinguishes a protocol failure from a successful HTTP 200 for affinity.
 +	ResponsesStreamError     *types.NewAPIError
 +	ResponsesCapacityFailure bool
- 	// PerformanceOutputTokens is captured by settlement and sampled once at
- 	// the request boundary, independently of billing success or failure.
- 	PerformanceOutputTokens      int64
+ 	// VendorToolUsage reads the upstream's own billed tool counts from a raw
+ 	// response body (non-stream) or the raw terminal stream frame. The channel
+ 	// adaptor's Init sets it for upstreams whose usage extension names a billed
 diff --git a/relay/common/stream_status.go b/relay/common/stream_status.go
 index 60c8495..35fe33a 100644
 --- a/relay/common/stream_status.go
@@ -756,10 +756,10 @@ index 608e841..357396c 100644
  		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
  		return newAPIError
 diff --git a/relaykit/dto/openai_response.go b/relaykit/dto/openai_response.go
-index c18df43..3f80953 100644
+index 98cdf41..2c63dd1 100644
 --- a/relaykit/dto/openai_response.go
 +++ b/relaykit/dto/openai_response.go
-@@ -550,6 +550,7 @@ const (
+@@ -567,6 +567,7 @@ const (
  type ResponsesStreamResponse struct {
  	Type            string                   `json:"type"`
  	Response        *OpenAIResponsesResponse `json:"response,omitempty"`
@@ -834,10 +834,10 @@ index ac4e11b..87e69ff 100644
  			other.SetAdmin("billing_model", billingModel)
  		}
 diff --git a/service/responses_usage.go b/service/responses_usage.go
-index cdf02e0..0f117e6 100644
+index 67b2f36..7ea5ace 100644
 --- a/service/responses_usage.go
 +++ b/service/responses_usage.go
-@@ -34,13 +34,15 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse)
+@@ -37,13 +37,15 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse,
  	}
  	if event.Response != nil {
  		a.info.ObserveResponseModel(event.Response.Model)
@@ -854,7 +854,7 @@ index cdf02e0..0f117e6 100644
  			if a.outputText.Len() == 0 {
  				// Some upstreams carry the output only on the terminal event.
  				a.outputText.WriteString(relayconvert.ExtractOutputTextFromResponses(event.Response))
-@@ -110,6 +112,15 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
+@@ -115,6 +117,15 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
  	return a.usage
  }
  
@@ -871,10 +871,10 @@ index cdf02e0..0f117e6 100644
  // on the stream status for health classification. Only codes and types are
  // kept; messages never leave the event.
 diff --git a/service/text_quota.go b/service/text_quota.go
-index d2df204..3ce2853 100644
+index 3bc48ab..351ede3 100644
 --- a/service/text_quota.go
 +++ b/service/text_quota.go
-@@ -396,13 +396,17 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
+@@ -390,13 +390,17 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
  	if usage == nil {
  		extraContent = append(extraContent, "上游无计费信息")
  	}

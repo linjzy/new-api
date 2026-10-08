@@ -1,10 +1,10 @@
 diff --git a/Dockerfile b/Dockerfile
-index 399a2ab..bd554f6 100644
+index ddcee58..5971157 100644
 --- a/Dockerfile
 +++ b/Dockerfile
-@@ -27,6 +27,9 @@ COPY . .
+@@ -28,6 +28,9 @@ COPY . .
  COPY --from=builder /build/web/dist ./web/dist
- RUN go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$(cat VERSION)'" -o new-api
+ RUN go build -pgo="$(go list -m -f '{{.Dir}}' github.com/Calcium-Ion/moejs)/default.pgo" -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$(cat VERSION)'" -o new-api
  
 +RUN apk add --no-cache bash \
 +    && bash scripts/install-astra-iq-codex.sh /opt/astra-iq-cli "${TARGETARCH:-amd64}"
@@ -12,7 +12,7 @@ index 399a2ab..bd554f6 100644
  FROM debian:bookworm-slim@sha256:f06537653ac770703bc45b4b113475bd402f451e85223f0f2837acbf89ab020a
  
  RUN apt-get update \
-@@ -35,6 +38,7 @@ RUN apt-get update \
+@@ -36,6 +39,7 @@ RUN apt-get update \
      && update-ca-certificates
  
  COPY --from=builder2 /build/new-api /
@@ -5573,10 +5573,10 @@ index 0000000..ce0eef4
 +  return 'Astra IQ pending'
 +}
 diff --git a/web/src/i18n/locales/en.json b/web/src/i18n/locales/en.json
-index 2ced2b8..ad4f967 100644
+index 76438a2..511b7c4 100644
 --- a/web/src/i18n/locales/en.json
 +++ b/web/src/i18n/locales/en.json
-@@ -6853,6 +6853,73 @@
+@@ -6865,6 +6865,73 @@
      "Zhipu": "Zhipu",
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V4",
@@ -5652,10 +5652,10 @@ index 2ced2b8..ad4f967 100644
    }
  }
 diff --git a/web/src/i18n/locales/fr.json b/web/src/i18n/locales/fr.json
-index 1f1d1a0..006c831 100644
+index 8fc0f25..754d29e 100644
 --- a/web/src/i18n/locales/fr.json
 +++ b/web/src/i18n/locales/fr.json
-@@ -6853,6 +6853,73 @@
+@@ -6865,6 +6865,73 @@
      "Zhipu": "Zhipu",
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V4",
@@ -5731,10 +5731,10 @@ index 1f1d1a0..006c831 100644
    }
  }
 diff --git a/web/src/i18n/locales/ja.json b/web/src/i18n/locales/ja.json
-index e251c56..6bc19a5 100644
+index dda2a01..58d51e4 100644
 --- a/web/src/i18n/locales/ja.json
 +++ b/web/src/i18n/locales/ja.json
-@@ -6853,6 +6853,73 @@
+@@ -6865,6 +6865,73 @@
      "Zhipu": "Zhipu",
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V 4",
@@ -5810,10 +5810,10 @@ index e251c56..6bc19a5 100644
    }
  }
 diff --git a/web/src/i18n/locales/ru.json b/web/src/i18n/locales/ru.json
-index 92edfa7..df24396 100644
+index 1afbf06..595ab2d 100644
 --- a/web/src/i18n/locales/ru.json
 +++ b/web/src/i18n/locales/ru.json
-@@ -6853,6 +6853,73 @@
+@@ -6865,6 +6865,73 @@
      "Zhipu": "Zhipu",
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V4",
@@ -5889,10 +5889,10 @@ index 92edfa7..df24396 100644
    }
  }
 diff --git a/web/src/i18n/locales/vi.json b/web/src/i18n/locales/vi.json
-index 307da10..07e479a 100644
+index fbade34..dc14e9b 100644
 --- a/web/src/i18n/locales/vi.json
 +++ b/web/src/i18n/locales/vi.json
-@@ -6853,6 +6853,73 @@
+@@ -6865,6 +6865,73 @@
      "Zhipu": "Zhipu",
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V4",
@@ -5968,10 +5968,10 @@ index 307da10..07e479a 100644
    }
  }
 diff --git a/web/src/i18n/locales/zh-TW.json b/web/src/i18n/locales/zh-TW.json
-index 55aae93..41280ef 100644
+index b0362ee..7985b13 100644
 --- a/web/src/i18n/locales/zh-TW.json
 +++ b/web/src/i18n/locales/zh-TW.json
-@@ -6853,6 +6853,73 @@
+@@ -6865,6 +6865,73 @@
      "Zhipu": "智譜",
      "Zhipu GLM": "智譜GLM",
      "Zhipu V4": "智譜 V4",
@@ -6047,10 +6047,10 @@ index 55aae93..41280ef 100644
    }
  }
 diff --git a/web/src/i18n/locales/zh.json b/web/src/i18n/locales/zh.json
-index 11608e4..39504fc 100644
+index 00dbace..f2f8748 100644
 --- a/web/src/i18n/locales/zh.json
 +++ b/web/src/i18n/locales/zh.json
-@@ -6853,6 +6853,73 @@
+@@ -6865,6 +6865,73 @@
      "Zhipu": "智谱",
      "Zhipu GLM": "智谱GLM",
      "Zhipu V4": "智谱 V4",
