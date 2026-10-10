@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	hostdto "github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -23,6 +24,7 @@ import (
 )
 
 func TestCustomCapacityFailoverContract(t *testing.T) {
+	require.NoError(t, i18n.Init())
 	db := modelManagementDB(t, "sqlite", "")
 	// This fixture restores global database/Redis state at teardown; keep
 	// unrelated asynchronous performance collection outside the relay contract.
