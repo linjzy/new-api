@@ -1,5 +1,5 @@
 diff --git a/constant/context_key.go b/constant/context_key.go
-index f1e158f..f63f964 100644
+index f1e158f1..f63f9647 100644
 --- a/constant/context_key.go
 +++ b/constant/context_key.go
 @@ -66,8 +66,10 @@ const (
@@ -16,13 +16,13 @@ index f1e158f..f63f964 100644
  
  	// ContextKeyAuditLogged marks that the current request has already recorded
 diff --git a/controller/relay.go b/controller/relay.go
-index 21c9138..a2f25ba 100644
+index 31fd128b..28463215 100644
 --- a/controller/relay.go
 +++ b/controller/relay.go
-@@ -90,6 +90,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+@@ -91,6 +91,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
  		if newAPIError != nil {
  			service.RecordRequestPolicyTermination(c, newAPIError)
- 			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
+ 			logger.LogError(c, common.LogText("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
 +			// The upstream SSE failure has already been sent. Appending JSON
 +			// would corrupt the stream, and its HTTP status cannot be replaced.
 +			if common.GetContextKeyBool(c, constant.ContextKeyResponsesStreamFailed) && c.Writer.Written() {
@@ -31,7 +31,7 @@ index 21c9138..a2f25ba 100644
  			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
  			switch relayFormat {
  			case types.RelayFormatOpenAIRealtime:
-@@ -162,6 +167,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+@@ -163,6 +168,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
  		relayInfo.RetryIndex = retryParam.GetRetry()
  		channel, channelErr := getChannel(c, relayInfo, retryParam)
  		if channelErr != nil {
@@ -44,7 +44,7 @@ index 21c9138..a2f25ba 100644
  			logger.LogError(c, channelErr.Error())
  			newAPIError = channelErr
  			break
-@@ -198,16 +209,26 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+@@ -199,16 +210,26 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
  		if newAPIError == nil {
  			service.MarkRequestPolicySuccess(c, relayInfo.StreamStatus)
  			relayInfo.LastError = nil
@@ -72,7 +72,7 @@ index 21c9138..a2f25ba 100644
  			break
  		}
 diff --git a/dto/channel_constraints.go b/dto/channel_constraints.go
-index a1848bc..6baff44 100644
+index a1848bc1..6baff443 100644
 --- a/dto/channel_constraints.go
 +++ b/dto/channel_constraints.go
 @@ -36,6 +36,7 @@ type ChannelPin struct {
@@ -92,7 +92,7 @@ index a1848bc..6baff44 100644
  
  type ChannelConstraints struct {
 diff --git a/middleware/distributor.go b/middleware/distributor.go
-index 4595ca3..2b8305f 100644
+index 43b2288c..ac94b85b 100644
 --- a/middleware/distributor.go
 +++ b/middleware/distributor.go
 @@ -124,7 +124,8 @@ func Distribute() func(c *gin.Context) {
@@ -106,10 +106,10 @@ index 4595ca3..2b8305f 100644
  		}
  	}
 diff --git a/model/ability.go b/model/ability.go
-index ecfcb5c..b86c442 100644
+index c3d4d127..18fcf342 100644
 --- a/model/ability.go
 +++ b/model/ability.go
-@@ -165,7 +165,8 @@ func GetChannel(
+@@ -164,7 +164,8 @@ func GetChannel(
  
  // filterAbilitiesByConstraints applies the same ChannelSatisfiesFilters
  // predicate used by the memory-cache path. A failed channel lookup fails
@@ -119,7 +119,7 @@ index ecfcb5c..b86c442 100644
  func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters []dto.ChannelFilter) []Ability {
  	if len(abilities) == 0 {
  		return nil
-@@ -183,6 +184,11 @@ func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters
+@@ -182,6 +183,11 @@ func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters
  
  	var channels []*Channel
  	if err := DB.Where("id IN ?", channelIds).Find(&channels).Error; err != nil {
@@ -132,7 +132,7 @@ index ecfcb5c..b86c442 100644
  			return nil
  		}
 diff --git a/model/channel_constraint.go b/model/channel_constraint.go
-index c3c3e9b..34121a7 100644
+index c3c3e9b6..34121a7b 100644
 --- a/model/channel_constraint.go
 +++ b/model/channel_constraint.go
 @@ -8,14 +8,16 @@ import (
@@ -164,10 +164,10 @@ index c3c3e9b..34121a7 100644
  		if filter.RequestPath == "" {
  			return true
 diff --git a/relay/channel/api_request.go b/relay/channel/api_request.go
-index 7e6f762..e17bdec 100644
+index 0efdddf1..ebc35e38 100644
 --- a/relay/channel/api_request.go
 +++ b/relay/channel/api_request.go
-@@ -541,7 +541,9 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
+@@ -542,7 +542,9 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
  
  	var stopPinger context.CancelFunc
  	var pingerDone <-chan struct{}
@@ -179,7 +179,7 @@ index 7e6f762..e17bdec 100644
  		// 处理流式请求的 ping 保活
  		generalSettings := operation_setting.GetGeneralSetting()
 diff --git a/relay/channel/openai/relay_responses.go b/relay/channel/openai/relay_responses.go
-index 0104b14..fcaa86a 100644
+index 37172fdb..50f2cd69 100644
 --- a/relay/channel/openai/relay_responses.go
 +++ b/relay/channel/openai/relay_responses.go
 @@ -4,6 +4,7 @@ import (
@@ -211,7 +211,7 @@ index 0104b14..fcaa86a 100644
  		// 检查当前数据是否包含 completed 状态和 usage 信息
  		var streamResponse dto.ResponsesStreamResponse
  		if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
--			logger.LogError(c, "failed to unmarshal stream response: "+err.Error())
+-			logger.LogError(c, common.LogText("failed to unmarshal stream response: %s", err.Error()))
 -			sr.Error(err)
 +			streamErr = types.NewErrorWithStatusCode(err, types.ErrorCodeBadResponseBody, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 +			sr.Stop(streamErr)
@@ -303,7 +303,7 @@ index 0104b14..fcaa86a 100644
 +		streamErr = types.NewErrorWithStatusCode(fmt.Errorf("%s", message), types.ErrorCodeBadResponse, statusCode, types.ErrOptionWithSkipRetry())
 +	}
 +	if streamErr != nil {
-+		logger.LogWarn(c, fmt.Sprintf("Responses stream failure: committed=%t first_output_event=%q first_output_bytes=%d prelude_bytes=%d capacity=%t", c.Writer.Written(), firstOutputEvent, firstOutputBytes, preludeBytes, info.ResponsesCapacityFailure))
++		logger.LogWarn(c, common.LogText("Responses stream failure: committed=%t first_output_event=%q first_output_bytes=%d prelude_bytes=%d capacity=%t", c.Writer.Written(), firstOutputEvent, firstOutputBytes, preludeBytes, info.ResponsesCapacityFailure))
 +		info.StreamStatus.SetUpstreamError(streamErr)
 +		info.ResponsesStreamError = streamErr
 +		common.SetContextKey(c, constant.ContextKeyResponsesStreamFailed, true)
@@ -563,7 +563,7 @@ index 0104b14..fcaa86a 100644
 +	return types.WithOpenAIError(*upstreamError, http.StatusBadGateway, types.ErrOptionWithSkipRetry()), false
 +}
 diff --git a/relay/common/relay_info.go b/relay/common/relay_info.go
-index c15b7f6..a164e95 100644
+index cee37b41..704b5ce7 100644
 --- a/relay/common/relay_info.go
 +++ b/relay/common/relay_info.go
 @@ -192,6 +192,9 @@ type RelayInfo struct {
@@ -577,7 +577,7 @@ index c15b7f6..a164e95 100644
  	// response body (non-stream) or the raw terminal stream frame. The channel
  	// adaptor's Init sets it for upstreams whose usage extension names a billed
 diff --git a/relay/common/stream_status.go b/relay/common/stream_status.go
-index 60c8495..35fe33a 100644
+index 60c84956..35fe33ad 100644
 --- a/relay/common/stream_status.go
 +++ b/relay/common/stream_status.go
 @@ -10,15 +10,16 @@ import (
@@ -629,7 +629,7 @@ index 60c8495..35fe33a 100644
  	if s == nil {
  		return false
 diff --git a/relay/helper/stream_scanner.go b/relay/helper/stream_scanner.go
-index e620469..bf66a09 100644
+index 0268ca36..82b81898 100644
 --- a/relay/helper/stream_scanner.go
 +++ b/relay/helper/stream_scanner.go
 @@ -80,7 +80,17 @@ func ExtendWriteDeadline(c *gin.Context) {
@@ -729,7 +729,7 @@ index e620469..bf66a09 100644
  
  	cleanup()
 diff --git a/relay/responses_handler.go b/relay/responses_handler.go
-index 608e841..357396c 100644
+index 9e481cbb..3d70fb21 100644
 --- a/relay/responses_handler.go
 +++ b/relay/responses_handler.go
 @@ -16,6 +16,8 @@ import (
@@ -756,7 +756,7 @@ index 608e841..357396c 100644
  		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
  		return newAPIError
 diff --git a/relaykit/dto/openai_response.go b/relaykit/dto/openai_response.go
-index 98cdf41..2c63dd1 100644
+index 98cdf411..2c63dd1b 100644
 --- a/relaykit/dto/openai_response.go
 +++ b/relaykit/dto/openai_response.go
 @@ -567,6 +567,7 @@ const (
@@ -768,7 +768,7 @@ index 98cdf41..2c63dd1 100644
  	Message         string                   `json:"message,omitempty"`
  	Param           string                   `json:"param,omitempty"`
 diff --git a/service/channel_select.go b/service/channel_select.go
-index b89558a..8a569a5 100644
+index 113e4a35..1630df8c 100644
 --- a/service/channel_select.go
 +++ b/service/channel_select.go
 @@ -4,6 +4,7 @@ import (
@@ -819,10 +819,10 @@ index b89558a..8a569a5 100644
  		)
  		if err != nil {
 diff --git a/service/log_info_generate.go b/service/log_info_generate.go
-index ac4e11b..87e69ff 100644
+index bda3e612..572040b0 100644
 --- a/service/log_info_generate.go
 +++ b/service/log_info_generate.go
-@@ -73,6 +73,10 @@ func AppendRelayLogAdminInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo,
+@@ -72,6 +72,10 @@ func AppendRelayLogAdminInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo,
  	}
  	other.SetAdmin("use_channel", ctx.GetStringSlice("use_channel"))
  	if relayInfo != nil {
@@ -834,7 +834,7 @@ index ac4e11b..87e69ff 100644
  			other.SetAdmin("billing_model", billingModel)
  		}
 diff --git a/service/responses_usage.go b/service/responses_usage.go
-index 67b2f36..7ea5ace 100644
+index 67b2f36b..7ea5ace3 100644
 --- a/service/responses_usage.go
 +++ b/service/responses_usage.go
 @@ -37,13 +37,15 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse,
@@ -871,12 +871,12 @@ index 67b2f36..7ea5ace 100644
  // on the stream status for health classification. Only codes and types are
  // kept; messages never leave the event.
 diff --git a/service/text_quota.go b/service/text_quota.go
-index 3bc48ab..351ede3 100644
+index b5cb682e..0e01a630 100644
 --- a/service/text_quota.go
 +++ b/service/text_quota.go
-@@ -390,13 +390,17 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
+@@ -389,13 +389,17 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
  	if usage == nil {
- 		extraContent = append(extraContent, "上游无计费信息")
+ 		extraContent = append(extraContent, common.NewMessage("Upstream returned no usage"))
  	}
 +	adminRejectReason := common.GetContextKeyString(ctx, constant.ContextKeyAdminRejectReason)
 +	summary := calculateTextQuotaSummary(ctx, relayInfo, billingUsage)
