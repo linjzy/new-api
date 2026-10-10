@@ -1,0 +1,7 @@
+upstream_repository=https://github.com/QuantumNous/new-api
+upstream_tag=v1.0.0-rc.43
+upstream_commit=c6741c36a9a1a729554ad94ee99f21602a214a23
+patch_sha256=9fe5c6634461288a66a16ab9acb50a81a2bab9ca1287cce5376bc28260897084
+source_ref=custom/1.0.0-rc.43-custom-de058c1efbb1-c6741c36a9a1
+frontend=web
+build_sha256=de058c1efbb15c97fa1ad7e7ca0449a3eeab37b3a4ad25eea2ad1d27205a1846

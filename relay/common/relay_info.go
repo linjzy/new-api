@@ -192,6 +192,9 @@ type RelayInfo struct {
 	FinalRequestRelayFormat types.RelayFormat
 
 	StreamStatus *StreamStatus
+	// Distinguishes a protocol failure from a successful HTTP 200 for affinity.
+	ResponsesStreamError     *types.NewAPIError
+	ResponsesCapacityFailure bool
 	// VendorToolUsage reads the upstream's own billed tool counts from a raw
 	// response body (non-stream) or the raw terminal stream frame. The channel
 	// adaptor's Init sets it for upstreams whose usage extension names a billed
