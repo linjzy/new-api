@@ -53,6 +53,6 @@ print('\n'.join(sorted(files)))
 PYFILES
   )
   bun x oxlint -c .oxlintrc.json "${changed_ts[@]}" src/features/usage-logs/custom-tests
-  bun run test src/features/usage-logs/custom-tests src/features/channels/components/__tests__/astra-iq-status.test.tsx src/components/multi-select/__tests__
+  bun run test src/features/usage-logs/custom-tests src/features/channels/components/__tests__/astra-iq-status.test.tsx src/components/multi-select/__tests__ src/features/usage-logs/components/__tests__/mobile-card.test.tsx
   if [[ "${BUILD_FRONTEND:-true}" == true ]]; then bun run build; fi
 fi
