@@ -19,7 +19,7 @@ diff --git a/controller/relay.go b/controller/relay.go
 index 31fd128b..28463215 100644
 --- a/controller/relay.go
 +++ b/controller/relay.go
-@@ -91,6 +91,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+@@ -91,4 +91,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
  		if newAPIError != nil {
  			service.RecordRequestPolicyTermination(c, newAPIError)
  			logger.LogError(c, common.LogText("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
@@ -29,8 +29,6 @@ index 31fd128b..28463215 100644
 +				return
 +			}
  			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
- 			switch relayFormat {
- 			case types.RelayFormatOpenAIRealtime:
 @@ -163,6 +168,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
  		relayInfo.RetryIndex = retryParam.GetRetry()
  		channel, channelErr := getChannel(c, relayInfo, retryParam)
