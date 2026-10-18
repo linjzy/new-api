@@ -2,7 +2,7 @@ name: Build custom new-api image
 
 on:
   schedule:
-    - cron: '23 */6 * * *'
+    - cron: '23 0 * * *' # Daily at 08:23 Asia/Shanghai (00:23 UTC).
   push:
     branches: [main]
     paths:

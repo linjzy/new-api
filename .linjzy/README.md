@@ -15,7 +15,7 @@
 
 ## 发布
 
-[GitHub Actions](../.github/workflows/custom-image.yml) 每六小时运行；`.linjzy/` 下非文档改动推送到 `main`，或手动触发时也运行。
+[GitHub Actions](../.github/workflows/custom-image.yml) 每天北京时间 08:23（UTC 00:23）定时运行一次；`.linjzy/` 下非文档改动推送到 `main`，或手动触发时也运行。
 流程：取最新上游 release，在其提交上应用补丁，通过后端、前端和镜像启动检查后发布源码分支和镜像。
 
 - 镜像 `ghcr.io/linjzy/new-api:<release>-custom-<build-sha>-<upstream-sha>`，源码分支 `custom/<同名>`；分支不含 `.github/workflows`。
