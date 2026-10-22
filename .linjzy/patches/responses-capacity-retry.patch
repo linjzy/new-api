@@ -165,10 +165,8 @@ diff --git a/relay/channel/api_request.go b/relay/channel/api_request.go
 index 0efdddf1..ebc35e38 100644
 --- a/relay/channel/api_request.go
 +++ b/relay/channel/api_request.go
-@@ -542,7 +542,9 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
+@@ -476,5 +476,7 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
  
- 	var stopPinger context.CancelFunc
- 	var pingerDone <-chan struct{}
 -	if info.IsStream {
 +	// Responses decides whether a failed stream can be retried before sending
 +	// headers or pings. Its response scanner owns the first downstream write.
