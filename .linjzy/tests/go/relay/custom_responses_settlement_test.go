@@ -30,6 +30,8 @@ func (s *customSettlement) NeedsRefund() bool        { return len(s.charges) == 
 func (s *customSettlement) GetPreConsumedQuota() int { return 100 }
 func (s *customSettlement) Reserve(int) error        { return nil }
 
+func (s *customSettlement) ReserveBeforeSubmit(q int) error { return s.Reserve(q) }
+
 type customDisconnectedWriter struct {
 	*httptest.ResponseRecorder
 	cancel context.CancelFunc
