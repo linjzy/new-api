@@ -33,6 +33,7 @@ import { requireServerSuccess } from '@/lib/server-error-message'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { getChannelOps } from './api'
+import { AstraIQSettings } from './components/astra-iq-settings'
 import { ChannelsDialogs } from './components/channels-dialogs'
 import { ChannelsPrimaryButtons } from './components/channels-primary-buttons'
 import { ChannelsProvider } from './components/channels-provider'
@@ -89,9 +90,10 @@ export function Channels() {
     <ChannelsProvider>
       <SectionPageLayout fixedContent>
         <SectionPageLayout.Title>
-          <span className='flex min-w-0 items-center gap-2'>
+          <span className='flex min-w-0 flex-wrap items-center gap-2'>
             <span className='truncate'>{t('Channels')}</span>
             {retryBadge}
+            <AstraIQSettings />
           </span>
         </SectionPageLayout.Title>
         <SectionPageLayout.Actions>

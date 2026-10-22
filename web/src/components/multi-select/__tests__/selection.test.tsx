@@ -32,8 +32,10 @@ function Fixture(props: {
   initialSelected?: string[]
   allowCreate?: boolean
   disabled?: boolean
+  activeChips?: boolean
 }) {
   const [selected, setSelected] = useState(props.initialSelected ?? [])
+  const [activeValue, setActiveValue] = useState(props.initialSelected?.[0])
 
   return (
     <>
@@ -43,6 +45,8 @@ function Fixture(props: {
         onChange={setSelected}
         allowCreate={props.allowCreate ?? true}
         disabled={props.disabled}
+        onChipClick={props.activeChips ? setActiveValue : undefined}
+        activeValue={activeValue}
       />
       <output aria-label='Selected values'>{selected.join(',')}</output>
     </>
@@ -155,5 +159,45 @@ describe('multi-select batch paste', () => {
     expect(input).toBeDisabled()
     expect(screen.getByLabelText('Selected values')).toBeEmptyDOMElement()
     expect(input).toHaveValue('')
+  })
+})
+
+describe('multi-select active chips', () => {
+  it.each(['click', 'Enter', 'Space'])(
+    'activates a chip with %s without changing the selection or opening the popup',
+    async (action) => {
+      const user = userEvent.setup()
+      render(<Fixture initialSelected={['a', 'c']} activeChips />)
+      const chip = screen.getByRole('button', { name: 'c' })
+      if (action === 'click') await user.click(chip)
+      else {
+        chip.focus()
+        await user.keyboard(action === 'Enter' ? '{Enter}' : ' ')
+      }
+      expect(chip).toHaveAttribute('aria-pressed', 'true')
+      expect(screen.getByRole('button', { name: 'a' })).toHaveAttribute(
+        'aria-pressed',
+        'false'
+      )
+      expect(screen.getByLabelText('Selected values')).toHaveTextContent(
+        /^a,c$/
+      )
+      expect(screen.getByRole('combobox')).toHaveAttribute(
+        'aria-expanded',
+        'false'
+      )
+    }
+  )
+
+  it('lets readers inspect selected values while the selection is disabled', async () => {
+    const user = userEvent.setup()
+    render(<Fixture initialSelected={['a', 'c']} activeChips disabled />)
+    await user.click(screen.getByRole('button', { name: 'c' }))
+    expect(screen.getByRole('button', { name: 'c' })).toHaveAttribute(
+      'aria-pressed',
+      'true'
+    )
+    expect(screen.getByRole('combobox')).toBeDisabled()
+    expect(screen.getByLabelText('Selected values')).toHaveTextContent(/^a,c$/)
   })
 })

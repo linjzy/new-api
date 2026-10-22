@@ -23,6 +23,7 @@ import * as React from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
+import { Button } from '@/components/ui/button'
 import {
   Combobox,
   ComboboxChip,
@@ -88,6 +89,13 @@ interface MultiSelectProps {
    * instead of being inert. The remove (×) button keeps its own behaviour.
    */
   copyChipOnClick?: boolean
+  /**
+   * Activate a selected value without changing the selection, including for
+   * read-only inspection when disabled. Takes priority over copying.
+   */
+  onChipClick?: (value: string) => void
+  /** Highlight the selected value currently being inspected or configured. */
+  activeValue?: string
 }
 
 const COMMA_REGEX = /[,，\n]/
@@ -331,7 +339,16 @@ export function MultiSelect(props: MultiSelectProps) {
                   const hint = hintMap.get(value)
                   const icon = iconMap.get(value)
                   return (
-                    <ComboboxChip key={value}>
+                    <ComboboxChip
+                      key={value}
+                      showRemove={!(props.disabled && props.onChipClick)}
+                      className={cn(
+                        props.onChipClick && 'min-w-0 max-w-full',
+                        props.onChipClick &&
+                          props.activeValue === value &&
+                          'bg-primary/10 text-primary ring-primary/30 ring-1'
+                      )}
+                    >
                       {icon && (
                         <span
                           aria-hidden='true'
@@ -340,18 +357,39 @@ export function MultiSelect(props: MultiSelectProps) {
                           {icon}
                         </span>
                       )}
-                      {props.copyChipOnClick ? (
-                        <button
+                      {props.onChipClick || props.copyChipOnClick ? (
+                        <Button
                           type='button'
-                          onClick={(event) =>
-                            handleCopyChip(event, value, label)
-                          }
+                          variant='ghost'
+                          size='xs'
+                          onClick={(event) => {
+                            if (props.onChipClick) {
+                              event.preventDefault()
+                              event.stopPropagation()
+                              props.onChipClick(value)
+                              return
+                            }
+                            void handleCopyChip(event, value, label)
+                          }}
                           onPointerDown={(event) => event.stopPropagation()}
-                          title={t('Click to copy')}
-                          className='max-w-[16rem] cursor-pointer truncate rounded-sm hover:underline'
+                          onKeyDown={(event) => {
+                            if (
+                              props.onChipClick &&
+                              (event.key === 'Enter' || event.key === ' ')
+                            ) {
+                              event.stopPropagation()
+                            }
+                          }}
+                          aria-pressed={
+                            props.onChipClick
+                              ? props.activeValue === value
+                              : undefined
+                          }
+                          title={props.onChipClick ? label : t('Click to copy')}
+                          className='h-auto max-w-[16rem] min-w-0 shrink cursor-pointer rounded-sm border-0 px-0 py-0 font-medium hover:underline'
                         >
-                          {label}
-                        </button>
+                          <span className='truncate'>{label}</span>
+                        </Button>
                       ) : (
                         <span className='max-w-[16rem] truncate'>{label}</span>
                       )}
