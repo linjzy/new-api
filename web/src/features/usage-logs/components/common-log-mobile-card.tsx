@@ -179,7 +179,7 @@ export function CommonLogMobileCard<TData>(props: {
               aria-label={`${t('Time')}: ${fields.time.value}`}
               aria-haspopup='dialog'
               onClick={() => setSelectedField('time')}
-              className='text-muted-foreground h-auto min-h-6 px-0 py-0 text-xs font-normal whitespace-normal tabular-nums'
+              className='text-muted-foreground h-auto min-h-6 appearance-none border-0 px-0 py-0 text-xs font-normal whitespace-normal tabular-nums shadow-none'
             >
               {dayjs.unix(log.created_at).format('MM-DD HH:mm:ss')}
             </Button>
@@ -268,7 +268,7 @@ export function CommonLogMobileCard<TData>(props: {
                     aria-label={`${field.label}: ${field.value}`}
                     aria-haspopup='dialog'
                     onClick={() => setSelectedField(id)}
-                    className='text-foreground h-auto min-h-8 min-w-0 flex-1 shrink justify-start px-0 py-1 text-left text-sm font-normal'
+                    className='text-foreground h-auto min-h-8 min-w-0 flex-1 shrink appearance-none justify-start border-0 px-0 py-1 text-left text-sm font-normal shadow-none'
                   >
                     {fieldContent}
                   </Button>

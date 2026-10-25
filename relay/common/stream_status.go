@@ -10,15 +10,16 @@ import (
 type StreamEndReason string
 
 const (
-	StreamEndReasonNone        StreamEndReason = ""
-	StreamEndReasonDone        StreamEndReason = "done"
-	StreamEndReasonTimeout     StreamEndReason = "timeout"
-	StreamEndReasonClientGone  StreamEndReason = "client_gone"
-	StreamEndReasonScannerErr  StreamEndReason = "scanner_error"
-	StreamEndReasonHandlerStop StreamEndReason = "handler_stop"
-	StreamEndReasonEOF         StreamEndReason = "eof"
-	StreamEndReasonPanic       StreamEndReason = "panic"
-	StreamEndReasonPingFail    StreamEndReason = "ping_fail"
+	StreamEndReasonNone          StreamEndReason = ""
+	StreamEndReasonDone          StreamEndReason = "done"
+	StreamEndReasonTimeout       StreamEndReason = "timeout"
+	StreamEndReasonClientGone    StreamEndReason = "client_gone"
+	StreamEndReasonScannerErr    StreamEndReason = "scanner_error"
+	StreamEndReasonHandlerStop   StreamEndReason = "handler_stop"
+	StreamEndReasonEOF           StreamEndReason = "eof"
+	StreamEndReasonPanic         StreamEndReason = "panic"
+	StreamEndReasonPingFail      StreamEndReason = "ping_fail"
+	StreamEndReasonUpstreamError StreamEndReason = "upstream_error"
 )
 
 // ResponseOutcome is the protocol-level result of one response, independent of
@@ -185,6 +186,21 @@ func (s *StreamStatus) OutcomeSnapshot() StreamOutcome {
 		ErrorType:        s.errorType,
 		ErrorStatus:      s.errorStatus,
 		IncompleteReason: s.incompleteReason,
+	}
+}
+
+// SetUpstreamError is called after the scanner has joined its workers. A
+// protocol failure takes precedence over the transport EOF that followed it.
+func (s *StreamStatus) SetUpstreamError(err error) {
+	if s == nil || err == nil {
+		return
+	}
+	if s.IsNormalEnd() || s.EndReason == StreamEndReasonNone {
+		s.EndReason = StreamEndReasonUpstreamError
+		s.EndError = err
+	}
+	if !s.HasErrors() {
+		s.RecordError(err.Error())
 	}
 }
 

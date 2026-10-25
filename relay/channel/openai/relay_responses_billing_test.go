@@ -137,9 +137,9 @@ func TestOaiResponsesStreamHandlerCompletionLifecycle(t *testing.T) {
 		{name: "data write failure", event: "response.completed", responseStatus: "completed", failWrite: 2, wantEnd: relaycommon.StreamEndReasonHandlerStop, wantError: true},
 		{name: "delimiter write failure", event: "response.completed", responseStatus: "completed", failWrite: 3, wantEnd: relaycommon.StreamEndReasonHandlerStop, wantError: true},
 		{name: "flush failure", event: "response.completed", responseStatus: "completed", failFlush: true, wantEnd: relaycommon.StreamEndReasonHandlerStop, wantError: true},
-		{name: "protocol error before completion", event: "response.completed", responseStatus: "completed", priorError: true, cancel: true, wantEnd: relaycommon.StreamEndReasonClientGone, wantError: true},
+		{name: "protocol error before completion", event: "response.completed", responseStatus: "completed", priorError: true, cancel: true, wantEnd: relaycommon.StreamEndReasonUpstreamError, wantError: true},
 		{name: "upstream read failure before handler returns", event: "response.completed", responseStatus: "completed", scannerError: true, wantEnd: relaycommon.StreamEndReasonScannerErr, wantError: true},
-		{name: "done with failed response", event: "response.done", responseStatus: "failed", eof: true, wantEnd: relaycommon.StreamEndReasonEOF, wantError: true},
+		{name: "done with failed response", event: "response.done", responseStatus: "failed", eof: true, wantEnd: relaycommon.StreamEndReasonUpstreamError, wantError: true},
 		{name: "done with incomplete response", event: "response.done", responseStatus: "incomplete", eof: true, wantEnd: relaycommon.StreamEndReasonEOF},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -187,14 +187,28 @@ func TestOaiResponsesStreamHandlerCompletionLifecycle(t *testing.T) {
 			info.SetEstimatePromptTokens(7)
 			resp := &http.Response{StatusCode: http.StatusOK, Body: upstream, Header: http.Header{"Content-Type": {"text/event-stream"}}}
 			usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
-			require.Nil(t, apiErr)
+			// The capacity patch propagates terminal, write and protocol errors
+			// for settlement and retry policy; scanner diagnostics stay on status.
+			if tc.wantError && !tc.scannerError {
+				require.NotNil(t, apiErr)
+				assert.Equal(t, http.StatusBadGateway, apiErr.StatusCode)
+				assert.True(t, types.IsSkipRetryError(apiErr))
+			} else {
+				require.Nil(t, apiErr)
+			}
 			require.NotNil(t, usage)
 			require.NotNil(t, info.StreamStatus)
 			assert.Equal(t, tc.wantEnd, info.StreamStatus.EndReason)
-			assert.Equal(t, tc.responseStatus, info.StreamStatus.ResponseOutcome())
+			wantOutcome := tc.responseStatus
+			if tc.priorError {
+				wantOutcome = string(relaycommon.ResponseOutcomeFailed) // Invalid JSON stops before observing the completion.
+			}
+			assert.Equal(t, wantOutcome, info.StreamStatus.ResponseOutcome())
 			log := service.GenerateTextOtherInfo(c, info, 1, 1, 1, 0, 1, 0, 1).Snapshot()["stream_status"].(map[string]any)
 			assert.Equal(t, tc.wantError, log["status"] == "error")
-			if tc.responseStatus != "" {
+			if tc.priorError {
+				assert.Zero(t, usage.TotalTokens)
+			} else if tc.responseStatus != "" {
 				assert.Equal(t, 7, usage.PromptTokens)
 				assert.Equal(t, 5, usage.CompletionTokens)
 				assert.Equal(t, 12, usage.TotalTokens)
@@ -202,7 +216,9 @@ func TestOaiResponsesStreamHandlerCompletionLifecycle(t *testing.T) {
 				require.Contains(t, info.ResponsesUsageInfo.BuiltInTools, dto.BuildInToolImageGeneration)
 				assert.Equal(t, 1, info.ResponsesUsageInfo.BuiltInTools[dto.BuildInToolImageGeneration].CallCount)
 			}
-			if tc.failWrite == 0 {
+			if tc.priorError {
+				assert.Empty(t, writer.Body.String())
+			} else if tc.failWrite == 0 {
 				assert.Contains(t, writer.Body.String(), payload+"\n\n")
 			} else {
 				assert.ErrorIs(t, info.StreamStatus.EndError, writer.writeErr)
