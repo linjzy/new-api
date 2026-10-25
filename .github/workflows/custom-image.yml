@@ -179,7 +179,7 @@ jobs:
 
       - name: Install pinned frontend runner
         if: steps.registry.outputs.verified != 'true'
-        run: npm install --global bun@1.4.0
+        run: npm install --global bun@1.4.4
 
       - name: Verify frontend errors, lint and types
         if: steps.registry.outputs.verified != 'true'
