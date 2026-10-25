@@ -70,7 +70,7 @@ index 31fd128b..28463215 100644
  			break
  		}
 diff --git a/dto/channel_constraints.go b/dto/channel_constraints.go
-index a1848bc1..6baff443 100644
+index 1936378..7f71719 100644
 --- a/dto/channel_constraints.go
 +++ b/dto/channel_constraints.go
 @@ -36,6 +36,7 @@ type ChannelPin struct {
@@ -79,13 +79,13 @@ index a1848bc1..6baff443 100644
  const (
 +	FilterExcludeChannels    ChannelFilterKind = "exclude_channels"
  	FilterRequestPath        ChannelFilterKind = "request_path"
+ 	FilterTaskPluginEndpoint ChannelFilterKind = "task_plugin_endpoint"
  	FilterTaskPluginIdentity ChannelFilterKind = "task_plugin_identity"
- 	FilterResponsesWebSocket ChannelFilterKind = "responses_websocket"
-@@ -47,6 +48,7 @@ type ChannelFilter struct {
- 	TaskPluginKey          string
- 	TaskPluginKeys         []string
- 	TaskPluginChannelTypes []int
-+	ExcludedChannelIDs     []int
+@@ -51,6 +52,7 @@ type ChannelFilter struct {
+ 	// TaskPluginRelayOnly excludes endpoint candidates after an ordinary relay
+ 	// channel wins selection, so retries keep using the same protocol handler.
+ 	TaskPluginRelayOnly bool
++	ExcludedChannelIDs  []int
  }
  
  type ChannelConstraints struct {
@@ -130,29 +130,18 @@ index c3d4d127..18fcf342 100644
  			return nil
  		}
 diff --git a/model/channel_constraint.go b/model/channel_constraint.go
-index c3c3e9b6..34121a7b 100644
+index 81c1541..c72046d 100644
 --- a/model/channel_constraint.go
 +++ b/model/channel_constraint.go
-@@ -8,14 +8,16 @@ import (
+@@ -8,6 +8,7 @@ import (
  )
  
  var filterEvalOrder = []dto.ChannelFilterKind{
 +	dto.FilterExcludeChannels,
  	dto.FilterRequestPath,
+ 	dto.FilterTaskPluginEndpoint,
  	dto.FilterTaskPluginIdentity,
- 	dto.FilterResponsesWebSocket,
- }
- 
- // ChannelSatisfiesFilters reports whether ch passes every filter.
--// On false, it returns the kind of the first violated filter (request_path
--// then task_plugin_identity) for error attribution.
-+// On false, it returns the kind of the first violated filter (excluded channels,
-+// request_path, task_plugin_identity, then responses_websocket) for error
-+// attribution.
- func ChannelSatisfiesFilters(ch *Channel, modelName string, filters []dto.ChannelFilter) (bool, dto.ChannelFilterKind) {
- 	if ch == nil {
- 		return false, ""
-@@ -89,6 +91,8 @@ func candidatePassesKindFilters(ch *Channel, exists bool, modelName string, kind
+@@ -90,6 +91,8 @@ func candidatePassesKindFilters(ch *Channel, exists bool, modelName string, kind
  
  func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilter) bool {
  	switch filter.Kind {
@@ -175,7 +164,7 @@ index 0efdddf1..ebc35e38 100644
  		// 处理流式请求的 ping 保活
  		generalSettings := operation_setting.GetGeneralSetting()
 diff --git a/relay/channel/openai/relay_responses.go b/relay/channel/openai/relay_responses.go
-index 37172fdb..50f2cd69 100644
+index 7d98b6e..a434285 100644
 --- a/relay/channel/openai/relay_responses.go
 +++ b/relay/channel/openai/relay_responses.go
 @@ -4,6 +4,7 @@ import (
@@ -186,7 +175,7 @@ index 37172fdb..50f2cd69 100644
  
  	"github.com/QuantumNous/new-api/common"
  	"github.com/QuantumNous/new-api/constant"
-@@ -76,26 +77,123 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
+@@ -76,21 +77,99 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
  	defer service.CloseResponseBodyGracefully(resp)
  
  	accumulator := service.NewResponsesUsageAccumulator(info)
@@ -197,6 +186,7 @@ index 37172fdb..50f2cd69 100644
 +	terminalSeen := false
 +	firstOutputEvent := ""
 +	firstOutputBytes := 0
++	downstreamFailure := false
 +	info.ResponsesStreamError = nil
 +	info.ResponsesCapacityFailure = false
 +	common.SetContextKey(c, constant.ContextKeyResponsesStreamFailed, false)
@@ -216,11 +206,9 @@ index 37172fdb..50f2cd69 100644
  		if streamResponse.Response != nil {
  			data = string(rewriteSGLangResponsesCreatedAt(info, []byte(data), "response.created_at", streamResponse.Response.CreatedAt))
  		}
--		sendResponsesStreamData(c, streamResponse, data)
 +		// Accounting runs before the commit decision: usage carried by a terminal
 +		// failure counts as work that must not be replayed.
  		accumulator.Observe(&streamResponse, common.StringToByteSlice(data))
--	})
 +
 +		failure, capacityFailure := responsesStreamFailure(streamResponse)
 +		if failure != nil {
@@ -275,18 +263,25 @@ index 37172fdb..50f2cd69 100644
 +			for i, event := range prelude {
 +				if err := helper.ResponseChunkData(c, event, preludeData[i]); err != nil {
 +					streamErr = types.NewErrorWithStatusCode(err, types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
-+					sr.Stop(streamErr)
++					downstreamFailure = true
++					sr.Stop(err)
 +					return
 +				}
 +			}
 +			prelude = nil
 +			preludeData = nil
 +		}
-+		if err := helper.ResponseChunkData(c, streamResponse, data); err != nil {
+ 		if err := helper.ResponseChunkData(c, streamResponse, data); err != nil {
 +			streamErr = types.NewErrorWithStatusCode(err, types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
-+			sr.Stop(streamErr)
-+			return
-+		}
++			downstreamFailure = true
+ 			sr.Stop(err)
+ 			return
+ 		}
+@@ -98,11 +177,32 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
+ 			streamResponse.Response != nil && info.StreamStatus.ResponseOutcome() == string(relaycommon.ResponseOutcomeCompleted) {
+ 			sr.Done()
+ 		}
+-	})
 +	}, helper.StreamScannerOptions{DeferHeaders: true})
 +
 +	if streamErr == nil && !terminalSeen {
@@ -300,7 +295,9 @@ index 37172fdb..50f2cd69 100644
 +	}
 +	if streamErr != nil {
 +		logger.LogWarn(c, common.LogText("Responses stream failure: committed=%t first_output_event=%q first_output_bytes=%d prelude_bytes=%d capacity=%t", c.Writer.Written(), firstOutputEvent, firstOutputBytes, preludeBytes, info.ResponsesCapacityFailure))
-+		info.StreamStatus.SetUpstreamError(streamErr)
++		if !downstreamFailure {
++			info.StreamStatus.SetUpstreamError(streamErr)
++		}
 +		info.ResponsesStreamError = streamErr
 +		common.SetContextKey(c, constant.ContextKeyResponsesStreamFailed, true)
 +		if c.Writer.Written() || c.Request.Context().Err() != nil {
@@ -315,7 +312,7 @@ index 37172fdb..50f2cd69 100644
  }
  
  func rewriteSGLangResponsesCreatedAt(info *relaycommon.RelayInfo, payload []byte, path string, createdAt dto.IntValue) []byte {
-@@ -111,3 +209,242 @@ func rewriteSGLangResponsesCreatedAt(info *relaycommon.RelayInfo, payload []byte
+@@ -118,3 +218,242 @@ func rewriteSGLangResponsesCreatedAt(info *relaycommon.RelayInfo, payload []byte
  	}
  	return patched
  }
@@ -625,11 +622,11 @@ index 60c84956..35fe33ad 100644
  	if s == nil {
  		return false
 diff --git a/relay/helper/stream_scanner.go b/relay/helper/stream_scanner.go
-index 0268ca36..82b81898 100644
+index 80d8fbc..137e565 100644
 --- a/relay/helper/stream_scanner.go
 +++ b/relay/helper/stream_scanner.go
-@@ -80,7 +80,17 @@ func ExtendWriteDeadline(c *gin.Context) {
- 	_ = http.NewResponseController(c.Writer).SetWriteDeadline(time.Now().Add(streamWriteTimeout))
+@@ -117,7 +117,17 @@ func (w *streamResponseWriter) Unwrap() http.ResponseWriter {
+ 	return w.ResponseWriter
  }
  
 -func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, dataHandler func(data string, sr *StreamResult)) {
@@ -647,7 +644,7 @@ index 0268ca36..82b81898 100644
  
  	if resp == nil || dataHandler == nil {
  		return
-@@ -88,6 +98,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
+@@ -131,6 +141,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
  
  	// 无条件新建 StreamStatus
  	info.StreamStatus = relaycommon.NewStreamStatus()
@@ -655,7 +652,7 @@ index 0268ca36..82b81898 100644
  
  	ctx, cancel := context.WithCancel(context.Background())
  
-@@ -147,8 +158,16 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
+@@ -190,8 +201,16 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
  	defer cleanup()
  
  	scanner.Split(bufio.ScanLines)
@@ -674,17 +671,17 @@ index 0268ca36..82b81898 100644
  
  	ctx = context.WithValue(ctx, "stop_chan", stopChan)
  
-@@ -178,6 +197,9 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
+@@ -221,6 +240,9 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
  					func() {
  						writeMutex.Lock()
  						defer writeMutex.Unlock()
 +						if deferHeaders && !c.Writer.Written() {
 +							return
 +						}
- 						ExtendWriteDeadline(c)
  						err = PingData(c)
  					}()
-@@ -296,15 +318,30 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
+ 					if err != nil {
+@@ -342,15 +364,30 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
  	})
  
  	// 主循环等待完成或超时
@@ -891,3 +888,62 @@ index b5cb682e..0e01a630 100644
  	var tieredResult *billingexpr.TieredResult
  	var tieredTokens billingexpr.TokenParams
  	tieredBillingApplied := false
+diff --git a/relay/channel/openai/relay_responses_billing_test.go b/relay/channel/openai/relay_responses_billing_test.go
+index cf0f933..d0848de 100644
+--- a/relay/channel/openai/relay_responses_billing_test.go
++++ b/relay/channel/openai/relay_responses_billing_test.go
+@@ -137,9 +137,9 @@ func TestOaiResponsesStreamHandlerCompletionLifecycle(t *testing.T) {
+ 		{name: "data write failure", event: "response.completed", responseStatus: "completed", failWrite: 2, wantEnd: relaycommon.StreamEndReasonHandlerStop, wantError: true},
+ 		{name: "delimiter write failure", event: "response.completed", responseStatus: "completed", failWrite: 3, wantEnd: relaycommon.StreamEndReasonHandlerStop, wantError: true},
+ 		{name: "flush failure", event: "response.completed", responseStatus: "completed", failFlush: true, wantEnd: relaycommon.StreamEndReasonHandlerStop, wantError: true},
+-		{name: "protocol error before completion", event: "response.completed", responseStatus: "completed", priorError: true, cancel: true, wantEnd: relaycommon.StreamEndReasonClientGone, wantError: true},
++		{name: "protocol error before completion", event: "response.completed", responseStatus: "completed", priorError: true, cancel: true, wantEnd: relaycommon.StreamEndReasonUpstreamError, wantError: true},
+ 		{name: "upstream read failure before handler returns", event: "response.completed", responseStatus: "completed", scannerError: true, wantEnd: relaycommon.StreamEndReasonScannerErr, wantError: true},
+-		{name: "done with failed response", event: "response.done", responseStatus: "failed", eof: true, wantEnd: relaycommon.StreamEndReasonEOF, wantError: true},
++		{name: "done with failed response", event: "response.done", responseStatus: "failed", eof: true, wantEnd: relaycommon.StreamEndReasonUpstreamError, wantError: true},
+ 		{name: "done with incomplete response", event: "response.done", responseStatus: "incomplete", eof: true, wantEnd: relaycommon.StreamEndReasonEOF},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+@@ -187,14 +187,28 @@ func TestOaiResponsesStreamHandlerCompletionLifecycle(t *testing.T) {
+ 			info.SetEstimatePromptTokens(7)
+ 			resp := &http.Response{StatusCode: http.StatusOK, Body: upstream, Header: http.Header{"Content-Type": {"text/event-stream"}}}
+ 			usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+-			require.Nil(t, apiErr)
++			// The capacity patch propagates terminal, write and protocol errors
++			// for settlement and retry policy; scanner diagnostics stay on status.
++			if tc.wantError && !tc.scannerError {
++				require.NotNil(t, apiErr)
++				assert.Equal(t, http.StatusBadGateway, apiErr.StatusCode)
++				assert.True(t, types.IsSkipRetryError(apiErr))
++			} else {
++				require.Nil(t, apiErr)
++			}
+ 			require.NotNil(t, usage)
+ 			require.NotNil(t, info.StreamStatus)
+ 			assert.Equal(t, tc.wantEnd, info.StreamStatus.EndReason)
+-			assert.Equal(t, tc.responseStatus, info.StreamStatus.ResponseOutcome())
++			wantOutcome := tc.responseStatus
++			if tc.priorError {
++				wantOutcome = string(relaycommon.ResponseOutcomeFailed) // Invalid JSON stops before observing the completion.
++			}
++			assert.Equal(t, wantOutcome, info.StreamStatus.ResponseOutcome())
+ 			log := service.GenerateTextOtherInfo(c, info, 1, 1, 1, 0, 1, 0, 1).Snapshot()["stream_status"].(map[string]any)
+ 			assert.Equal(t, tc.wantError, log["status"] == "error")
+-			if tc.responseStatus != "" {
++			if tc.priorError {
++				assert.Zero(t, usage.TotalTokens)
++			} else if tc.responseStatus != "" {
+ 				assert.Equal(t, 7, usage.PromptTokens)
+ 				assert.Equal(t, 5, usage.CompletionTokens)
+ 				assert.Equal(t, 12, usage.TotalTokens)
+@@ -202,7 +216,9 @@ func TestOaiResponsesStreamHandlerCompletionLifecycle(t *testing.T) {
+ 				require.Contains(t, info.ResponsesUsageInfo.BuiltInTools, dto.BuildInToolImageGeneration)
+ 				assert.Equal(t, 1, info.ResponsesUsageInfo.BuiltInTools[dto.BuildInToolImageGeneration].CallCount)
+ 			}
+-			if tc.failWrite == 0 {
++			if tc.priorError {
++				assert.Empty(t, writer.Body.String())
++			} else if tc.failWrite == 0 {
+ 				assert.Contains(t, writer.Body.String(), payload+"\n\n")
+ 			} else {
+ 				assert.ErrorIs(t, info.StreamStatus.EndError, writer.writeErr)
