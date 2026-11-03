@@ -85,7 +85,7 @@ jobs:
           extended="$EXTENDED"
           if [[ "$GITHUB_EVENT_NAME" == schedule ]] ||
              { [[ -n "$BEFORE" && "$BEFORE" != 0000000000000000000000000000000000000000 ]] &&
-               ! git diff --quiet "$BEFORE" HEAD -- .linjzy/patches/responses-capacity-retry.patch .linjzy/patches/astra-iq-gate.patch .linjzy/tests/go .linjzy/bin/prepare-release.py; }; then
+               ! git diff --quiet "$BEFORE" HEAD -- .linjzy/patches/responses-capacity-retry.patch .linjzy/patches/astra-iq-gate.patch .linjzy/patches/graceful-drain.patch .linjzy/tests/go .linjzy/bin/prepare-release.py; }; then
             extended=true
           fi
           {

@@ -8,6 +8,7 @@
 | `usage-logs-auto-refresh.patch` | 用量日志自动刷新、错误去重，失败后停止刷新 |
 | `responses-capacity-retry.patch` | 输出前无计费用量的容量错误重试，保留已产生用量的结算 |
 | `astra-iq-gate.patch` | 可选模型的定时答题检测、独立配置与路由门禁及卡片历史状态条 |
+| `graceful-drain.patch` | 部署准入、Responses WS 当前请求完成后关闭、Unix socket 运维控制及 SIGTERM 排空 |
 
 容量重试需要开启自动重试，并配置同模型、同分组的可用替代渠道。
 已产生输出或计费用量的请求不会重放。

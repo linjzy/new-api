@@ -52,6 +52,20 @@ for _ in $(seq 1 90); do
     curl -fs --connect-timeout 2 --max-time 5 \
       "http://127.0.0.1:${PORT}/" 2>/dev/null | grep -q '/static/js/'
   then
+    docker exec "$CONTAINER_NAME" /new-api drain status | python3 -c '
+import json,sys
+p=json.load(sys.stdin)
+assert p["protocol"] == 1 and p["draining"] is False
+'
+    docker exec "$CONTAINER_NAME" /new-api drain begin image-smoke >/dev/null
+    CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${PORT}/v1/models")"
+    [[ "$CODE" == 503 ]] || { printf 'drain did not reject new requests: %s\n' "$CODE" >&2; exit 1; }
+    curl -fs --max-time 5 "http://127.0.0.1:${PORT}/api/status" | json_success
+    docker exec "$CONTAINER_NAME" /new-api drain cancel image-smoke >/dev/null
+    docker stop --time 15 "$CONTAINER_NAME" >/dev/null
+    [[ "$(docker inspect "$CONTAINER_NAME" --format '{{.State.ExitCode}}')" == 0 ]] || {
+      printf 'image did not stop gracefully\n' >&2; exit 1;
+    }
     printf 'smoke test passed for %s\n' "$IMAGE_REF"
     exit 0
   fi

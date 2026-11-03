@@ -25,6 +25,7 @@ OVERRIDE_FILE="${NEWAPI_OVERRIDE_FILE:-$DEPLOY_DIR/docker-compose.override.yml}"
 APP_SERVICE="${NEWAPI_APP_SERVICE:-new-api}"
 APP_CONTAINER="${NEWAPI_APP_CONTAINER:-new-api}"
 APP_PORT="${NEWAPI_APP_PORT:-8899}"
+APP_INTERNAL_PORT="${NEWAPI_APP_INTERNAL_PORT:-3000}"
 PUBLIC_URL="${NEWAPI_PUBLIC_URL:-https://ai.linjzy.com}"
 MAINTENANCE_FLAG="${NEWAPI_MAINTENANCE_FLAG:-/run/newapi-maintenance}"
 
@@ -44,7 +45,14 @@ CANDIDATE_STATE_FILE="$STATE_DIR/candidate.env"
 CURRENT_STATE_FILE="$STATE_DIR/current.env"
 SCHEDULED_STATE_FILE="$STATE_DIR/scheduled.env"
 JOB_STATE_FILE="$STATE_DIR/job.env"
+MAINTENANCE_STATE_FILE="$STATE_DIR/maintenance.env"
 SCRIPT_SHA256="$(sha256sum "$SCRIPT_PATH" | awk '{print $1}')"
+JOB_ID="newapi-$(date +%Y%m%d%H%M%S)-$$"
+GATE_OWNED=0
+LIVE_CONTAINER_CHANGED=0
+GATE_RELEASE_ALLOWED=0
+APP_DRAIN_ACTIVE=0
+DRAIN_CONTAINER_ID=""
 JOB_PHASE=idle
 JOB_STARTED_SECONDS=$SECONDS
 PHASE_STARTED_SECONDS=$SECONDS
@@ -76,6 +84,7 @@ Usage:
   newapi-custom-upgrade.sh deploy
   newapi-custom-upgrade.sh upgrade [release-tag|latest|previous|image-reference]
   newapi-custom-upgrade.sh cleanup
+  newapi-custom-upgrade.sh recover
 
 Commands:
   latest    Print the configured GHCR candidate reference.
@@ -87,6 +96,7 @@ Commands:
             "previous" redeploys the registry's previous candidate.
   cleanup   Remove unused New API managed resources and expired task logs.
             Other projects and shared Docker build caches are untouched.
+  recover   Recover an abandoned maintenance job after local health verification.
 
 Production hosts do not fetch source code, apply patches, or build Docker
 images.
@@ -106,7 +116,7 @@ require_runtime_commands() {
   local command_name
   for command_name in \
     awk curl df docker find flock grep install mktemp python3 readlink sed ss \
-    systemctl systemd-run tee unlink sha256sum
+    systemctl systemd-run tee unlink sha256sum nsenter
   do
     need_command "$command_name"
   done
@@ -332,33 +342,107 @@ backup_database() {
 }
 
 active_app_connections() {
-  ss -Htn state established "( sport = :${APP_PORT} )" |
+  local pid
+  pid="$(docker inspect "$APP_CONTAINER" --format '{{.State.Pid}}')" || return 1
+  [[ "$pid" =~ ^[1-9][0-9]*$ && "$APP_INTERNAL_PORT" =~ ^[0-9]+$ ]] || return 1
+  nsenter -t "$pid" -n ss -Htn state established "( sport = :${APP_INTERNAL_PORT} )" |
     awk 'END {print NR + 0}'
 }
 
 disable_request_gate() {
-  if [[ -e "$MAINTENANCE_FLAG" ]]; then
-    unlink "$MAINTENANCE_FLAG"
-    log "public request gate removed"
+  [[ "$GATE_OWNED" == 1 ]] || return 0
+  [[ -f "$MAINTENANCE_FLAG" && "$(cat "$MAINTENANCE_FLAG")" == "$JOB_ID" ]] || {
+    log "maintenance gate ownership changed; leaving it untouched"
+    return 1
+  }
+  if [[ "$APP_DRAIN_ACTIVE" == 1 ]]; then
+    local current_id
+    current_id="$(docker inspect "$APP_CONTAINER" --format '{{.Id}}')" || return 1
+    if [[ "$current_id" == "$DRAIN_CONTAINER_ID" ]]; then
+      docker exec "$DRAIN_CONTAINER_ID" /new-api drain cancel "$JOB_ID" >/dev/null || return 1
+    fi
+    APP_DRAIN_ACTIVE=0
   fi
+  curl -fsS --connect-timeout 3 --max-time 10 \
+    "http://127.0.0.1:${APP_PORT}/api/status" | json_success || return 1
+  unlink "$MAINTENANCE_FLAG"
+  rm -f "$MAINTENANCE_STATE_FILE"
+  GATE_OWNED=0
+  log "public request gate removed after local health verification"
 }
 
 enable_request_gate() {
-  local status_code
-  if [[ ! -e "$MAINTENANCE_FLAG" ]]; then
-    install -m 644 /dev/null "$MAINTENANCE_FLAG"
-    log "new public requests are temporarily gated at nginx"
+  local status_code address headers host port verified
+  local current_id
+  current_id="$(docker container ls -aq --no-trunc --filter "name=^/${APP_CONTAINER}$")" ||
+    die "cannot inspect application container"
+  if [[ "$current_id" != "$DRAIN_CONTAINER_ID" ]]; then
+    DRAIN_CONTAINER_ID="$current_id"
+    APP_DRAIN_ACTIVE=0
+  fi
+  if [[ -e "$MAINTENANCE_FLAG" ]]; then
+    [[ "$GATE_OWNED" == 1 && "$(cat "$MAINTENANCE_FLAG")" == "$JOB_ID" ]] ||
+      die "maintenance gate already exists; inspect status and use recover for an abandoned job"
+  else
+    [[ -n "$DRAIN_CONTAINER_ID" ]] || die "application container is missing before maintenance"
+    write_env_file "$MAINTENANCE_STATE_FILE" \
+      "MAINTENANCE_JOB_ID=$JOB_ID" "MAINTENANCE_CONTAINER_ID=$DRAIN_CONTAINER_ID"
+    (set -o noclobber; printf '%s\n' "$JOB_ID" >"$MAINTENANCE_FLAG") ||
+      die "maintenance gate was created by another operator"
+    GATE_OWNED=1
+    GATE_RELEASE_ALLOWED=0
+    chmod 644 "$MAINTENANCE_FLAG"
+    log "new public requests are temporarily gated at nginx; job=$JOB_ID"
   fi
 
+  read -r host port < <(python3 - "$PUBLIC_URL" <<'PY'
+import sys
+from urllib.parse import urlsplit
+url = urlsplit(sys.argv[1])
+if url.scheme != 'https' or not url.hostname:
+    raise SystemExit('PUBLIC_URL must be an HTTPS URL')
+print(url.hostname, url.port or 443)
+PY
+  )
+  headers="$(mktemp "$STATE_DIR/.gate-check.XXXXXX")"
+  verified=0
   for _ in $(seq 1 10); do
-    status_code="$(curl -sS -o /dev/null -w '%{http_code}' \
-      --connect-timeout 5 --max-time 10 "$PUBLIC_URL/api/status" || true)"
-    [[ "$status_code" == '503' ]] && return 0
+    verified=1
+    # Verify both enabled listener families on this host, independent of DNS.
+    for address in 127.0.0.1 '[::1]'; do
+      status_code="$(curl -sS --noproxy '*' --resolve "$host:$port:$address" \
+        -D "$headers" -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 5 \
+        "$PUBLIC_URL/api/status" || true)"
+      if [[ "$status_code" != 503 ]] || ! grep -qi '^X-Newapi-Maintenance: 1' "$headers"; then
+        verified=0
+        break
+      fi
+    done
+    [[ "$verified" == 1 ]] && break
     sleep 1
   done
+  rm -f "$headers"
+  [[ "$verified" == 1 ]] && return 0
+  die "nginx request gate verification failed: expected identified maintenance 503 on IPv4 and IPv6"
+}
 
-  disable_request_gate
-  die "nginx request gate verification failed: expected 503, got $status_code"
+begin_app_drain() {
+  [[ "$APP_DRAIN_ACTIVE" == 0 ]] || return 0
+  local protocol
+  protocol="$(docker inspect "$DRAIN_CONTAINER_ID" \
+    --format '{{index .Config.Labels "com.linjzy.new-api.drain-protocol"}}')" ||
+    die "cannot inspect drain capability; service was not changed"
+  case "$protocol" in
+    1)
+      # Mark ownership before sending: a lost reply must still trigger cancel.
+      APP_DRAIN_ACTIVE=1
+      docker exec "$DRAIN_CONTAINER_ID" /new-api drain begin "$JOB_ID" >/dev/null ||
+        die "application drain could not be started; service was not changed"
+      log "application drain started; idle WS close and busy Responses finish their current request"
+      ;;
+    ''|'<no value>') log "legacy image: waiting for all TCP connections without forcing WebSockets" ;;
+    *) die "unsupported application drain protocol: $protocol" ;;
+  esac
 }
 
 # Opportunistic idle wait leaves the public entry open. The post-gate drain is
@@ -384,20 +468,52 @@ wait_for_idle_window() {
 
 wait_for_connection_drain() {
   local phase="$1"
-  local deadline active_count
+  local deadline active_count snapshot previous_snapshot="" last_log=0
+  [[ "$DRAIN_WAIT_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "invalid drain wait seconds"
+  if [[ -z "$DRAIN_CONTAINER_ID" ]] ||
+    [[ "$(docker inspect "$DRAIN_CONTAINER_ID" --format '{{.State.Running}}')" == false ]]; then
+    log "application container is absent or stopped; there are no active connections"
+    return 0
+  fi
+  begin_app_drain
   deadline=$(($(date +%s) + DRAIN_WAIT_SECONDS))
   log "waiting for active new-api connections to drain before $phase"
 
   while (($(date +%s) < deadline)); do
-    active_count="$(active_app_connections)" ||
-      die "cannot inspect active connections; service was not changed"
-    [[ "$active_count" =~ ^[0-9]+$ ]] ||
-      die "invalid active connection count; service was not changed"
-    if ((active_count == 0)); then
-      log "connection drain confirmed"
-      return 0
+    if [[ "$APP_DRAIN_ACTIVE" == 1 ]]; then
+      snapshot="$(docker exec "$DRAIN_CONTAINER_ID" /new-api drain status | python3 -c '
+import json,sys
+p=json.load(sys.stdin)
+keys=("http_inflight","ws_busy","ws_idle","ws_closing")
+if p.get("protocol") != 1 or p.get("job_id") != sys.argv[1] or p.get("draining") is not True:
+    raise SystemExit("invalid drain ownership")
+if any(type(p.get(k)) is not int or p[k] < 0 for k in keys) or type(p.get("ready")) is not bool:
+    raise SystemExit("invalid drain counters")
+empty=all(p[k] == 0 for k in keys)
+if p["ready"] != empty:
+    raise SystemExit("inconsistent drain readiness")
+print(("ready" if empty else "busy") + " " + " ".join(k+"="+str(p[k]) for k in keys))
+' "$JOB_ID")" || die "cannot inspect application drain; service was not changed"
+      if [[ "$snapshot" == ready\ * ]]; then
+        log "business requests and WebSocket connections drained: $snapshot"
+        return 0
+      fi
+    else
+      active_count="$(active_app_connections)" ||
+        die "cannot inspect active connections; service was not changed"
+      [[ "$active_count" =~ ^[0-9]+$ ]] ||
+        die "invalid active connection count; service was not changed"
+      if ((active_count == 0)); then
+        log "connection drain confirmed"
+        return 0
+      fi
+      snapshot="$active_count active TCP connection(s)"
     fi
-    log "$active_count active connection(s); waiting"
+    if [[ "$snapshot" != "$previous_snapshot" ]] || (($(date +%s) - last_log >= 10)); then
+      log "$snapshot; waiting, remaining_seconds=$((deadline - $(date +%s)))"
+      previous_snapshot="$snapshot"
+      last_log=$(date +%s)
+    fi
     sleep 1
   done
 
@@ -439,6 +555,8 @@ write_override() {
 }
 
 compose_up_app() {
+  LIVE_CONTAINER_CHANGED=1
+  GATE_RELEASE_ALLOWED=0
   (
     cd "$DEPLOY_DIR"
     docker compose config --quiet
@@ -500,7 +618,7 @@ deploy_local_and_verify() {
   local expected_image_id="$2"
   local running_image_id
 
-  write_override "$image_ref"
+  write_override "$image_ref" || return 1
   compose_up_app || return 1
   wait_for_app_health || return 1
 
@@ -519,11 +637,12 @@ rollback_to_image() {
   wait_for_connection_drain 'rolling back the live container'
   write_override "$rollback_ref"
   if ! compose_up_app || ! wait_for_app_health; then
-    disable_request_gate
+    log "rollback failed; maintenance gate retained"
     return 1
   fi
 
-  disable_request_gate
+  GATE_RELEASE_ALLOWED=1
+  disable_request_gate || return 1
   verify_public_entry
 }
 
@@ -624,7 +743,8 @@ activate_image() {
     die "deployment failed and rollback was attempted; inspect the job log"
   fi
 
-  disable_request_gate
+  GATE_RELEASE_ALLOWED=1
+  disable_request_gate || die "cannot safely restore the public entry"
   if ! verify_public_entry; then
     log "candidate public verification failed"
     if rollback_to_image "$ROLLBACK_REF"; then
@@ -743,6 +863,14 @@ show_status() {
     printf '%s\n' 'Last job result:'
     sed 's/^/  /' "$JOB_STATE_FILE"
   fi
+  if [[ -e "$MAINTENANCE_FLAG" ]]; then
+    printf 'Maintenance gate: present; recorded_job=%s\n' \
+      "$(state_value "$MAINTENANCE_STATE_FILE" MAINTENANCE_JOB_ID)"
+  fi
+  if [[ "$(docker inspect "$APP_CONTAINER" --format '{{index .Config.Labels "com.linjzy.new-api.drain-protocol"}}' 2>/dev/null || true)" == 1 ]]; then
+    printf '%s\n' 'Application drain status:'
+    docker exec "$APP_CONTAINER" /new-api drain status || true
+  fi
   printf 'Retained previous image: %s\n' \
     "$(docker image inspect "$ROLLBACK_REF" --format '{{join .RepoDigests " "}}' 2>/dev/null | grep . || echo none)"
   if [[ -f "$DB_BACKUP_FILE" ]]; then
@@ -758,7 +886,14 @@ show_status() {
 
 finish_internal_job() {
   local rc="$1"
-  disable_request_gate
+  trap - EXIT INT TERM HUP
+  if [[ "$GATE_OWNED" == 1 ]]; then
+    if [[ "$LIVE_CONTAINER_CHANGED" == 0 || "$GATE_RELEASE_ALLOWED" == 1 ]]; then
+      disable_request_gate || log "CRITICAL: maintenance recovery failed; gate retained for recover"
+    else
+      log "CRITICAL: container activation was not verified; maintenance gate retained for recover"
+    fi
+  fi
   write_env_file "$JOB_STATE_FILE" \
     "JOB_PHASE=$JOB_PHASE" "JOB_EXIT_CODE=$rc" \
     "JOB_DURATION_SECONDS=$((SECONDS - JOB_STARTED_SECONDS))" \
@@ -767,6 +902,36 @@ finish_internal_job() {
   if ((rc != 0)); then
     rm -f "$SCHEDULED_STATE_FILE"
   fi
+}
+
+recover_maintenance() {
+  [[ -f "$MAINTENANCE_FLAG" ]] || { log "no maintenance gate to recover"; return 0; }
+  local saved_job protocol payload
+  saved_job="$(state_value "$MAINTENANCE_STATE_FILE" MAINTENANCE_JOB_ID)"
+  [[ -n "$saved_job" && "$(cat "$MAINTENANCE_FLAG")" == "$saved_job" ]] ||
+    die "maintenance gate has no matching ownership record; leaving it untouched"
+  JOB_ID="$saved_job"
+  GATE_OWNED=1
+  DRAIN_CONTAINER_ID="$(docker inspect "$APP_CONTAINER" --format '{{.Id}}')"
+  protocol="$(docker inspect "$DRAIN_CONTAINER_ID" \
+    --format '{{index .Config.Labels "com.linjzy.new-api.drain-protocol"}}')"
+  if [[ "$protocol" == 1 ]]; then
+    payload="$(docker exec "$DRAIN_CONTAINER_ID" /new-api drain status)" ||
+      die "cannot inspect abandoned application drain"
+    APP_DRAIN_ACTIVE="$(printf '%s' "$payload" | python3 -c '
+import json,sys
+p=json.load(sys.stdin)
+if p.get("protocol") != 1 or type(p.get("draining")) is not bool:
+    raise SystemExit("invalid drain status")
+if p["draining"] and p.get("job_id") != sys.argv[1]:
+    raise SystemExit("application drain belongs to a different job")
+print(1 if p["draining"] else 0)
+' "$JOB_ID")" || die "cannot recover application drain ownership"
+  fi
+  wait_for_app_health || die "application is unhealthy; maintenance gate retained"
+  disable_request_gate || die "maintenance recovery failed; gate retained"
+  verify_public_entry || die "local recovery completed but public verification failed"
+  log "abandoned maintenance job recovered: $JOB_ID"
 }
 
 run_internal_upgrade() {
@@ -780,6 +945,9 @@ run_internal_upgrade() {
   acquire_lock
   begin_job_log upgrade
   trap 'finish_internal_job $?' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
   set_phase pull
   pull_candidate "$requested"
   activate_image \
@@ -802,6 +970,9 @@ run_internal_activate() {
   acquire_lock
   begin_job_log activate
   trap 'finish_internal_job $?' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
   set_phase inspect
   activate_image \
     "$image_ref" "$release_tag" "$upstream_commit" \
@@ -861,6 +1032,15 @@ main() {
       acquire_lock
       [[ $# -eq 0 ]] || die "cleanup does not accept arguments"
       safe_cleanup
+      ;;
+    recover)
+      require_root
+      require_runtime_commands
+      ensure_runtime_dirs
+      acquire_lock
+      [[ $# -eq 0 ]] || die "recover does not accept arguments"
+      existing_background_job && die "a background deployment job is still active"
+      recover_maintenance
       ;;
     _upgrade)
       [[ $# -eq 1 ]] || die "invalid internal upgrade arguments"
