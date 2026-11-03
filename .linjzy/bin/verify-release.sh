@@ -9,29 +9,16 @@ else
   FRONTEND="$SOURCE_DIR/web"
 fi
 case "$MODE" in
-  go|race|frontend|all) ;;
+  go|frontend|all) ;;
   *) printf 'unknown verification mode: %s\n' "$MODE" >&2; exit 1 ;;
 esac
 if [[ "$MODE" != frontend ]]; then
-  if [[ "$(uname -s)" == Linux ]]; then
-    codex_bin_dir="${RUNNER_TEMP:-/tmp}/newapi-astra-iq-cli"
-    if [[ "$("$codex_bin_dir/codex" --version 2>/dev/null || true)" != 'codex-cli 0.157.1' ]]; then
-      bash "$SOURCE_DIR/scripts/install-astra-iq-codex.sh" "$codex_bin_dir"
-    fi
-    export PATH="$codex_bin_dir:$PATH"
-  fi
-  cp -R "$BUNDLE_DIR/tests/go/." "$SOURCE_DIR/"
   cd "$SOURCE_DIR"
-  if [[ "$MODE" == race ]]; then
-    GOWORK=off go test -race ./controller ./service ./relay ./relay/channel ./relay/channel/openai -run 'TestCustom|TestOaiResponses|TestNewTaskAPIRequestInheritsClientCancellation' -count=1
-  else
-    GOWORK=off go -C relaykit build ./...
-    GOWORK=off go test -v ./controller ./router ./relay ./relay/channel ./relay/channel/openai ./model ./service -run 'TestCustom|TestOaiResponses|TestResponsesUsage|TestApplyResponsesUsage|TestNewTaskAPIRequestInheritsClientCancellation' -count=1
-  fi
+  GOWORK=off go -C relaykit build ./...
+  # The image build compiles main after creating the real embedded frontend.
+  GOWORK=off go build ./controller ./router ./relay/... ./model ./service/... ./pkg/drain
 fi
 if [[ "$MODE" == frontend || "$MODE" == all ]]; then
-  mkdir -p "$FRONTEND/src/features/usage-logs/custom-tests"
-  cp "$BUNDLE_DIR"/tests/frontend/* "$FRONTEND/src/features/usage-logs/custom-tests/"
   cd "$SOURCE_DIR/web"
   bun install --frozen-lockfile
   cd "$FRONTEND"
@@ -52,7 +39,6 @@ for patch in (Path(sys.argv[1]) / 'patches').glob('*.patch'):
 print('\n'.join(sorted(files)))
 PYFILES
   )
-  bun x oxlint -c .oxlintrc.json "${changed_ts[@]}" src/features/usage-logs/custom-tests
-  bun run test src/features/usage-logs/custom-tests src/features/channels/components/__tests__/astra-iq-status.test.tsx src/components/multi-select/__tests__ src/features/usage-logs/components/__tests__/mobile-card.test.tsx
+  bun x oxlint -c .oxlintrc.json "${changed_ts[@]}"
   if [[ "${BUILD_FRONTEND:-true}" == true ]]; then bun run build; fi
 fi

@@ -319,14 +319,7 @@ pull_candidate() {
 }
 
 backup_database() {
-  local upstream_commit="$1"
   local tmp
-  if [[ -f "$DB_BACKUP_FILE" &&
-    "$(state_value "$CURRENT_STATE_FILE" CURRENT_UPSTREAM_COMMIT)" == "$upstream_commit" ]]
-  then
-    log "upstream version unchanged; keeping $DB_BACKUP_FILE"
-    return 0
-  fi
   mkdir -p "$(dirname "$DB_BACKUP_FILE")"
   tmp="$(mktemp "$DB_BACKUP_FILE.tmp.XXXXXX")"
   if ! docker exec "$DB_CONTAINER" \
@@ -335,6 +328,10 @@ backup_database() {
   then
     rm -f "$tmp"
     die "database backup failed; service was not changed"
+  fi
+  if ! docker exec -i "$DB_CONTAINER" pg_restore --list <"$tmp" >/dev/null; then
+    rm -f "$tmp"
+    die "database backup archive is invalid; service was not changed"
   fi
   chmod 600 "$tmp"
   mv -f "$tmp" "$DB_BACKUP_FILE"
@@ -356,18 +353,31 @@ disable_request_gate() {
     return 1
   }
   if [[ "$APP_DRAIN_ACTIVE" == 1 ]]; then
-    local current_id
+    local current_id draining
     current_id="$(docker inspect "$APP_CONTAINER" --format '{{.Id}}')" || return 1
     if [[ "$current_id" == "$DRAIN_CONTAINER_ID" ]]; then
-      docker exec "$DRAIN_CONTAINER_ID" /new-api drain cancel "$JOB_ID" >/dev/null || return 1
+      # Begin can fail before the application accepts it. Inspect ownership
+      # before canceling; an already inactive drain needs no cancellation.
+      draining="$(docker exec "$DRAIN_CONTAINER_ID" /new-api drain status | python3 -c '
+import json,sys
+p=json.load(sys.stdin)
+if p.get("protocol") != 1 or type(p.get("draining")) is not bool:
+    raise SystemExit("invalid drain status")
+if p["draining"] and p.get("job_id") != sys.argv[1]:
+    raise SystemExit("application drain belongs to a different job")
+print(1 if p["draining"] else 0)
+' "$JOB_ID")" || return 1
+      if [[ "$draining" == 1 ]]; then
+        docker exec "$DRAIN_CONTAINER_ID" /new-api drain cancel "$JOB_ID" >/dev/null || return 1
+      fi
     fi
     APP_DRAIN_ACTIVE=0
   fi
   curl -fsS --connect-timeout 3 --max-time 10 \
     "http://127.0.0.1:${APP_PORT}/api/status" | json_success || return 1
-  unlink "$MAINTENANCE_FLAG"
-  rm -f "$MAINTENANCE_STATE_FILE"
+  unlink "$MAINTENANCE_FLAG" || return 1
   GATE_OWNED=0
+  rm -f "$MAINTENANCE_STATE_FILE"
   log "public request gate removed after local health verification"
 }
 
@@ -542,15 +552,15 @@ write_override() {
   local tmp
   validate_image_ref "$image_ref"
   ensure_override_manageable
-  tmp="$(mktemp "$DEPLOY_DIR/.docker-compose.override.yml.XXXXXX")"
+  tmp="$(mktemp "$DEPLOY_DIR/.docker-compose.override.yml.XXXXXX")" || return 1
   {
     printf '%s\n' "$OVERRIDE_MARKER"
     printf '%s\n' 'services:'
     printf '%s\n' "  ${APP_SERVICE}:"
     printf '    image: %s\n' "$image_ref"
     printf '%s\n' '    stop_grace_period: 180s'
-  } >"$tmp"
-  chmod 600 "$tmp"
+  } >"$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$OVERRIDE_FILE"
 }
 
@@ -559,7 +569,7 @@ compose_up_app() {
   GATE_RELEASE_ALLOWED=0
   (
     cd "$DEPLOY_DIR"
-    docker compose config --quiet
+    docker compose config --quiet || return 1
     docker compose up -d --no-deps --pull never "$APP_SERVICE"
   )
 }
@@ -631,12 +641,13 @@ deploy_local_and_verify() {
 
 rollback_to_image() {
   local rollback_ref="$1"
+  local rollback_id
 
   log "rolling back to $rollback_ref"
+  rollback_id="$(docker image inspect "$rollback_ref" --format '{{.Id}}')" || return 1
   enable_request_gate
   wait_for_connection_drain 'rolling back the live container'
-  write_override "$rollback_ref"
-  if ! compose_up_app || ! wait_for_app_health; then
+  if ! deploy_local_and_verify "$rollback_ref" "$rollback_id"; then
     log "rollback failed; maintenance gate retained"
     return 1
   fi
@@ -712,6 +723,9 @@ activate_image() {
     wait_for_app_health || die "running image failed local verification"
     verify_public_entry ||
       die "running candidate failed public verification"
+    write_override "$image_ref" || die "cannot record the running immutable reference"
+    record_current_image "$image_ref" "$candidate_id" "$release_tag" \
+      "$upstream_commit" "$patch_sha" "$source_ref" "$source_commit"
     rm -f "$CANDIDATE_STATE_FILE" "$SCHEDULED_STATE_FILE"
     set_phase unchanged
     return 0
@@ -726,7 +740,7 @@ activate_image() {
   set_phase drain
   wait_for_connection_drain 'replacing the live container'
   set_phase backup
-  backup_database "$upstream_commit"
+  backup_database
   set_phase activate
   ensure_override_manageable
   docker tag "$previous_id" "$ROLLBACK_REF"
@@ -757,21 +771,22 @@ activate_image() {
     die "deployment failed and rollback was attempted; inspect the job log"
   fi
 
-  write_env_file "$CURRENT_STATE_FILE" \
-    "CURRENT_IMAGE=$image_ref" \
-    "CURRENT_IMAGE_ID=$candidate_id" \
-    "CURRENT_RELEASE=$release_tag" \
-    "CURRENT_UPSTREAM_COMMIT=$upstream_commit" \
-    "CURRENT_PATCH_SHA256=$patch_sha" \
-    "CURRENT_SOURCE_REF=$source_ref" \
-    "CURRENT_SOURCE_COMMIT=$source_commit" \
-    "CURRENT_DEPLOYED_AT=$(date -Is)"
+  record_current_image "$image_ref" "$candidate_id" "$release_tag" \
+    "$upstream_commit" "$patch_sha" "$source_ref" "$source_commit"
   rm -f "$CANDIDATE_STATE_FILE" "$SCHEDULED_STATE_FILE"
 
   set_phase complete
   log "deployment succeeded"
   # Only the running image and the retained previous image stay local.
   cleanup_managed_images
+}
+
+record_current_image() {
+  write_env_file "$CURRENT_STATE_FILE" \
+    "CURRENT_IMAGE=$1" "CURRENT_IMAGE_ID=$2" "CURRENT_RELEASE=$3" \
+    "CURRENT_UPSTREAM_COMMIT=$4" "CURRENT_PATCH_SHA256=$5" \
+    "CURRENT_SOURCE_REF=$6" "CURRENT_SOURCE_COMMIT=$7" \
+    "CURRENT_DEPLOYED_AT=$(date -Is)"
 }
 
 existing_background_job() {
@@ -783,7 +798,21 @@ existing_background_job() {
 schedule_internal_job() {
   local action="$1"
   local target="$2"
-  local unit timestamp
+  local unit timestamp key
+  local -a child_env=(NEWAPI_INTERNAL_ACTIVATE=1 "NEWAPI_CUSTOM_CONFIG_FILE=$CONFIG_FILE")
+  # systemd does not inherit the invoking shell's environment. Carry only the
+  # supported settings so an override cannot silently change in the child job.
+  for key in \
+    NEWAPI_IMAGE_REPOSITORY NEWAPI_SOURCE_REPOSITORY NEWAPI_CANDIDATE_TAG \
+    NEWAPI_CUSTOM_BASE_DIR NEWAPI_CUSTOM_STATE_DIR NEWAPI_CUSTOM_LOG_DIR \
+    NEWAPI_DEPLOY_DIR NEWAPI_OVERRIDE_FILE NEWAPI_APP_SERVICE NEWAPI_APP_CONTAINER \
+    NEWAPI_APP_PORT NEWAPI_APP_INTERNAL_PORT NEWAPI_PUBLIC_URL NEWAPI_MAINTENANCE_FLAG \
+    NEWAPI_ROLLBACK_IMAGE_REPO NEWAPI_DB_CONTAINER NEWAPI_DB_BACKUP_FILE \
+    NEWAPI_DRAIN_WAIT_SECONDS NEWAPI_IDLE_WAIT_SECONDS NEWAPI_HEALTH_TIMEOUT_SECONDS \
+    NEWAPI_LOG_RETENTION_DAYS NEWAPI_CUSTOM_LOCK_FILE
+  do
+    if declare -p "$key" >/dev/null 2>&1; then child_env+=("$key=${!key}"); fi
+  done
   existing_background_job &&
     die "a new-api custom background job is already running; inspect status first"
 
@@ -795,8 +824,7 @@ schedule_internal_job() {
       systemd-run --quiet --collect \
         --unit "$unit" \
         --no-block \
-        /usr/bin/env NEWAPI_INTERNAL_ACTIVATE=1 \
-        "NEWAPI_CUSTOM_CONFIG_FILE=$CONFIG_FILE" \
+        /usr/bin/env "${child_env[@]}" \
         "$SCRIPT_PATH" _upgrade "$target"
       ;;
     activate)
@@ -812,8 +840,7 @@ schedule_internal_job() {
       systemd-run --quiet --collect \
         --unit "$unit" \
         --no-block \
-        /usr/bin/env NEWAPI_INTERNAL_ACTIVATE=1 \
-        "NEWAPI_CUSTOM_CONFIG_FILE=$CONFIG_FILE" \
+        /usr/bin/env "${child_env[@]}" \
         "$SCRIPT_PATH" _activate \
         "$target" "$release_tag" "$upstream_commit" \
         "$patch_sha" "$source_ref" "$source_commit"

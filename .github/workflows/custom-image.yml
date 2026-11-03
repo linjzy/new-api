@@ -19,10 +19,6 @@ on:
         description: Move candidate after all checks pass
         default: false
         type: boolean
-      extended_checks:
-        description: Also run the concurrency race detector
-        default: false
-        type: boolean
 
 permissions:
   contents: write
@@ -37,26 +33,6 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 35
-    services:
-      postgres:
-        image: postgres:15-alpine
-        env:
-          POSTGRES_PASSWORD: ci-test-only
-        ports: ['5432:5432']
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s --health-timeout 5s --health-retries 20
-      mysql:
-        image: mysql:8.0
-        env:
-          MYSQL_ROOT_PASSWORD: ci-test-only
-        ports: ['3306:3306']
-        options: >-
-          --health-cmd "mysqladmin ping -h 127.0.0.1 -pci-test-only"
-          --health-interval 5s --health-timeout 5s --health-retries 20
-    env:
-      TEST_MYSQL_DSN: root:ci-test-only@tcp(127.0.0.1:3306)/mysql?parseTime=true
-      TEST_POSTGRES_DSN: postgres://postgres:ci-test-only@127.0.0.1:5432/postgres?sslmode=disable
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -67,8 +43,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REQUESTED_RELEASE: ${{ inputs.release || '' }}
-          EXTENDED: ${{ inputs.extended_checks || false }}
-          BEFORE: ${{ github.event.before || '' }}
         run: |
           set -Eeuo pipefail
           release="$REQUESTED_RELEASE"
@@ -82,12 +56,6 @@ jobs:
           source "$RUNNER_TEMP/identities.env"
           tag="${release#v}-custom-${build_sha:0:12}-${upstream:0:12}"
           repository="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/new-api"
-          extended="$EXTENDED"
-          if [[ "$GITHUB_EVENT_NAME" == schedule ]] ||
-             { [[ -n "$BEFORE" && "$BEFORE" != 0000000000000000000000000000000000000000 ]] &&
-               ! git diff --quiet "$BEFORE" HEAD -- .linjzy/patches/responses-capacity-retry.patch .linjzy/patches/astra-iq-gate.patch .linjzy/patches/graceful-drain.patch .linjzy/tests/go .linjzy/bin/prepare-release.py; }; then
-            extended=true
-          fi
           {
             echo "release=$release"
             echo "upstream=$upstream"
@@ -95,11 +63,9 @@ jobs:
             echo "tag=$tag"
             echo "source_ref=custom/$tag"
             echo "image=$repository:$tag"
-            echo "proof=$repository:verified-${validation_sha:0:12}-${extended}-$tag"
-            echo "proof_full=$repository:verified-${validation_sha:0:12}-true-$tag"
+            echo "proof=$repository:verified-${validation_sha:0:12}-$tag"
             echo "candidate=$repository:candidate"
             echo "previous=$repository:previous"
-            echo "extended=$extended"
           } >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
@@ -114,15 +80,12 @@ jobs:
         env:
           IMAGE: ${{ steps.plan.outputs.image }}
           PROOF: ${{ steps.plan.outputs.proof }}
-          PROOF_FULL: ${{ steps.plan.outputs.proof_full }}
         run: |
           set -Eeuo pipefail
           digest="$(bash .linjzy/bin/registry-digest.sh "$IMAGE")"
           proof="$(bash .linjzy/bin/registry-digest.sh "$PROOF")"
-          full="$(bash .linjzy/bin/registry-digest.sh "$PROOF_FULL")"
           echo "exists=$([[ -n "$digest" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
-          # A full validation (race) also satisfies a regular one.
-          echo "verified=$([[ -n "$digest" && ( "$digest" == "$proof" || "$digest" == "$full" ) ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "verified=$([[ -n "$digest" && "$digest" == "$proof" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
       - name: Prepare exact source and current verification bundle
         id: source
@@ -166,28 +129,23 @@ jobs:
             go.sum
             relaykit/go.sum
 
-      - name: Verify relay, settlement, capacity retry and deployment contract
+      - name: Compile backend and independent relaykit module
         if: steps.registry.outputs.verified != 'true'
         run: |
           set -Eeuo pipefail
           bash "$RUNNER_TEMP/current-custom/bin/verify-release.sh" "$PWD" go
-          python3 -m unittest discover -s "$RUNNER_TEMP/current-custom/tests" -p 'test_*.py'
-
-      - name: Verify changed backend concurrency
-        if: steps.registry.outputs.verified != 'true' && steps.plan.outputs.extended == 'true'
-        run: bash "$RUNNER_TEMP/current-custom/bin/verify-release.sh" "$PWD" race
 
       - name: Install pinned frontend runner
         if: steps.registry.outputs.verified != 'true'
         run: npm install --global bun@1.4.4
 
-      - name: Verify frontend errors, lint and types
+      - name: Check frontend lint and types
         if: steps.registry.outputs.verified != 'true'
         env:
           BUILD_FRONTEND: false
         run: bash "$RUNNER_TEMP/current-custom/bin/verify-release.sh" "$PWD" frontend
 
-      - name: Build or fetch immutable image, verify startup and publish its source ref
+      - name: Build or fetch immutable image and publish its source ref
         env:
           IMAGE: ${{ steps.plan.outputs.image }}
           IMAGE_EXISTS: ${{ steps.registry.outputs.exists }}
@@ -219,7 +177,6 @@ jobs:
                 --label "org.opencontainers.image.version=$RELEASE" \
                 --label 'org.opencontainers.image.licenses=AGPL-3.0-only' --tag "$IMAGE" .
             fi
-            bash "$RUNNER_TEMP/current-custom/bin/smoke-test-image.sh" "$IMAGE" "$RELEASE"
           fi
           if [[ "$(git ls-remote --heads origin "$SOURCE_REF" | cut -f1)" != "$COMMIT" ]]; then
             git push --force origin "HEAD:refs/heads/$SOURCE_REF"

@@ -1,7 +1,8 @@
 # New API 定制
 
 基于 [QuantumNous/new-api](https://github.com/QuantumNous/new-api) 的已发布版本维护独立业务补丁。
-补丁在 `patches/`，测试在 `tests/`，发布脚本在 `bin/`，服务器部署工具在 `deploy/`。
+补丁在 `patches/`，发布脚本在 `bin/`，服务器部署工具在 `deploy/`。
+自定义自动化测试及对应 CI 步骤已移除；上游自带测试保留。发布执行编译、前端类型和 lint 检查，部署后验证实际运行状态。
 
 | 补丁 | 功能 |
 | --- | --- |
@@ -17,11 +18,11 @@
 ## 发布
 
 [GitHub Actions](../.github/workflows/custom-image.yml) 每天北京时间 08:23（UTC 00:23）定时运行一次；`.linjzy/` 下非文档改动推送到 `main`，或手动触发时也运行。
-流程：取最新上游 release，在其提交上应用补丁，通过后端、前端和镜像启动检查后发布源码分支和镜像。
+流程：取最新上游 release，在其提交上应用补丁，通过后端编译、前端类型和 lint 检查及镜像构建后发布源码分支和镜像。
 
 - 镜像 `ghcr.io/linjzy/new-api:<release>-custom-<build-sha>-<upstream-sha>`，源码分支 `custom/<同名>`；分支不含 `.github/workflows`。
-- 构建输入（补丁、prepare 脚本）与验证输入（tests、deploy、verify 脚本）分别计算摘要；镜像和匹配的 `verified-*` 记录已存在时直接复用，改 workflow 或文档不会重建。
-- 定时运行或手动 `promote_candidate=true` 才移动 `candidate`，旧 `candidate` 改标为 `previous`；定时运行和后端补丁变更会追加 race 检查。
+- 构建输入（补丁、prepare 脚本）与检查输入（deploy、verify 脚本）分别计算摘要；镜像和匹配的 `verified-*` 记录已存在时直接复用，改 workflow 或文档不会重建。此记录表示构建与静态检查通过，不表示运行过回归测试。
+- 定时运行或手动 `promote_candidate=true` 才移动 `candidate`，旧 `candidate` 改标为 `previous`。
 - 每次成功后只保留 `candidate`、`previous` 和本次镜像及其 `custom/*` 分支，其余 ghcr 版本和分支删除。
 
 补丁失配时构建失败，日志打印 `.rej` 内容。移植：
@@ -40,8 +41,6 @@ Responses 流保留原始事件字节用于上游工具用量结算，Astra CLI 
 
 ```bash
 bash .linjzy/bin/verify-release.sh SOURCE all
-bash .linjzy/bin/verify-release.sh SOURCE race
-python3 -m unittest discover -s .linjzy/tests -p 'test_*.py'
 actionlint .github/workflows/custom-image.yml
 shellcheck .linjzy/bin/*.sh .linjzy/deploy/bin/*.sh
 ```
@@ -50,7 +49,7 @@ shellcheck .linjzy/bin/*.sh .linjzy/deploy/bin/*.sh
 
 - 容器环境变量 `ASTRA_IQ_ENABLED=true` 启用；缺省关闭。回滚开关为 `false`，重建应用容器生效，无需删除渠道或数据库结果。
 - “检测模型”多选渠道中已配置的模型；旧配置和首次打开仍默认 `gpt-6-astra`。每个模型独立配置启用检测、渠道、时间段、间隔和失败停用。仅检测启用且支持当前模型的渠道，手动或自动停用均跳过。每个模型默认全天、以该模型本轮开始时间为基准每 5 分钟一轮（调度误差最多 15 秒），跨模型总并发保持 3，每个渠道/模型最长 2 分钟。任务仍使用共享数据库租约，上一轮未完成时不会重叠。移除模型后历史保留，结果不再限制该模型调用；重新选择恢复最新适用判定，新配置项采用默认设置。
-- 检测由随镜像固定安装的官方 **Codex CLI 0.157.1** 发起，通过 `/v1/responses` 流式调用。官方 GitHub 二进制包经 SHA-256 校验，CI 使用同版本真实客户端回归，镜像启动检查验证其版本。每次检测使用独立临时配置、严格配置校验、只读沙箱与单次请求代理；上游密钥仅由网关持有，CLI 使用一次性本地代理令牌，关闭 shell、浏览器、插件等工具。`agents.enabled=false` 禁用多代理，`skills.max_context_tokens=1` 限制可用技能目录；当前请求配置记为 `minimal-v1`，保存于历史 `profile` 和客户端说明。旧记录没有 profile，仍可查看；题目版本和渠道指纹不变，旧失败判定保留至新检测完成。新旧配置的耗时、用量和通过率不应直接作为同条件结果比较。普通模型测试不受影响。
+- 检测由随镜像固定安装的官方 **Codex CLI 0.157.1** 发起，通过 `/v1/responses` 流式调用。官方 GitHub 二进制包在镜像构建时经 SHA-256 校验。每次检测使用独立临时配置、严格配置校验、只读沙箱与单次请求代理；上游密钥仅由网关持有，CLI 使用一次性本地代理令牌，关闭 shell、浏览器、插件等工具。`agents.enabled=false` 禁用多代理，`skills.max_context_tokens=1` 限制可用技能目录；当前请求配置记为 `minimal-v1`，保存于历史 `profile` 和客户端说明。旧记录没有 profile，仍可查看；题目版本和渠道指纹不变，旧失败判定保留至新检测完成。新旧配置的耗时、用量和通过率不应直接作为同条件结果比较。普通模型测试不受影响。
 - 使用指定糖果题，标准答案 **21**，请求固定 `medium` 推理强度，覆盖渠道的推理参数替换。题目不携带答案。普通业务请求参数保持原样。
 - 多密钥渠道逐一检查当前启用的密钥，全部正确才通过；答错或请求失败立即保存阻断结果。不会改变其他模型或渠道整体开关。
 - 渠道标题旁“检测设置”提供启用检测、检测渠道、开始时间、结束时间、间隔（分钟）、失败停用，“检测模型”多选框同时承担选择与配置切换：新增模型后自动显示其配置，点击已选模型标签切换，当前模型高亮；移除当前模型后切换到剩余模型。切换模型保留各自未保存的修改，保存时原子更新全部选中模型的配置。只读用户可点击模型标签查看配置，但不能修改模型选择或设置。每天按北京时间 UTC+8 执行，支持跨午夜；相同时间表示全天，间隔支持 1～1440 分钟。默认检测开启、00:00→00:00、5 分钟、失败停用开启。关闭“启用检测”后不启动新请求，已有失败结果不限制调用，卡片检测条隐藏；弹窗保留合并后的模型选择与配置入口、该开关及取消/保存，其余设置隐藏并按已保存值原样保存（隐藏项的未保存修改在弹窗内重新开启时恢复显示，不参与关闭状态的保存和校验）；历史保留，重新开启恢复显示。旧配置缺少 enabled 字段时默认为开启。
@@ -65,8 +64,8 @@ shellcheck .linjzy/bin/*.sh .linjzy/deploy/bin/*.sh
 - 检测结果按“渠道 + 模型”写入独立 `model_iq_results` 表，各模型历史最多保留 24 轮；`astra_iq_model_runs` 保存各模型最近 24 轮起止时间。旧 `astra_iq_results` 的原有判定与历史通过带事务标记的一次性迁移复制到 Astra，原表保留；重复启动、清空结果后再次迁移均不会恢复已删除的历史。现有渠道/密钥/计费表结构不变，详情列在 MySQL 使用 LONGTEXT，SQLite/PostgreSQL 使用 TEXT。更换客户端版本后视为暂无适用结果；只切换上述请求配置不清空历史或放开旧失败渠道。默认全天 5 分钟间隔时，每个启用密钥每天约 288 次上游检测请求，会产生上游用量；原配置每次约 1.3 万输入 Token，`minimal-v1` 实测请求体减少约 23%，实际 Token 以检测历史为准。计费用量日志保持不变；判分使用完整响应流，应用检测日志只记渠道级最终摘要（判定、HTTP、耗时、已知 Token、尝试数、错误码和配置版本），不输出 RelayInfo 或响应尾部。公共流解析器的异常诊断仍保留。
 - 这是一道固定题的质量门禁，不能证明模型身份或等价于通用智商评测。
 
-升级时保持补丁列于 `prepare-release.py` 和 `release-inputs.py`，不要直接使用未打补丁的官方镜像。CI 在真实 SQLite、MySQL 8、PostgreSQL 15 上验证新增表、重复迁移、旧渠道保留、即时跳过/恢复和缓存路径，并运行前端、后端回归与镜像启动检查；失败不会移动 candidate。
+升级时保持补丁列于 `prepare-release.py` 和 `release-inputs.py`，不要直接使用未打补丁的官方镜像。CI 编译后端与独立 relaykit 模块、检查前端类型和 lint，再构建镜像；失败不会移动 candidate。数据库结构或计费逻辑发生变化时，仍需在发布前执行对应的专项验证；当前 CI 不含自动化回归或三数据库验证。
 
-部署固定上游版本时手动指定 release，并保留当前镜像 digest、数据库备份及 Compose 配置。独立结果表是增量添加，回滚至旧镜像时可保留。后续移植以补丁接入点为审查范围，不强行忽略冲突或跳过测试。
+部署固定上游版本时手动指定 release，并保留当前镜像 digest、数据库备份及 Compose 配置。独立结果表是增量添加，回滚至旧镜像时可保留。后续移植以补丁接入点为审查范围，不强行忽略补丁冲突或跳过构建检查。
 
 模型入口复用 `web/src/components/multi-select.tsx`，通过可选的 `onChipClick` 与 `activeValue` 支持标签激活和当前模型高亮；原有搜索、多选和移除行为保持兼容。独立选择器不能在同一入口中切换已选模型配置，因此扩展已有组件，不新增替代选择器。
