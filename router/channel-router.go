@@ -57,6 +57,12 @@ func registerChannelRoutes(apiRouter *gin.RouterGroup) {
 var channelPermissionRoutes = []permissionRoute{
 	{method: http.MethodGet, path: "/priority/order", permission: authz.ChannelRead, handler: controller.GetChannelPriorityOrder},
 	{method: http.MethodPost, path: "/priority/reorder", permission: authz.ChannelWrite, handler: controller.ReorderChannelPriority},
+	{method: http.MethodGet, path: "/astra_iq", permission: authz.ChannelRead, handler: controller.GetAstraIQStatus},
+	{method: http.MethodGet, path: "/astra_iq/settings", permission: authz.ChannelRead, handler: controller.GetAstraIQSettings},
+	{method: http.MethodPut, path: "/astra_iq/settings", permission: authz.ChannelWrite, handler: controller.UpdateAstraIQSettings},
+	{method: http.MethodGet, path: "/astra_iq/:id/:checked_at", permission: authz.ChannelRead, handler: controller.GetAstraIQSample},
+	{method: http.MethodDelete, path: "/astra_iq/:id", permission: authz.ChannelWrite, handler: controller.DeleteAstraIQResults},
+	{method: http.MethodDelete, path: "/astra_iq/:id/:checked_at", permission: authz.ChannelWrite, handler: controller.DeleteAstraIQResults},
 	{method: http.MethodGet, path: "/", permission: authz.ChannelRead, handler: controller.GetAllChannels},
 	{method: http.MethodGet, path: "/search", permission: authz.ChannelRead, handler: controller.SearchChannels},
 	{method: http.MethodGet, path: "/models", permission: authz.ChannelRead, handler: controller.ChannelListModels},

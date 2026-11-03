@@ -19,6 +19,7 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	appmodel "github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/drain"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	"github.com/QuantumNous/new-api/pkg/wsmanager"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
@@ -89,6 +90,7 @@ type responsesWSCallState struct {
 }
 
 type responsesWSSession struct {
+	drainSession   *drain.Session
 	ctx            context.Context
 	cancel         context.CancelFunc
 	client         *websocket.Conn
@@ -134,6 +136,14 @@ func ResponsesWebSocketHelper(c *gin.Context, client *websocket.Conn, runner Res
 		maxMB = 128
 	}
 	client.SetReadLimit(int64(maxMB) << 20)
+	s.drainSession = drain.RegisterWS(ctx, false, func() {
+		s.shutdown(websocket.CloseServiceRestart, "service restarting")
+	})
+	if s.drainSession == nil {
+		s.shutdown(websocket.CloseServiceRestart, "service restarting")
+		return nil
+	}
+	defer s.drainSession.Unregister()
 	defer func() {
 		// Unless an earlier shutdown ended the read, the client closed or left.
 		// Gorilla already answered a client close frame, so this tells the upstream.
@@ -172,6 +182,10 @@ func ResponsesWebSocketHelper(c *gin.Context, client *websocket.Conn, runner Res
 		}
 		state := &responsesWSCallState{inbox: make(chan responsesWSMessage), controls: make(chan responsesWSControl, 1), done: make(chan struct{})}
 		if !s.tryReserveCurrent(state) {
+			if s.drainSession.Draining() {
+				s.sendError(envelope.EventID, streamID, types.NewErrorWithStatusCode(errors.New("service restarting; retry later"), types.ErrorCode("service_draining"), http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry()))
+				continue
+			}
 			s.sendError(envelope.EventID, streamID, types.NewErrorWithStatusCode(errors.New("another response.create is already in progress on this websocket connection"), types.ErrorCodeInvalidRequest, http.StatusConflict, types.ErrOptionWithSkipRetry()))
 			continue
 		}
@@ -215,6 +229,7 @@ func (s *responsesWSSession) runRequest(state *responsesWSCallState, message []b
 		}
 		s.current = nil
 		close(state.done)
+		s.drainSession.FinishWork()
 		s.stateMu.Unlock()
 		s.clientWriteMu.Unlock()
 	}()
@@ -679,7 +694,7 @@ func (s *responsesWSSession) getCurrent() *responsesWSCallState {
 func (s *responsesWSSession) tryReserveCurrent(state *responsesWSCallState) bool {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
-	if s.current != nil {
+	if s.current != nil || !s.drainSession.StartWork() {
 		return false
 	}
 	s.current = state

@@ -8,6 +8,7 @@ import (
 )
 
 var filterEvalOrder = []dto.ChannelFilterKind{
+	dto.FilterExcludeChannels,
 	dto.FilterRequestPath,
 	dto.FilterTaskPluginEndpoint,
 	dto.FilterTaskPluginIdentity,
@@ -20,6 +21,9 @@ var filterEvalOrder = []dto.ChannelFilterKind{
 func ChannelSatisfiesFilters(ch *Channel, modelName string, filters []dto.ChannelFilter) (bool, dto.ChannelFilterKind) {
 	if ch == nil {
 		return false, ""
+	}
+	if !AstraIQAllowsChannel(ch, modelName) {
+		return false, "astra_iq"
 	}
 	for _, kind := range filterEvalOrder {
 		for _, filter := range filters {
@@ -90,6 +94,8 @@ func candidatePassesKindFilters(ch *Channel, exists bool, modelName string, kind
 
 func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilter) bool {
 	switch filter.Kind {
+	case dto.FilterExcludeChannels:
+		return !slices.Contains(filter.ExcludedChannelIDs, ch.Id)
 	case dto.FilterRequestPath:
 		if filter.RequestPath == "" {
 			return true
