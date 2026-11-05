@@ -125,16 +125,20 @@ func GetRandomSatisfiedChannel(
 		return GetChannel(group, model, retry, filters)
 	}
 
+	iq, err := loadAstraIQRouting(model)
+	if err != nil {
+		return nil, fmt.Errorf("Astra IQ routing unavailable: %w", err)
+	}
 	channelSyncLock.RLock()
 	defer channelSyncLock.RUnlock()
 
 	// First, try to find channels with the exact model name.
-	channels, _ := filterCandidateIDs(group2model2channels[group][model], model, filters)
+	channels, _ := filterCandidateIDs(iq.filterIDs(group2model2channels[group][model]), model, filters)
 
 	// If no channels found, try to find channels with the normalized model name.
 	if len(channels) == 0 {
 		normalizedModel := ratio_setting.RoutingMatchModelName(model)
-		channels, _ = filterCandidateIDs(group2model2channels[group][normalizedModel], model, filters)
+		channels, _ = filterCandidateIDs(iq.filterIDs(group2model2channels[group][normalizedModel]), model, filters)
 	}
 
 	if len(channels) == 0 {
