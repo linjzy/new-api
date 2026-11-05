@@ -33,7 +33,7 @@ cp -R .linjzy ../port/ && cd ../port
 bash .linjzy/bin/prepare-release.sh . "$TAG" "$(git rev-parse HEAD)" custom/port   # 失败时保留部分应用结果和 .rej
 ```
 
-修好后重新生成对应补丁并提交到本仓库。当前补丁以 `v1.0.0-rc.47`（`e835b1bfc43b`）为基线；更换上游版本后必须重新验证。
+修好后重新生成对应补丁并提交到本仓库。容量重试的渠道选择接入点已适配 `v1.0.0-rc.48`（`706144769e5b`），保留上游会话亲和回退与分组重试次数上限；四项补丁均已验证可应用。更换上游版本后必须重新验证。
 Responses 流保留原始事件字节用于上游工具用量结算，Astra CLI 安装保留上游 Dockerfile 的 PGO 构建参数。
 `main` 的其余内容是上游 tag 的快照，只为方便阅读；需要时 `git merge <tag>` 同步。
 
