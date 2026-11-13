@@ -4,7 +4,7 @@ index ddcee582..5971157f 100644
 +++ b/Dockerfile
 @@ -28,6 +28,9 @@ COPY . .
  COPY --from=builder /build/web/dist ./web/dist
- RUN go build -pgo="$(go list -m -f '{{.Dir}}' github.com/Calcium-Ion/moejs)/default.pgo" -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$(cat VERSION)'" -o new-api
+ RUN go build -pgo="$(go list -m -f '{{.Dir}}' github.com/MoeForge/moejs)/default.pgo" -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$(cat VERSION)'" -o new-api
  
 +RUN apk add --no-cache bash \
 +    && bash scripts/install-astra-iq-codex.sh /opt/astra-iq-cli "${TARGETARCH:-amd64}"
@@ -949,9 +949,10 @@ diff --git a/controller/channel-test.go b/controller/channel-test.go
 index 3cf5c846..9fade4c4 100644
 --- a/controller/channel-test.go
 +++ b/controller/channel-test.go
-@@ -21,6 +21,7 @@ import (
+@@ -21,7 +21,8 @@ import (
  	"github.com/QuantumNous/new-api/model"
  	"github.com/QuantumNous/new-api/pkg/billingexpr"
+ 	"github.com/QuantumNous/new-api/pkg/jsplugin"
  	"github.com/QuantumNous/new-api/relay"
 +	channelrelay "github.com/QuantumNous/new-api/relay/channel"
  	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -1174,17 +1175,12 @@ index 3cf5c846..9fade4c4 100644
  }
  
 diff --git a/controller/system_task_handlers.go b/controller/system_task_handlers.go
-index eba8dfd1..3fc771a7 100644
 --- a/controller/system_task_handlers.go
 +++ b/controller/system_task_handlers.go
-@@ -17,6 +17,7 @@ import (
- // instances and each run is recorded as one task row. Call this before
- // service.StartSystemTaskRunner.
+@@ -20,2 +20,3 @@
  func RegisterScheduledSystemTasks() {
 +	service.RegisterSystemTaskHandler(astraIQTestHandler{})
  	service.RegisterSystemTaskHandler(channelTestHandler{})
- 	service.RegisterSystemTaskHandler(modelUpdateHandler{})
- 	service.RegisterSystemTaskHandler(midjourneyPollHandler{})
 diff --git a/model/ability.go b/model/ability.go
 index 18fcf342..0d27c820 100644
 --- a/model/ability.go
@@ -3516,15 +3512,12 @@ index 00000000..ce0eef4c
 +  return 'Astra IQ pending'
 +}
 diff --git a/web/src/i18n/locales/en.json b/web/src/i18n/locales/en.json
-index 382c8fdd..5158fc24 100644
 --- a/web/src/i18n/locales/en.json
 +++ b/web/src/i18n/locales/en.json
-@@ -7252,6 +7252,73 @@
-     "Zhipu": "Zhipu",
+@@ -7726,6 +7726,73 @@
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V4",
--    "Zoom": "Zoom"
-+    "Zoom": "Zoom",
+     "Zoom": "Zoom",
 +    "Astra IQ": "Astra IQ",
 +    "Astra IQ check details": "Astra IQ check details",
 +    "Astra IQ details unavailable": "Astra IQ details unavailable",
@@ -3591,19 +3584,17 @@ index 382c8fdd..5158fc24 100644
 +    "Pause only this model on a failed channel. Calls without a result are allowed.": "Pause only this model on a failed channel. Calls without a result are allowed.",
 +    "Select only channels that support the selected model": "Select only channels that support the selected model",
 +    "Select a model configured on a channel": "Select a model configured on a channel",
-+    "Invalid check model": "Invalid check model"
++    "Invalid check model": "Invalid check model",
+     "By clicking sign in, you agree to our": "By clicking sign in, you agree to our",
+     "By creating an account, you agree to our": "By creating an account, you agree to our"
    }
- }
 diff --git a/web/src/i18n/locales/fr.json b/web/src/i18n/locales/fr.json
-index 0e8cc48f..a18cc76b 100644
 --- a/web/src/i18n/locales/fr.json
 +++ b/web/src/i18n/locales/fr.json
-@@ -7252,6 +7252,73 @@
-     "Zhipu": "Zhipu",
+@@ -7726,6 +7726,73 @@
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V4",
--    "Zoom": "Zoom"
-+    "Zoom": "Zoom",
+     "Zoom": "Zoom",
 +    "Astra IQ": "Astra IQ",
 +    "Astra IQ check details": "Astra IQ check details",
 +    "Astra IQ details unavailable": "Astra IQ details unavailable",
@@ -3670,19 +3661,17 @@ index 0e8cc48f..a18cc76b 100644
 +    "Pause only this model on a failed channel. Calls without a result are allowed.": "Suspendre uniquement ce modèle sur le canal en échec. Les appels sans résultat restent autorisés.",
 +    "Select only channels that support the selected model": "Sélectionnez les canaux prenant en charge ce modèle",
 +    "Select a model configured on a channel": "Choisissez un modèle configuré sur un canal",
-+    "Invalid check model": "Modèle de vérification invalide"
++    "Invalid check model": "Modèle de vérification invalide",
+     "By clicking sign in, you agree to our": "En cliquant sur se connecter, vous acceptez nos",
+     "By creating an account, you agree to our": "En créant un compte, vous acceptez nos"
    }
- }
 diff --git a/web/src/i18n/locales/ja.json b/web/src/i18n/locales/ja.json
-index 7913083a..26c8edb7 100644
 --- a/web/src/i18n/locales/ja.json
 +++ b/web/src/i18n/locales/ja.json
-@@ -7252,6 +7252,73 @@
-     "Zhipu": "Zhipu",
+@@ -7726,6 +7726,73 @@
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V 4",
--    "Zoom": "ズーム"
-+    "Zoom": "ズーム",
+     "Zoom": "ズーム",
 +    "Astra IQ": "Astra IQ",
 +    "Astra IQ check details": "Astra IQ check details",
 +    "Astra IQ details unavailable": "Astra IQ details unavailable",
@@ -3749,19 +3738,17 @@ index 7913083a..26c8edb7 100644
 +    "Pause only this model on a failed channel. Calls without a result are allowed.": "失敗したチャネルのこのモデルのみ停止します。結果がない呼び出しは許可します。",
 +    "Select only channels that support the selected model": "選択したモデルに対応するチャネルのみ選択できます",
 +    "Select a model configured on a channel": "チャネルに設定済みのモデルを選択してください",
-+    "Invalid check model": "検査モデルが無効です"
++    "Invalid check model": "検査モデルが無効です",
+     "By clicking sign in, you agree to our": "サインインをクリックすると、以下に同意したことになります：",
+     "By creating an account, you agree to our": "アカウントを作成すると、以下に同意したことになります："
    }
- }
 diff --git a/web/src/i18n/locales/ru.json b/web/src/i18n/locales/ru.json
-index 43776c89..69e49746 100644
 --- a/web/src/i18n/locales/ru.json
 +++ b/web/src/i18n/locales/ru.json
-@@ -7252,6 +7252,73 @@
-     "Zhipu": "Zhipu",
+@@ -7726,6 +7726,73 @@
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V4",
--    "Zoom": "Zoom"
-+    "Zoom": "Zoom",
+     "Zoom": "Zoom",
 +    "Astra IQ": "Astra IQ",
 +    "Astra IQ check details": "Astra IQ check details",
 +    "Astra IQ details unavailable": "Astra IQ details unavailable",
@@ -3828,19 +3815,17 @@ index 43776c89..69e49746 100644
 +    "Pause only this model on a failed channel. Calls without a result are allowed.": "При сбое блокируется только эта модель на канале. Вызовы без результата разрешены.",
 +    "Select only channels that support the selected model": "Выберите каналы с поддержкой выбранной модели",
 +    "Select a model configured on a channel": "Выберите модель, настроенную на канале",
-+    "Invalid check model": "Некорректная модель проверки"
++    "Invalid check model": "Некорректная модель проверки",
+     "By clicking sign in, you agree to our": "Нажимая «Войти», вы соглашаетесь с нашими",
+     "By creating an account, you agree to our": "Создавая аккаунт, вы соглашаетесь с нашими"
    }
- }
 diff --git a/web/src/i18n/locales/vi.json b/web/src/i18n/locales/vi.json
-index 7f967ced..c1edf9ae 100644
 --- a/web/src/i18n/locales/vi.json
 +++ b/web/src/i18n/locales/vi.json
-@@ -7252,6 +7252,73 @@
-     "Zhipu": "Zhipu",
+@@ -7726,6 +7726,73 @@
      "Zhipu GLM": "Zhipu GLM",
      "Zhipu V4": "Zhipu V4",
--    "Zoom": "Zoom"
-+    "Zoom": "Zoom",
+     "Zoom": "Zoom",
 +    "Astra IQ": "Astra IQ",
 +    "Astra IQ check details": "Astra IQ check details",
 +    "Astra IQ details unavailable": "Astra IQ details unavailable",
@@ -3907,19 +3892,17 @@ index 7f967ced..c1edf9ae 100644
 +    "Pause only this model on a failed channel. Calls without a result are allowed.": "Chỉ dừng mô hình này trên kênh thất bại. Lệnh gọi chưa có kết quả được phép.",
 +    "Select only channels that support the selected model": "Chỉ chọn kênh hỗ trợ mô hình đã chọn",
 +    "Select a model configured on a channel": "Chọn mô hình đã cấu hình trên kênh",
-+    "Invalid check model": "Mô hình kiểm tra không hợp lệ"
++    "Invalid check model": "Mô hình kiểm tra không hợp lệ",
+     "By clicking sign in, you agree to our": "Bằng cách nhấp đăng nhập, bạn đồng ý với",
+     "By creating an account, you agree to our": "Bằng cách tạo tài khoản, bạn đồng ý với"
    }
- }
 diff --git a/web/src/i18n/locales/zh-TW.json b/web/src/i18n/locales/zh-TW.json
-index 82b91221..4683aea6 100644
 --- a/web/src/i18n/locales/zh-TW.json
 +++ b/web/src/i18n/locales/zh-TW.json
-@@ -7252,6 +7252,73 @@
-     "Zhipu": "智譜",
+@@ -7726,6 +7726,73 @@
      "Zhipu GLM": "智譜GLM",
      "Zhipu V4": "智譜 V4",
--    "Zoom": "縮放"
-+    "Zoom": "縮放",
+     "Zoom": "縮放",
 +    "Astra IQ": "Astra IQ",
 +    "Astra IQ check details": "Astra IQ check details",
 +    "Astra IQ details unavailable": "Astra IQ details unavailable",
@@ -3986,19 +3969,17 @@ index 82b91221..4683aea6 100644
 +    "Pause only this model on a failed channel. Calls without a result are allowed.": "僅暫停失敗渠道上的當前模型呼叫；尚無結果時允許呼叫。",
 +    "Select only channels that support the selected model": "只能選擇支援當前模型的渠道",
 +    "Select a model configured on a channel": "請選擇已在渠道中設定的模型",
-+    "Invalid check model": "檢測模型無效"
++    "Invalid check model": "檢測模型無效",
+     "By clicking sign in, you agree to our": "點擊登入即表示您同意我們的",
+     "By creating an account, you agree to our": "建立帳戶即表示您同意我們的"
    }
- }
 diff --git a/web/src/i18n/locales/zh.json b/web/src/i18n/locales/zh.json
-index bb4b063d..a66614d4 100644
 --- a/web/src/i18n/locales/zh.json
 +++ b/web/src/i18n/locales/zh.json
-@@ -7252,6 +7252,73 @@
-     "Zhipu": "智谱",
+@@ -7726,6 +7726,73 @@
      "Zhipu GLM": "智谱GLM",
      "Zhipu V4": "智谱 V4",
--    "Zoom": "缩放"
-+    "Zoom": "缩放",
+     "Zoom": "缩放",
 +    "Astra IQ": "模型智力检测",
 +    "Astra IQ check details": "模型检测详情",
 +    "Astra IQ details unavailable": "暂时无法读取检测详情",
@@ -4065,6 +4046,7 @@ index bb4b063d..a66614d4 100644
 +    "Pause only this model on a failed channel. Calls without a result are allowed.": "仅暂停失败渠道上的当前模型调用；尚无结果时允许调用。",
 +    "Select only channels that support the selected model": "只能选择支持当前模型的渠道",
 +    "Select a model configured on a channel": "请选择已在渠道中配置的模型",
-+    "Invalid check model": "检测模型无效"
++    "Invalid check model": "检测模型无效",
+     "By clicking sign in, you agree to our": "点击登录即表示您同意我们的",
+     "By creating an account, you agree to our": "创建账户即表示您同意我们的"
    }
- }

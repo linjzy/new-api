@@ -23,7 +23,7 @@ index 34a11216..4f394810 100644
  	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
  	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
  	"github.com/QuantumNous/new-api/relay"
-@@ -88,6 +89,14 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+@@ -88,4 +89,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
  			return
  		}
  		defer ws.Close()
@@ -36,8 +36,6 @@ index 34a11216..4f394810 100644
 +		}
 +		defer session.Unregister()
  	}
- 
- 	defer func() {
 diff --git a/main.go b/main.go
 index 476e1008..ccb8d48d 100644
 --- a/main.go
@@ -63,7 +61,7 @@ index 476e1008..ccb8d48d 100644
 @@ -213,8 +217,14 @@ func main() {
  
  	srv := &http.Server{
- 		Addr:    ":" + port,
+ 		Addr:    net.JoinHostPort(host, port),
 -		Handler: server,
 +		Handler: drain.Default.Wrap(server),
  	}
@@ -94,11 +92,12 @@ diff --git a/relay/responses_websocket.go b/relay/responses_websocket.go
 index 5f0d6bd2..8c44e1ef 100644
 --- a/relay/responses_websocket.go
 +++ b/relay/responses_websocket.go
-@@ -19,6 +19,7 @@ import (
+@@ -19,7 +19,8 @@ import (
  	"github.com/QuantumNous/new-api/i18n"
  	"github.com/QuantumNous/new-api/middleware"
  	appmodel "github.com/QuantumNous/new-api/model"
 +	"github.com/QuantumNous/new-api/pkg/drain"
+ 	"github.com/QuantumNous/new-api/pkg/jsplugin"
  	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
  	"github.com/QuantumNous/new-api/pkg/wsmanager"
  	relaychannel "github.com/QuantumNous/new-api/relay/channel"

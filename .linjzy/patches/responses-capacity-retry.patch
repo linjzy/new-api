@@ -2,7 +2,7 @@ diff --git a/constant/context_key.go b/constant/context_key.go
 index f1e158f1..f63f9647 100644
 --- a/constant/context_key.go
 +++ b/constant/context_key.go
-@@ -66,8 +66,10 @@ const (
+@@ -66,6 +66,8 @@ const (
  	ContextKeyAdminRejectReason ContextKey = "admin_reject_reason"
  
  	// ContextKeyLanguage stores the user's language preference for i18n
@@ -13,8 +13,6 @@ index f1e158f1..f63f9647 100644
 +	ContextKeyResponsesStreamFailed    ContextKey = "responses_stream_failed"
 +	ContextKeyResponsesCapacityRetried ContextKey = "responses_capacity_retried"
  	ContextKeyResponseStreamStatus ContextKey = "response_stream_status"
- 
- 	// ContextKeyAuditLogged marks that the current request has already recorded
 diff --git a/controller/relay.go b/controller/relay.go
 index 31fd128b..28463215 100644
 --- a/controller/relay.go
