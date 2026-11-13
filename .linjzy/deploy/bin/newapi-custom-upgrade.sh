@@ -684,6 +684,32 @@ rotate_managed_files() {
     -mtime "+$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
 }
 
+clear_finished_system_task_history() {
+  local removed
+  # The scheduler and node synchronization consume the newest row of each type.
+  # Keep those state rows and all pending/running tasks; only discard history.
+  if ! removed="$(docker exec "$DB_CONTAINER" sh -c '
+    psql -X -v ON_ERROR_STOP=1 -At -U "$POSTGRES_USER" \
+      -d "${POSTGRES_DB:-$POSTGRES_USER}" <<"SQL"
+WITH deleted AS (
+  DELETE FROM system_tasks
+  WHERE status IN ('\''succeeded'\'', '\''failed'\'')
+    AND id NOT IN (SELECT MAX(id) FROM system_tasks GROUP BY type)
+  RETURNING id
+)
+SELECT COUNT(*) FROM deleted;
+SQL
+  ')"; then
+    log "ERROR: deployment verified but system-task history cleanup failed" >&2
+    return 1
+  fi
+  [[ "$removed" =~ ^[0-9]+$ ]] || {
+    log "ERROR: invalid system-task history cleanup result" >&2
+    return 1
+  }
+  log "cleared finished system-task history: deleted=$removed; latest state per type retained"
+}
+
 cleanup_unused_docker_objects() {
   # Only explicitly managed disposable resources qualify. Database volumes and
   # other Compose projects never carry this label.
@@ -727,6 +753,8 @@ activate_image() {
     record_current_image "$image_ref" "$candidate_id" "$release_tag" \
       "$upstream_commit" "$patch_sha" "$source_ref" "$source_commit"
     rm -f "$CANDIDATE_STATE_FILE" "$SCHEDULED_STATE_FILE"
+    set_phase history_cleanup
+    clear_finished_system_task_history || die "verified deployment history cleanup failed"
     set_phase unchanged
     return 0
   fi
@@ -775,6 +803,8 @@ activate_image() {
     "$upstream_commit" "$patch_sha" "$source_ref" "$source_commit"
   rm -f "$CANDIDATE_STATE_FILE" "$SCHEDULED_STATE_FILE"
 
+  set_phase history_cleanup
+  clear_finished_system_task_history || die "verified deployment history cleanup failed"
   set_phase complete
   log "deployment succeeded"
   # Only the running image and the retained previous image stay local.
