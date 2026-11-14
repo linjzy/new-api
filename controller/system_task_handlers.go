@@ -17,6 +17,7 @@ import (
 // dedups execution across multiple master instances and each run is recorded
 // as one task row. Call this before service.StartSystemTaskRunner.
 func RegisterScheduledSystemTasks() {
+	service.RegisterSystemTaskHandler(astraIQTestHandler{})
 	service.RegisterSystemTaskHandler(channelTestHandler{})
 	service.RegisterSystemTaskHandler(channelBalanceHandler{})
 	service.RegisterSystemTaskHandler(modelUpdateHandler{})

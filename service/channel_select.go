@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -123,6 +124,16 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 	userGroup := common.GetContextKeyString(param.Ctx, constant.ContextKeyUserGroup)
 	filters := GetChannelConstraints(param.Ctx).Filters
 	affinityRetryOffset := param.Ctx.GetInt(ginKeyChannelAffinityRetryOffset)
+	capacityRetry := common.GetContextKeyBool(param.Ctx, constant.ContextKeyResponsesCapacityRetried)
+	if capacityRetry {
+		var excluded []int
+		for _, value := range param.Ctx.GetStringSlice("use_channel") {
+			if id, err := strconv.Atoi(value); err == nil {
+				excluded = append(excluded, id)
+			}
+		}
+		filters = append(append([]dto.ChannelFilter(nil), filters...), dto.ChannelFilter{Kind: dto.FilterExcludeChannels, ExcludedChannelIDs: excluded})
+	}
 
 	if param.TokenGroup == "auto" {
 		autoGroups := GetRequestAutoGroups(param.Ctx, userGroup)
@@ -151,6 +162,11 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 				groupRetry = 0
 			}
 			priorityRetry := max(groupRetry-affinityRetryOffset, 0)
+			// Exclusion advances the candidate set; restart its priority without
+			// resetting the current group's retry budget.
+			if capacityRetry {
+				priorityRetry = 0
+			}
 			logger.LogDebug(param.Ctx, "Auto selecting group: %s, priorityRetry: %d", autoGroup, priorityRetry)
 
 			channel, _ = model.GetRandomSatisfiedChannel(
@@ -199,10 +215,14 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 			break
 		}
 	} else {
+		priorityRetry := max(param.GetRetry()-affinityRetryOffset, 0)
+		if capacityRetry {
+			priorityRetry = 0
+		}
 		channel, err = model.GetRandomSatisfiedChannel(
 			param.TokenGroup,
 			param.ModelName,
-			max(param.GetRetry()-affinityRetryOffset, 0),
+			priorityRetry,
 			filters,
 		)
 		if err != nil {

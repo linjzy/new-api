@@ -544,7 +544,7 @@ export function ChannelsTable() {
               reorderEnabled={reorderActive}
             />
           )}
-          cardGridClassName='grid grid-cols-1 gap-3 sm:gap-4 lg:grid-cols-3'
+          cardGridClassName='grid grid-cols-1 gap-4 lg:grid-cols-3 [&>[data-slot=data-table-card]]:rounded-2xl [&>[data-slot=data-table-card]]:border-border/70 [&>[data-slot=data-table-card]]:p-4 [&>[data-slot=data-table-card]]:shadow-xs'
           applyHeaderSize
           afterTable={<ChannelPriorityStatus order={priorityOrder} />}
           toolbarProps={{

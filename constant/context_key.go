@@ -74,8 +74,10 @@ const (
 	ContextKeyAdminRejectReason ContextKey = "admin_reject_reason"
 
 	// ContextKeyLanguage stores the user's language preference for i18n
-	ContextKeyLanguage             ContextKey = "language"
-	ContextKeyIsStream             ContextKey = "is_stream"
+	ContextKeyLanguage                 ContextKey = "language"
+	ContextKeyIsStream                 ContextKey = "is_stream"
+	ContextKeyResponsesStreamFailed    ContextKey = "responses_stream_failed"
+	ContextKeyResponsesCapacityRetried ContextKey = "responses_capacity_retried"
 	ContextKeyResponseStreamStatus ContextKey = "response_stream_status"
 	// ContextKeyConsumeLog holds the *model.RecordConsumeLogParams of the
 	// request's last consume log, which request plugin report hooks read.

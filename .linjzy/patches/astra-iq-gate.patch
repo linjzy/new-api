@@ -1,0 +1,4052 @@
+diff --git a/Dockerfile b/Dockerfile
+index ddcee582..5971157f 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -28,6 +28,9 @@ COPY . .
+ COPY --from=builder /build/web/dist ./web/dist
+ RUN go build -pgo="$(go list -m -f '{{.Dir}}' github.com/MoeForge/moejs)/default.pgo" -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$(cat VERSION)'" -o new-api
+ 
++RUN apk add --no-cache bash \
++    && bash scripts/install-astra-iq-codex.sh /opt/astra-iq-cli "${TARGETARCH:-amd64}"
++
+ FROM debian:bookworm-slim@sha256:f06537653ac770703bc45b4b113475bd402f451e85223f0f2837acbf89ab020a
+ 
+ RUN apt-get update \
+@@ -36,6 +39,7 @@ RUN apt-get update \
+     && update-ca-certificates
+ 
+ COPY --from=builder2 /build/new-api /
++COPY --from=builder2 /opt/astra-iq-cli/codex /usr/local/bin/codex
+ COPY LICENSE NOTICE THIRD-PARTY-LICENSES.md /licenses/
+ EXPOSE 3000
+ WORKDIR /data
+diff --git a/controller/astra_iq.go b/controller/astra_iq.go
+new file mode 100644
+index 00000000..c0125522
+--- /dev/null
++++ b/controller/astra_iq.go
+@@ -0,0 +1,700 @@
++package controller
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net/http"
++	"regexp"
++	"slices"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/QuantumNous/new-api/model"
++	"github.com/QuantumNous/new-api/relaykit/dto"
++	"github.com/QuantumNous/new-api/relaykit/relayconvert/reasoning"
++	"github.com/gin-gonic/gin"
++	"github.com/samber/lo"
++	"github.com/tidwall/gjson"
++	"gorm.io/gorm"
++)
++
++const astraIQQuestion = `在一个黑色的袋子里放有三种口味的糖果，每种糖果有两种不同的形状（圆形和五角星形，不同的形状靠手感可以分辨）。现已知不同口味的糖和不同形状的数量统计如下表。参赛者需要在活动前决定摸出的糖果数目，那么，最少取出多少个糖果才能保证手中同时拥有不同形状的苹果味和桃子味的糖？（同时手中有圆形苹果味匹配五角星桃子味糖果，或者有圆形桃子味匹配五角星苹果味糖果都满足要求）
++苹果味 桃子味 西瓜味
++圆形 7 9 8
++五角星形 7 6 4
++
++请只输出最终答案的一个整数，不要输出解释、分析过程或其他内容。`
++
++var astraIQAnswerPattern = regexp.MustCompile(`^(?:(?:答案|最少|至少)(?:是|为)?[:：]?\s*)?21(?:\s*(?:个|颗)(?:糖果)?)?[。.!！]?$`)
++
++var astraIQEmptyAnswer = errors.New("empty_answer")
++
++func setAstraIQPrompt(request dto.Request, prompt string) error {
++	switch r := request.(type) {
++	case *dto.GeneralOpenAIRequest:
++		r.ReasoningEffort = "medium"
++		r.Messages = []dto.Message{{Role: "user", Content: prompt}}
++		r.MaxTokens = nil
++		r.MaxCompletionTokens = lo.ToPtr(uint(2048))
++	case *dto.OpenAIResponsesRequest:
++		r.Reasoning = &dto.Reasoning{Effort: "medium"}
++		input, err := common.Marshal([]dto.Message{{Role: "user", Content: prompt}})
++		if err != nil {
++			return err
++		}
++		r.Input = input
++		r.MaxOutputTokens = lo.ToPtr(uint(2048))
++	default:
++		return errors.New("Astra IQ requires a chat or Responses endpoint")
++	}
++	return nil
++}
++
++// Apply after channel parameter overrides so a channel's high/low override
++// cannot silently change the benchmark. Ordinary requests never call this.
++func enforceAstraIQReasoning(body []byte, modelName string) ([]byte, error) {
++	var request map[string]any
++	if err := common.Unmarshal(body, &request); err != nil {
++		return nil, err
++	}
++	if _, responses := request["input"]; responses {
++		reasoning, _ := request["reasoning"].(map[string]any)
++		if reasoning == nil {
++			reasoning = map[string]any{}
++		}
++		reasoning["effort"] = "medium"
++		request["reasoning"] = reasoning
++		delete(request, "reasoning_effort")
++	} else if _, gemini := request["contents"]; gemini {
++		render, err := reasoning.RenderGemini(modelName, reasoning.Intent{Effort: reasoning.EffortMedium}, nil, 0)
++		if err != nil {
++			return nil, err
++		}
++		generation, _ := request["generationConfig"].(map[string]any)
++		if generation == nil {
++			generation = map[string]any{}
++		}
++		thinking, _ := generation["thinkingConfig"].(map[string]any)
++		if thinking == nil {
++			thinking = map[string]any{}
++		}
++		delete(thinking, "thinkingBudget")
++		delete(thinking, "thinkingLevel")
++		if render.Config != nil {
++			if render.Config.ThinkingBudget != nil {
++				thinking["thinkingBudget"] = *render.Config.ThinkingBudget
++			}
++			if render.Config.ThinkingLevel != "" {
++				thinking["thinkingLevel"] = render.Config.ThinkingLevel
++			}
++		}
++		if len(thinking) > 0 {
++			generation["thinkingConfig"] = thinking
++		} else {
++			delete(generation, "thinkingConfig")
++		}
++		request["generationConfig"] = generation
++		delete(request, "reasoning")
++		delete(request, "reasoning_effort")
++	} else if _, chat := request["messages"]; chat {
++		request["reasoning_effort"] = "medium"
++		if reasoning, ok := request["reasoning"].(map[string]any); ok {
++			reasoning["effort"] = "medium"
++		}
++	} else {
++		return nil, errors.New("unsupported_iq_reasoning_protocol")
++	}
++	return common.Marshal(request)
++}
++
++// Grade only completed assistant output; never match numbers in reasoning,
++// usage, prompt echoes, tool calls, incomplete streams or error payloads.
++func astraIQAnswer(body []byte) (string, error) {
++	text := strings.TrimSpace(string(body))
++	if strings.HasPrefix(text, "data:") || strings.HasPrefix(text, "event:") {
++		var content strings.Builder
++		var completedItems strings.Builder
++		completed := false
++		var responseAnswer string
++		for line := range strings.SplitSeq(text, "\n") {
++			data, ok := strings.CutPrefix(strings.TrimSpace(line), "data:")
++			if !ok {
++				continue
++			}
++			data = strings.TrimSpace(data)
++			if data == "[DONE]" {
++				continue
++			}
++			if !gjson.Valid(data) {
++				return "", errors.New("invalid_stream")
++			}
++			event := gjson.Parse(data)
++			if (event.Get("error").Exists() && event.Get("error").Type != gjson.Null) || event.Get("type").String() == "error" || event.Get("type").String() == "response.failed" || event.Get("type").String() == "response.incomplete" {
++				return "", errors.New("upstream_error")
++			}
++			if event.Get("type").String() == "response.output_item.done" {
++				item := event.Get("item")
++				if item.Get("type").String() == "message" && item.Get("role").String() == "assistant" && item.Get("status").String() == "completed" && item.Get("phase").String() != "commentary" {
++					for _, part := range item.Get("content").Array() {
++						if part.Get("type").String() == "output_text" {
++							completedItems.WriteString(part.Get("text").String())
++						}
++					}
++				}
++			}
++			if event.Get("type").String() == "response.completed" {
++				answer, err := astraIQAnswer([]byte(event.Get("response").Raw))
++				// Some Responses providers omit output from response.completed.
++				// A completed assistant item is authoritative only after the
++				// response itself has completed successfully; deltas never pass.
++				if errors.Is(err, astraIQEmptyAnswer) && strings.TrimSpace(completedItems.String()) != "" {
++					answer, err = strings.TrimSpace(completedItems.String()), nil
++				}
++				if err != nil {
++					return "", err
++				}
++				responseAnswer, completed = answer, true
++			}
++			for _, choice := range event.Get("choices").Array() {
++				if choice.Get("index").Int() != 0 {
++					continue
++				}
++				if part := choice.Get("delta.content"); part.Type == gjson.String {
++					content.WriteString(part.String())
++				}
++				if finish := choice.Get("finish_reason").String(); finish != "" {
++					if finish != "stop" {
++						return "", errors.New("incomplete_answer")
++					}
++					completed = true
++				}
++			}
++		}
++		if !completed {
++			return "", errors.New("incomplete_stream")
++		}
++		if responseAnswer != "" {
++			return responseAnswer, nil
++		}
++		if strings.TrimSpace(content.String()) == "" {
++			return "", astraIQEmptyAnswer
++		}
++		return strings.TrimSpace(content.String()), nil
++	}
++	if !gjson.Valid(text) {
++		return "", errors.New("invalid_response")
++	}
++	response := gjson.Parse(text)
++	if response.Get("error").Exists() && response.Get("error").Type != gjson.Null {
++		return "", errors.New("upstream_error")
++	}
++	if choices := response.Get("choices").Array(); len(choices) > 0 {
++		choice := choices[0]
++		if choice.Get("finish_reason").String() != "stop" {
++			return "", errors.New("incomplete_answer")
++		}
++		answer := choice.Get("message.content")
++		if answer.Type != gjson.String || strings.TrimSpace(answer.String()) == "" {
++			return "", astraIQEmptyAnswer
++		}
++		return strings.TrimSpace(answer.String()), nil
++	}
++	if response.Get("status").String() != "completed" {
++		return "", errors.New("incomplete_response")
++	}
++	var answer strings.Builder
++	for _, item := range response.Get("output").Array() {
++		if item.Get("type").String() != "message" || item.Get("role").String() != "assistant" {
++			continue
++		}
++		for _, part := range item.Get("content").Array() {
++			if part.Get("type").String() == "output_text" {
++				answer.WriteString(part.Get("text").String())
++			}
++		}
++	}
++	if strings.TrimSpace(answer.String()) == "" {
++		return "", astraIQEmptyAnswer
++	}
++	return strings.TrimSpace(answer.String()), nil
++}
++
++func probeAstraIQChannel(ctx context.Context, ch *model.Channel, userID int, names ...string) (result model.AstraIQResult) {
++	modelName := model.AstraIQModelName(names...)
++	started := time.Now()
++	result = model.AstraIQResult{ModelName: modelName, Status: "error", Detail: "no_enabled_keys"}
++	result.Sample.StartedAt = started.Unix()
++	result.Sample.Endpoint = "/v1/responses"
++	result.Sample.Profile = model.AstraIQProfile
++	result.Sample.Client = model.AstraIQClient + " (" + model.AstraIQProfile + ")"
++	defer func() {
++		if len(result.Sample.Attempts) == 0 {
++			return
++		}
++		// Log the final grade once per channel, including multi-key failures.
++		// Detailed answers/errors remain in the bounded check history.
++		last := result.Sample.Attempts[len(result.Sample.Attempts)-1]
++		var input, output int
++		knownUsage := true
++		for _, attempt := range result.Sample.Attempts {
++			if attempt.PromptTokens == nil || attempt.CompletionTokens == nil {
++				knownUsage = false
++				continue
++			}
++			input += *attempt.PromptTokens
++			output += *attempt.CompletionTokens
++		}
++		tokens := "unknown"
++		if knownUsage {
++			tokens = fmt.Sprintf("%d/%d", input, output)
++		}
++		common.SysLog(fmt.Sprintf("Model IQ check: model=%q channel=%d checked_at=%d status=%s detail=%s http=%d latency_ms=%d tokens_in_out=%s attempts=%d error_code=%q profile=%s", modelName, ch.Id, result.CheckedAt, result.Status, result.Detail, last.HTTPStatus, time.Since(started).Milliseconds(), tokens, len(result.Sample.Attempts), last.ErrorCode, model.AstraIQProfile))
++	}()
++	if !model.ChannelEligibleForAstraIQ(ch, modelName) {
++		result.Detail = "channel_disabled"
++		return result
++	}
++	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
++	defer cancel()
++	keys := []string{ch.Key}
++	if ch.ChannelInfo.IsMultiKey {
++		keys = ch.GetKeys()
++	}
++	for index, key := range keys {
++		if ch.ChannelInfo.IsMultiKey {
++			if status, exists := ch.ChannelInfo.MultiKeyStatusList[index]; exists && status != common.ChannelStatusEnabled {
++				continue
++			}
++		}
++		settings, err := model.GetAstraIQSettings(modelName)
++		if err != nil {
++			result.Status, result.Detail = "pending", "settings_unavailable"
++			return result
++		}
++		if !settings.Active(time.Now()) || !settings.Includes(ch.Id) {
++			// A partially checked multi-key channel must not become a pass.
++			// Finish in-flight requests, but do not start another after the
++			// window closes or the channel is deselected.
++			result.Status, result.Detail = "pending", "outside_window"
++			return result
++		}
++		// Probe every enabled key without advancing the production polling cursor.
++		probe := *ch
++		probe.Key, probe.Keys, probe.ChannelInfo = key, nil, model.ChannelInfo{}
++		attemptStarted := time.Now()
++		test := testAstraIQWithCodex(ctx, &probe, userID, modelName)
++		attempt := test.iqAttempt
++		attempt.KeyIndex, attempt.LatencyMS, attempt.Status = index+1, time.Since(attemptStarted).Milliseconds(), "error"
++		if test.localErr != nil || test.newAPIError != nil {
++			result.Status, result.Detail = "error", "request_failed"
++			if test.iqAttempt.Detail != "" {
++				result.Detail = test.iqAttempt.Detail
++			}
++			if ctx.Err() != nil {
++				result.Detail = "timeout"
++			}
++			message := ""
++			if test.localErr != nil {
++				message = test.localErr.Error()
++			}
++			apiError := test.newAPIError
++			if apiError == nil {
++				_ = errors.As(test.localErr, &apiError)
++			}
++			if apiError != nil {
++				// Use the parsed error fields, not Error(), which can append the
++				// complete HTTP body and unrelated upstream request metadata.
++				upstream := apiError.ToOpenAIError()
++				message = upstream.Message
++				if upstream.Code != nil {
++					attempt.ErrorCode = astraIQSafeErrorText(fmt.Sprint(upstream.Code), &probe, 128)
++				}
++				attempt.ErrorType = astraIQSafeErrorText(upstream.Type, &probe, 128)
++			}
++			attempt.ErrorMessage = astraIQSafeErrorText(message, &probe, 2048)
++			attempt.Detail = result.Detail
++			result.Sample.Attempts = append(result.Sample.Attempts, attempt)
++			break
++		}
++		answer, err := astraIQAnswer(test.responseBody)
++		if err != nil {
++			result.Status, result.Detail = "error", err.Error()
++			attempt.Detail = result.Detail
++			result.Sample.Attempts = append(result.Sample.Attempts, attempt)
++			break
++		}
++		attempt.Response = string([]rune(answer)[:min(len([]rune(answer)), 8192)])
++		result.Answer = string([]rune(answer)[:min(len([]rune(answer)), 128)])
++		if !astraIQAnswerPattern.MatchString(strings.Trim(answer, "`* \r\n\t")) {
++			result.Status, result.Detail = "fail", "wrong_answer"
++			attempt.Status, attempt.Detail = result.Status, result.Detail
++			result.Sample.Attempts = append(result.Sample.Attempts, attempt)
++			break
++		}
++		result.Status, result.Detail = "pass", ""
++		attempt.Status = result.Status
++		result.Sample.Attempts = append(result.Sample.Attempts, attempt)
++	}
++	result.CheckedAt, result.LatencyMS = common.GetTimestamp(), time.Since(started).Milliseconds()
++	return result
++}
++
++type astraIQTestHandler struct{}
++
++func (astraIQTestHandler) Type() string            { return model.AstraIQTaskType }
++func (astraIQTestHandler) Enabled() bool           { return model.AstraIQEnabled() }
++func (astraIQTestHandler) Interval() time.Duration { return model.AstraIQInterval }
++func (astraIQTestHandler) NewPayload() any         { return nil }
++func (astraIQTestHandler) ScheduleFromStart() bool { return true }
++
++func (astraIQTestHandler) ScheduleDue(now, lastRun int64) (bool, error) {
++	due, err := model.DueAstraIQModels(now, lastRun)
++	return len(due) > 0, err
++}
++
++func (astraIQTestHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
++	if !model.AstraIQEnabled() {
++		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, nil, nil)
++		return
++	}
++	var previous model.SystemTask
++	if err := model.DB.Where("type = ? AND id < ?", model.AstraIQTaskType, task.ID).Order("id DESC").Limit(1).Find(&previous).Error; err != nil {
++		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
++		return
++	}
++	due, err := model.DueAstraIQModels(common.GetTimestamp(), previous.CreatedAt)
++	if err != nil {
++		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
++		return
++	}
++	if len(due) == 0 {
++		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, nil, nil)
++		return
++	}
++	userID, err := resolveChannelTestUserID(nil)
++	if err != nil {
++		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
++		return
++	}
++	var channels []*model.Channel
++	if err = model.DB.Find(&channels).Error; err != nil {
++		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
++		return
++	}
++	type probeJob struct {
++		channel   *model.Channel
++		modelName string
++	}
++	jobs := make(chan probeJob, len(channels)*len(due))
++	runs := make([]model.AstraIQModelRun, 0, len(due))
++	names := make([]string, 0, len(due))
++	for name := range due {
++		names = append(names, name)
++	}
++	slices.Sort(names)
++	for _, name := range names {
++		run := model.AstraIQModelRun{ModelName: name, StartedAt: common.GetTimestamp()}
++		if err = model.DB.Create(&run).Error; err != nil {
++			break
++		}
++		runs = append(runs, run)
++		for _, ch := range channels {
++			if model.ChannelEligibleForAstraIQ(ch, name) && due[name].Includes(ch.Id) {
++				jobs <- probeJob{channel: ch, modelName: name}
++			}
++		}
++	}
++	close(jobs)
++	errs := make(chan error, len(channels)*len(due))
++	var workers sync.WaitGroup
++	for range 3 {
++		workers.Go(func() {
++			for job := range jobs {
++				if ctx.Err() != nil {
++					return
++				}
++				result := probeAstraIQChannel(ctx, job.channel, userID, job.modelName)
++				if ctx.Err() != nil {
++					return
++				}
++				if result.Status == "pending" {
++					if result.Detail == "settings_unavailable" {
++						errs <- errors.New("check settings unavailable")
++					}
++					continue
++				}
++				if saveErr := model.SaveAstraIQResult(job.channel, result); saveErr != nil {
++					errs <- fmt.Errorf("save channel %d model %s IQ result: %w", job.channel.Id, job.modelName, saveErr)
++				}
++			}
++		})
++	}
++	workers.Wait()
++	close(errs)
++	for saveErr := range errs {
++		err = errors.Join(err, saveErr)
++	}
++	for _, run := range runs {
++		err = errors.Join(err, model.FinishAstraIQModelRun(run))
++	}
++	err = errors.Join(err, ctx.Err())
++	status := model.SystemTaskStatusSucceeded
++	if err != nil {
++		status = model.SystemTaskStatusFailed
++	}
++	finishSystemTaskHandler(task, runnerID, status, nil, err)
++}
++
++// History details share the channel read permission; the response deliberately
++// contains no channel configuration or raw upstream request/response envelope.
++func GetAstraIQSample(c *gin.Context) {
++	channelID, idErr := strconv.Atoi(c.Param("id"))
++	checkedAt, timeErr := strconv.ParseInt(c.Param("checked_at"), 10, 64)
++	if idErr != nil || timeErr != nil || channelID <= 0 || checkedAt <= 0 {
++		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Invalid check identifier"})
++		return
++	}
++	rows, err := model.GetAstraIQResults([]int{channelID}, c.Query("model"))
++	if err != nil {
++		common.ApiError(c, err)
++		return
++	}
++	row := rows[channelID]
++	var history []model.AstraIQSample
++	if err := common.UnmarshalJsonStr(string(row.HistoryJSON), &history); err == nil && row.Version == model.AstraIQVersion {
++		for _, sample := range history {
++			if sample.CheckedAt != checkedAt {
++				continue
++			}
++			// Older samples remain readable after upgrading the history format.
++			if len(sample.Attempts) == 0 && checkedAt == row.CheckedAt {
++				sample.Answer, sample.Detail, sample.LatencyMS = row.Answer, row.Detail, row.LatencyMS
++			}
++			common.ApiSuccess(c, gin.H{"sample": sample, "question": astraIQQuestion, "expected_answer": "21", "model": model.AstraIQModelName(row.ModelName), "reasoning_effort": "medium"})
++			return
++		}
++	}
++	c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "Check history is no longer available"})
++}
++
++func DeleteAstraIQResults(c *gin.Context) {
++	channelID, err := strconv.Atoi(c.Param("id"))
++	if err != nil || channelID <= 0 {
++		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Invalid check identifier"})
++		return
++	}
++	var checkedAt int64
++	if value := c.Param("checked_at"); value != "" {
++		checkedAt, err = strconv.ParseInt(value, 10, 64)
++		if err != nil || checkedAt <= 0 {
++			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Invalid check identifier"})
++			return
++		}
++	}
++	if err = model.DeleteAstraIQResults(channelID, checkedAt, c.Query("model")); errors.Is(err, gorm.ErrRecordNotFound) {
++		c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "Check history is no longer available"})
++		return
++	} else if err != nil {
++		common.ApiError(c, err)
++		return
++	}
++	common.ApiSuccess(c, nil)
++}
++
++func GetAstraIQStatus(c *gin.Context) {
++	modelNames := map[string]gin.H{}
++	if !model.AstraIQEnabled() {
++		common.ApiSuccess(c, gin.H{"enabled": false, "models": modelNames})
++		return
++	}
++	config, err := model.GetAstraIQConfig()
++	if err != nil {
++		common.ApiError(c, err)
++		return
++	}
++	var channels []*model.Channel
++	if err = model.DB.Find(&channels).Error; err != nil {
++		common.ApiError(c, err)
++		return
++	}
++	for name, settings := range config.Models {
++		if !settings.Enabled {
++			continue
++		}
++		var ids []int
++		for _, ch := range channels {
++			if model.ChannelSupportsAstraIQ(ch, name) && settings.Includes(ch.Id) {
++				ids = append(ids, ch.Id)
++			}
++		}
++		results, resultErr := model.GetAstraIQResults(ids, name)
++		if resultErr != nil {
++			common.ApiError(c, resultErr)
++			return
++		}
++		views := make(map[int]model.AstraIQView, len(ids))
++		for _, ch := range channels {
++			if !slices.Contains(ids, ch.Id) {
++				continue
++			}
++			result := results[ch.Id]
++			result.ModelName = name
++			views[ch.Id] = model.AstraIQResultView(ch, result, settings)
++		}
++		runs, runErr := model.GetAstraIQModelRuns(name)
++		if runErr != nil {
++			common.ApiError(c, runErr)
++			return
++		}
++		modelNames[name] = gin.H{"interval_minutes": settings.IntervalMinutes, "results": views, "runs": runs}
++	}
++	// Keep Astra fields for older clients during rolling upgrades.
++	response := gin.H{"enabled": len(modelNames) > 0, "models": modelNames, "server_time": common.GetTimestamp(), "results": map[int]model.AstraIQView{}}
++	if astra, exists := modelNames[model.AstraIQModel]; exists {
++		for key, value := range astra {
++			response[key] = value
++		}
++	}
++	common.ApiSuccess(c, response)
++}
++
++type astraIQChannelOption struct {
++	ID     int      `json:"id"`
++	Name   string   `json:"name"`
++	Status int      `json:"status"`
++	Models []string `json:"models"`
++}
++
++func astraIQChannelOptions() ([]astraIQChannelOption, error) {
++	var channels []*model.Channel
++	if err := model.DB.Select("id", "name", "status", "models").Order("id").Find(&channels).Error; err != nil {
++		return nil, err
++	}
++	options := make([]astraIQChannelOption, 0, len(channels))
++	for _, ch := range channels {
++		names := []string{}
++		for name := range strings.SplitSeq(ch.Models, ",") {
++			if name = strings.TrimSpace(name); name != "" {
++				names = append(names, name)
++			}
++		}
++		if len(names) > 0 {
++			options = append(options, astraIQChannelOption{ID: ch.Id, Name: ch.Name, Status: ch.Status, Models: names})
++		}
++	}
++	return options, nil
++}
++
++func GetAstraIQSettings(c *gin.Context) {
++	config, err := model.GetAstraIQConfig()
++	if err != nil {
++		common.ApiError(c, err)
++		return
++	}
++	options, err := astraIQChannelOptions()
++	if err != nil {
++		common.ApiError(c, err)
++		return
++	}
++	legacy := config.Models[model.AstraIQModel]
++	common.ApiSuccess(c, struct {
++		model.AstraIQSettings
++		model.AstraIQConfig
++		Channels []astraIQChannelOption `json:"channels"`
++	}{legacy, config, options})
++}
++
++func UpdateAstraIQSettings(c *gin.Context) {
++	var request struct {
++		Models map[string]struct {
++			Enabled         *bool  `json:"enabled" binding:"required"`
++			StartTime       string `json:"start_time" binding:"required"`
++			EndTime         string `json:"end_time" binding:"required"`
++			IntervalMinutes int    `json:"interval_minutes" binding:"required"`
++			StopOnFailure   *bool  `json:"stop_on_failure" binding:"required"`
++			ChannelIDs      []int  `json:"channel_ids" binding:"required"`
++		} `json:"model_settings"`
++		Enabled         *bool  `json:"enabled"`
++		StartTime       string `json:"start_time"`
++		EndTime         string `json:"end_time"`
++		IntervalMinutes int    `json:"interval_minutes"`
++		StopOnFailure   *bool  `json:"stop_on_failure"`
++		ChannelIDs      []int  `json:"channel_ids"`
++	}
++	if err := c.ShouldBindJSON(&request); err != nil {
++		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Invalid check settings"})
++		return
++	}
++	config := model.AstraIQConfig{Models: map[string]model.AstraIQSettings{}}
++	if request.Models == nil {
++		if request.Enabled == nil || request.StopOnFailure == nil || request.ChannelIDs == nil {
++			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Invalid check settings"})
++			return
++		}
++		existing, err := model.GetAstraIQConfig()
++		if err != nil {
++			common.ApiError(c, err)
++			return
++		}
++		config = existing
++		config.Models[model.AstraIQModel] = model.AstraIQSettings{Enabled: *request.Enabled, StartTime: request.StartTime, EndTime: request.EndTime, IntervalMinutes: request.IntervalMinutes, StopOnFailure: *request.StopOnFailure, ChannelIDs: request.ChannelIDs}
++	} else {
++		for name, value := range request.Models {
++			if value.Enabled == nil || value.StopOnFailure == nil || value.ChannelIDs == nil {
++				c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Invalid check settings"})
++				return
++			}
++			config.Models[name] = model.AstraIQSettings{Enabled: *value.Enabled, StartTime: value.StartTime, EndTime: value.EndTime, IntervalMinutes: value.IntervalMinutes, StopOnFailure: *value.StopOnFailure, ChannelIDs: value.ChannelIDs}
++		}
++	}
++	for name, settings := range config.Models {
++		slices.Sort(settings.ChannelIDs)
++		settings.ChannelIDs = slices.Compact(settings.ChannelIDs)
++		config.Models[name] = settings
++	}
++	if err := config.Validate(); err != nil {
++		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
++		return
++	}
++	options, err := astraIQChannelOptions()
++	if err != nil {
++		common.ApiError(c, err)
++		return
++	}
++	previous, err := model.GetAstraIQConfig()
++	if err != nil {
++		common.ApiError(c, err)
++		return
++	}
++	for name, settings := range config.Models {
++		configured := slices.ContainsFunc(options, func(option astraIQChannelOption) bool { return slices.Contains(option.Models, name) })
++		_, saved := previous.Models[name]
++		if !configured && !saved {
++			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Select a model configured on a channel"})
++			return
++		}
++		for _, id := range settings.ChannelIDs {
++			if !slices.ContainsFunc(options, func(option astraIQChannelOption) bool { return option.ID == id && slices.Contains(option.Models, name) }) {
++				// Retain unavailable saved selections so disabling checks remains possible.
++				if !settings.Enabled && slices.Contains(previous.Models[name].ChannelIDs, id) {
++					continue
++				}
++				c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": model.AstraIQChannelSelectionError})
++				return
++			}
++		}
++	}
++	if err := model.SaveAstraIQConfig(config); err != nil {
++		common.ApiError(c, err)
++		return
++	}
++	if request.Models == nil {
++		common.ApiSuccess(c, config.Models[model.AstraIQModel])
++		return
++	}
++	common.ApiSuccess(c, config)
++}
+diff --git a/controller/astra_iq_codex.go b/controller/astra_iq_codex.go
+new file mode 100644
+index 00000000..71039c0a
+--- /dev/null
++++ b/controller/astra_iq_codex.go
+@@ -0,0 +1,213 @@
++package controller
++
++import (
++	"bufio"
++	"context"
++	"crypto/rand"
++	"crypto/subtle"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"regexp"
++	"strings"
++	"sync/atomic"
++	"time"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/QuantumNous/new-api/constant"
++	"github.com/QuantumNous/new-api/model"
++	"github.com/tidwall/gjson"
++)
++
++var astraIQCredentialPattern = regexp.MustCompile(`(?i)(?:bearer\s+\S+|sk-[a-z0-9_-]+|eyJ[a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+|(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)["']?\s*[:=]\s*["']?[^\s,;"'}]+)`)
++
++// Diagnostic text is visible with channel-read permission. Redact configured
++// credentials before bounding it; never save raw bodies or CLI event envelopes.
++func astraIQSafeErrorText(message string, ch *model.Channel, limit int) string {
++	message, _, _ = strings.Cut(message, ", body:")
++	message = sanitizeFetchModelsError(errors.New(message), ch.Key).Error()
++	for _, value := range ch.GetHeaderOverride() {
++		if secret, ok := value.(string); ok && secret != "" {
++			message = sanitizeFetchModelsError(errors.New(message), secret).Error()
++		}
++	}
++	message = astraIQCredentialPattern.ReplaceAllString(message, "[REDACTED]")
++	message = common.MaskSensitiveInfo(message)
++	message = strings.Join(strings.Fields(message), " ")
++	runes := []rune(message)
++	if len(runes) > limit {
++		return string(runes[:limit]) + "…"
++	}
++	return message
++}
++
++// The real pinned Codex CLI originates every IQ request. Its single-use local
++// proxy selects exactly this channel and keeps provider keys out of the child
++// environment, while reusing channel adapters, timing, usage and test logging.
++func testAstraIQWithCodex(ctx context.Context, ch *model.Channel, userID int, names ...string) testResult {
++	modelName := model.AstraIQModelName(names...)
++	ctx, cancel := context.WithCancel(ctx)
++	defer cancel()
++	binary, err := exec.LookPath("codex")
++	if err != nil {
++		return testResult{localErr: err, iqAttempt: model.AstraIQAttempt{Detail: "official_client_unavailable"}}
++	}
++	dir, err := os.MkdirTemp("", "astra-iq-codex-")
++	if err != nil {
++		return testResult{localErr: err}
++	}
++	defer os.RemoveAll(dir)
++	workspace := filepath.Join(dir, "workspace")
++	if err := os.Mkdir(workspace, 0700); err != nil {
++		return testResult{localErr: err}
++	}
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		return testResult{localErr: err}
++	}
++	proxyKey := rand.Text()
++	results := make(chan testResult, 1)
++	server := &http.Server{ReadHeaderTimeout: 5 * time.Second, Handler: astraIQProxyHandler(ctx, ch, userID, proxyKey, results, modelName)}
++	defer server.Close()
++	go func() { _ = server.Serve(listener) }()
++	config := fmt.Sprintf(`model = %q
++model_provider = "astra_iq"
++model_reasoning_effort = "medium"
++approval_policy = "never"
++web_search = "disabled"
++[agents]
++enabled = false
++[skills]
++max_context_tokens = 1
++[features]
++shell_tool = false
++unified_exec = false
++apps = false
++plugins = false
++multi_agent = false
++browser_use = false
++computer_use = false
++js_repl = false
++code_mode = false
++code_mode_host = false
++skill_search = false
++view_image = false
++sleep_tool = false
++goals = false
++[model_providers.astra_iq]
++name = "Astra IQ"
++base_url = "http://%s/v1"
++wire_api = "responses"
++env_key = "ASTRA_IQ_PROXY_KEY"
++request_max_retries = 0
++stream_max_retries = 0
++stream_idle_timeout_ms = 120000
++supports_websockets = false
++`, modelName, listener.Addr())
++	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(config), 0600); err != nil {
++		return testResult{localErr: err}
++	}
++	cmd := exec.CommandContext(ctx, binary, "exec", "--strict-config", "--json", "--ephemeral", "--skip-git-repo-check", "--sandbox", "read-only", "-C", workspace, "-")
++	cmd.Dir = workspace
++	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + dir, "ASTRA_IQ_PROXY_KEY=" + proxyKey}
++	cmd.Stdin = strings.NewReader(astraIQQuestion)
++	cmd.Stderr = io.Discard // CLI errors can contain request metadata; never persist them.
++	cmd.WaitDelay = time.Second
++	stdout, err := cmd.StdoutPipe()
++	if err != nil {
++		return testResult{localErr: err}
++	}
++	if err := cmd.Start(); err != nil {
++		return testResult{localErr: err, iqAttempt: model.AstraIQAttempt{Detail: "official_client_unavailable"}}
++	}
++	scanner := bufio.NewScanner(stdout)
++	scanner.Buffer(make([]byte, 4096), 1<<20)
++	completed, failed := false, false
++	var answer, failureMessage string
++	for scanner.Scan() {
++		event := gjson.ParseBytes(scanner.Bytes())
++		switch event.Get("type").String() {
++		case "item.completed":
++			if event.Get("item.type").String() == "agent_message" {
++				answer = event.Get("item.text").String()
++			}
++		case "turn.completed":
++			completed = true
++		case "turn.failed", "error":
++			failed = true
++			failureMessage = event.Get("error.message").String()
++			if failureMessage == "" {
++				failureMessage = event.Get("message").String()
++			}
++		}
++	}
++	if scanner.Err() != nil {
++		_ = cmd.Process.Kill()
++	}
++	cliErr := cmd.Wait()
++	if failureMessage == "" && cliErr != nil {
++		failureMessage = cliErr.Error()
++	}
++	failureMessage = strings.ReplaceAll(failureMessage, proxyKey, "[REDACTED]")
++	var result testResult
++	select {
++	case result = <-results:
++	default:
++		return testResult{localErr: fmt.Errorf("official client did not issue a probe: %s", failureMessage), iqAttempt: model.AstraIQAttempt{Detail: "official_client_failed"}}
++	}
++	if result.localErr != nil || result.newAPIError != nil {
++		if result.localErr != nil && strings.Contains(result.localErr.Error(), "only allows Codex official clients") {
++			result.iqAttempt.Detail = "official_client_rejected"
++		}
++		return result
++	}
++	expected, gradeErr := astraIQAnswer(result.responseBody)
++	if cliErr != nil || scanner.Err() != nil || failed || !completed || gradeErr != nil || strings.TrimSpace(answer) != expected {
++		if failureMessage == "" && gradeErr != nil {
++			failureMessage = gradeErr.Error()
++		}
++		if failureMessage == "" && scanner.Err() != nil {
++			failureMessage = scanner.Err().Error()
++		}
++		if failureMessage == "" {
++			failureMessage = "missing completion event or inconsistent final answer"
++		}
++		result.localErr = fmt.Errorf("official client did not complete the model response: %s", failureMessage)
++		result.iqAttempt.Detail = "official_client_incomplete"
++	}
++	return result
++}
++
++// astraIQProxyHandler admits one authenticated Responses call for one channel.
++func astraIQProxyHandler(ctx context.Context, ch *model.Channel, userID int, proxyKey string, results chan<- testResult, names ...string) http.Handler {
++	modelName := model.AstraIQModelName(names...)
++	var used atomic.Bool
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Method != http.MethodPost || r.URL.Path != "/v1/responses" || subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+proxyKey)) != 1 {
++			http.Error(w, "invalid probe request", http.StatusForbidden)
++			return
++		}
++		if !used.CompareAndSwap(false, true) {
++			http.Error(w, "only one inference is allowed per check", http.StatusTooManyRequests)
++			return
++		}
++		r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
++		result := testChannelWithClientRequest(ctx, ch, userID, modelName, string(constant.EndpointTypeOpenAIResponse), true, astraIQQuestion, r)
++		results <- result
++		if result.localErr != nil || result.newAPIError != nil {
++			status := result.iqAttempt.HTTPStatus
++			if status < 400 {
++				status = http.StatusBadGateway
++			}
++			http.Error(w, "channel probe failed", status)
++			return
++		}
++		w.Header().Set("Content-Type", "text/event-stream")
++		_, _ = w.Write(result.responseBody)
++	})
++}
+diff --git a/controller/channel-test.go b/controller/channel-test.go
+index 3cf5c846..9fade4c4 100644
+--- a/controller/channel-test.go
++++ b/controller/channel-test.go
+@@ -21,7 +21,8 @@ import (
+ 	"github.com/QuantumNous/new-api/model"
+ 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+ 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+ 	"github.com/QuantumNous/new-api/relay"
++	channelrelay "github.com/QuantumNous/new-api/relay/channel"
+ 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+ 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+ 	"github.com/QuantumNous/new-api/relay/helper"
+@@ -37,9 +38,11 @@ import (
+ )
+ 
+ type testResult struct {
+-	context     *gin.Context
+-	localErr    error
+-	newAPIError *types.NewAPIError
++	context      *gin.Context
++	localErr     error
++	newAPIError  *types.NewAPIError
++	responseBody []byte
++	iqAttempt    model.AstraIQAttempt
+ }
+ 
+ func normalizeChannelTestEndpoint(channel *model.Channel, endpointType string) string {
+@@ -71,6 +74,14 @@ func resolveChannelTestUserID(c *gin.Context) (int, error) {
+ }
+ 
+ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool) testResult {
++	return testChannelWithPrompt(ctx, channel, testUserID, testModel, endpointType, isStream, "")
++}
++
++func testChannelWithPrompt(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool, prompt string) testResult {
++	return testChannelWithClientRequest(ctx, channel, testUserID, testModel, endpointType, isStream, prompt, nil)
++}
++
++func testChannelWithClientRequest(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool, prompt string, clientRequest *http.Request) testResult {
+ 	if ctx == nil {
+ 		ctx = context.Background()
+ 	}
+@@ -151,6 +162,9 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+ 		requestPath = strings.Replace(requestPath, ":generateContent", ":streamGenerateContent", 1)
+ 	}
+ 	c.Request = httptest.NewRequestWithContext(ctx, http.MethodPost, requestPath, nil)
++	if clientRequest != nil {
++		c.Request = clientRequest.Clone(ctx)
++	}
+ 
+ 	cache, err := model.GetUserCache(testUserID)
+ 	if err != nil {
+@@ -229,6 +243,20 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+ 	}
+ 
+ 	request := buildTestRequest(testModel, endpointType, channel, isStream)
++	if clientRequest != nil {
++		var actual dto.OpenAIResponsesRequest
++		if err := common.DecodeJson(clientRequest.Body, &actual); err != nil {
++			return testResult{context: c, localErr: err}
++		}
++		if actual.Model != testModel {
++			return testResult{context: c, localErr: errors.New("probe model does not match configured model")}
++		}
++		request = &actual
++	} else if prompt != "" {
++		if err := setAstraIQPrompt(request, prompt); err != nil {
++			return testResult{context: c, localErr: err}
++		}
++	}
+ 
+ 	info, err := relaycommon.GenRelayInfo(c, relayFormat, request, nil)
+ 
+@@ -242,6 +270,24 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+ 
+ 	info.IsChannelTest = true
+ 	info.InitChannelMeta(c)
++	if clientRequest != nil {
++		// Forward the identity generated by the real official CLI process.
++		// No fabricated client headers or upstream credentials reach that process.
++		headers, err := channelrelay.ResolveHeaderOverride(info, c)
++		if err != nil {
++			return testResult{context: c, localErr: err}
++		}
++		info.RuntimeHeadersOverride = make(map[string]any, len(headers)+4)
++		for name, value := range headers {
++			info.RuntimeHeadersOverride[name] = value
++		}
++		for _, name := range []string{"user-agent", "originator", "session_id", "version", "x-codex-turn-metadata", "x-codex-beta-features"} {
++			if value := clientRequest.Header.Get(name); value != "" {
++				info.RuntimeHeadersOverride[name] = value
++			}
++		}
++		info.UseRuntimeHeadersOverride = true
++	}
+ 
+ 	err = attachTestBillingRequestInput(info, request)
+ 	if err != nil {
+@@ -293,7 +339,9 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+ 	//// 创建一个用于日志的 info 副本，移除 ApiKey
+ 	//logInfo := info
+ 	//logInfo.ApiKey = ""
+-	common.SysLog(common.LogText("testing channel %d with model %s , info %+v ", channel.Id, testModel, info.ToString()))
++	if prompt == "" {
++		common.SysLog(common.LogText("testing channel %d with model %s , info %+v ", channel.Id, testModel, info.ToString()))
++	}
+ 
+ 	priceData, err := helper.ModelPriceHelper(c, info, 0, request.GetTokenCountMeta())
+ 	if err != nil {
+@@ -432,6 +480,12 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+ 		}
+ 	}
+ 
++	if prompt != "" {
++		jsonData, err = enforceAstraIQReasoning(jsonData, info.UpstreamModelName)
++		if err != nil {
++			return testResult{context: c, localErr: err}
++		}
++	}
+ 	requestBody := bytes.NewBuffer(jsonData)
+ 	c.Request.Body = io.NopCloser(bytes.NewBuffer(jsonData))
+ 	resp, err := adaptor.DoRequest(c, info, requestBody)
+@@ -443,33 +497,46 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+ 		}
+ 	}
+ 	var httpResp *http.Response
++	attempt := model.AstraIQAttempt{}
+ 	if resp != nil {
+ 		httpResp = resp.(*http.Response)
++		attempt.HTTPStatus = httpResp.StatusCode
+ 		if httpResp.StatusCode != http.StatusOK {
+ 			err := service.RelayErrorHandler(c.Request.Context(), httpResp, true)
+-			common.SysError(common.LogText(
+-				"channel test bad response: channel_id=%d name=%s type=%d model=%s endpoint_type=%s status=%d err=%v",
+-				channel.Id,
+-				channel.Name,
+-				channel.Type,
+-				testModel,
+-				endpointType,
+-				httpResp.StatusCode,
+-				err,
+-			))
++			if prompt == "" {
++				common.SysError(common.LogText(
++					"channel test bad response: channel_id=%d name=%s type=%d model=%s endpoint_type=%s status=%d err=%v",
++					channel.Id,
++					channel.Name,
++					channel.Type,
++					testModel,
++					endpointType,
++					httpResp.StatusCode,
++					err,
++				))
++			}
+ 			return testResult{
+ 				context:     c,
+ 				localErr:    err,
+ 				newAPIError: types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError),
++				iqAttempt:   attempt,
+ 			}
+ 		}
+ 	}
+ 	usageA, respErr := adaptor.DoResponse(c, httpResp, info)
++	if measured, ok := usageA.(*dto.Usage); ok && measured != nil {
++		attempt.PromptTokens, attempt.CompletionTokens = &measured.PromptTokens, &measured.CompletionTokens
++	}
++	if isStream && info.HasSendResponse() {
++		firstTokenMS := info.FirstResponseTime.Sub(info.StartTime).Milliseconds()
++		attempt.FirstTokenMS = &firstTokenMS
++	}
+ 	if respErr != nil {
+ 		return testResult{
+ 			context:     c,
+ 			localErr:    respErr,
+ 			newAPIError: respErr,
++			iqAttempt:   attempt,
+ 		}
+ 	}
+ 	usage, usageErr := coerceTestUsage(usageA, isStream, info.GetEstimatePromptTokens())
+@@ -478,15 +545,18 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+ 			context:     c,
+ 			localErr:    usageErr,
+ 			newAPIError: types.NewOpenAIError(usageErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError),
++			iqAttempt:   attempt,
+ 		}
+ 	}
+ 	result := w.Result()
+-	respBody, err := readTestResponseBody(result.Body, isStream)
++	// IQ grading needs the final event beyond the ordinary 8 KiB log preview.
++	respBody, err := readTestResponseBody(result.Body, isStream && prompt == "")
+ 	if err != nil {
+ 		return testResult{
+ 			context:     c,
+ 			localErr:    err,
+ 			newAPIError: types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError),
++			iqAttempt:   attempt,
+ 		}
+ 	}
+ 	if bodyErr := validateTestResponseBody(respBody, isStream); bodyErr != nil {
+@@ -494,6 +564,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+ 			context:     c,
+ 			localErr:    bodyErr,
+ 			newAPIError: types.NewOpenAIError(bodyErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError),
++			iqAttempt:   attempt,
+ 		}
+ 	}
+ 	info.SetEstimatePromptTokens(usage.PromptTokens)
+@@ -516,11 +587,16 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
+ 		Group:            info.UsingGroup,
+ 		Other:            other,
+ 	})
+-	common.SysLog(common.LogText("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
++	if prompt == "" {
++		common.SysLog(common.LogText("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
++	}
++	attempt.PromptTokens, attempt.CompletionTokens = &usage.PromptTokens, &usage.CompletionTokens
+ 	return testResult{
+-		context:     c,
+-		localErr:    nil,
+-		newAPIError: nil,
++		context:      c,
++		localErr:     nil,
++		newAPIError:  nil,
++		responseBody: respBody,
++		iqAttempt:    attempt,
+ 	}
+ }
+ 
+diff --git a/controller/system_task_handlers.go b/controller/system_task_handlers.go
+--- a/controller/system_task_handlers.go
++++ b/controller/system_task_handlers.go
+@@ -20,2 +20,3 @@
+ func RegisterScheduledSystemTasks() {
++	service.RegisterSystemTaskHandler(astraIQTestHandler{})
+ 	service.RegisterSystemTaskHandler(channelTestHandler{})
+diff --git a/model/ability.go b/model/ability.go
+index 18fcf342..0d27c820 100644
+--- a/model/ability.go
++++ b/model/ability.go
+@@ -183,6 +183,9 @@ func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters
+ 
+ 	var channels []*Channel
+ 	if err := DB.Where("id IN ?", channelIds).Find(&channels).Error; err != nil {
++		if AstraIQRequired(modelName) {
++			return nil
++		}
+ 		for _, filter := range filters {
+ 			if filter.Kind == dto.FilterExcludeChannels {
+ 				return nil
+diff --git a/model/astra_iq.go b/model/astra_iq.go
+new file mode 100644
+index 00000000..5d0108f1
+--- /dev/null
++++ b/model/astra_iq.go
+@@ -0,0 +1,459 @@
++package model
++
++import (
++	"context"
++	"crypto/sha256"
++	"errors"
++	"fmt"
++	"slices"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/QuantumNous/new-api/common"
++	"gorm.io/gorm"
++	"gorm.io/gorm/clause"
++)
++
++const (
++	AstraIQModel   = "gpt-6-astra"
++	AstraIQClient  = "Codex CLI 0.157.1"
++	AstraIQVersion = "candy-21-medium-v1"
++	// The question and routing judgment remain compatible across request
++	// profiles. Keep the benchmark version/fingerprint so existing failures
++	// stay blocked until a new check completes, and old history is retained.
++	AstraIQProfile     = "minimal-v1"
++	AstraIQTaskType    = "astra_iq_test"
++	AstraIQInterval    = 5 * time.Minute
++	AstraIQHistorySize = 24
++)
++
++// Separate storage prevents channel edits/imports from overwriting approval.
++type AstraIQResult struct {
++	ChannelID   int           `json:"channel_id" gorm:"primaryKey;autoIncrement:false"`
++	ModelKey    string        `json:"-" gorm:"primaryKey;type:varchar(64)"`
++	ModelName   string        `json:"model" gorm:"type:varchar(128)"`
++	Status      string        `json:"status" gorm:"type:varchar(16)"`
++	CheckedAt   int64         `json:"checked_at" gorm:"bigint"`
++	Version     string        `json:"version" gorm:"type:varchar(64)"`
++	Fingerprint string        `json:"-" gorm:"type:varchar(64)"`
++	Answer      string        `json:"answer" gorm:"type:text"`
++	Detail      string        `json:"detail" gorm:"type:varchar(128)"`
++	LatencyMS   int64         `json:"latency_ms" gorm:"bigint"`
++	HistoryJSON LongText      `json:"-"`
++	Sample      AstraIQSample `json:"-" gorm:"-"`
++}
++
++type AstraIQSample struct {
++	Status    string           `json:"status"`
++	CheckedAt int64            `json:"checked_at"`
++	StartedAt int64            `json:"started_at,omitempty"`
++	Answer    string           `json:"answer,omitempty"`
++	Detail    string           `json:"detail,omitempty"`
++	LatencyMS int64            `json:"latency_ms,omitempty"`
++	Endpoint  string           `json:"endpoint,omitempty"`
++	Client    string           `json:"client,omitempty"`
++	Profile   string           `json:"profile,omitempty"`
++	Attempts  []AstraIQAttempt `json:"attempts,omitempty"`
++}
++
++// Store the assistant's answer, sanitized errors and safe metrics, never request
++// headers, credentials, reasoning content or raw upstream error bodies.
++type AstraIQAttempt struct {
++	KeyIndex         int    `json:"key_index"`
++	Status           string `json:"status"`
++	Response         string `json:"response,omitempty"`
++	Detail           string `json:"detail,omitempty"`
++	ErrorMessage     string `json:"error_message,omitempty"`
++	ErrorCode        string `json:"error_code,omitempty"`
++	ErrorType        string `json:"error_type,omitempty"`
++	LatencyMS        int64  `json:"latency_ms"`
++	FirstTokenMS     *int64 `json:"first_token_ms"`
++	PromptTokens     *int   `json:"prompt_tokens"`
++	CompletionTokens *int   `json:"completion_tokens"`
++	HTTPStatus       int    `json:"http_status,omitempty"`
++}
++
++type AstraIQView struct {
++	AstraIQResult
++	Allowed  bool            `json:"allowed"`
++	PassRate float64         `json:"pass_rate"`
++	History  []AstraIQSample `json:"history"`
++}
++
++type AstraIQRun struct {
++	StartedAt  int64 `json:"started_at"`
++	FinishedAt int64 `json:"finished_at"`
++}
++
++// Actual rounds distinguish scheduler drift and long-running probes from
++// missed checks. Only their times are exposed, never task payloads or errors.
++func GetAstraIQRuns() ([]AstraIQRun, error) {
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	var tasks []SystemTask
++	if err := DB.WithContext(ctx).Select("created_at", "updated_at", "status").
++		Where("type = ?", AstraIQTaskType).Order("id DESC").Limit(AstraIQHistorySize).
++		Find(&tasks).Error; err != nil {
++		return nil, err
++	}
++	runs := make([]AstraIQRun, 0, len(tasks))
++	for i := len(tasks) - 1; i >= 0; i-- {
++		run := AstraIQRun{StartedAt: tasks[i].CreatedAt}
++		if tasks[i].Status == SystemTaskStatusSucceeded || tasks[i].Status == SystemTaskStatusFailed {
++			run.FinishedAt = tasks[i].UpdatedAt
++		}
++		runs = append(runs, run)
++	}
++	return runs, nil
++}
++
++func AstraIQEnabled() bool {
++	return common.GetEnvOrDefaultBool("ASTRA_IQ_ENABLED", false)
++}
++
++func AstraIQRequired(modelName string) bool {
++	return AstraIQEnabled() && strings.TrimSpace(modelName) != ""
++}
++
++func ChannelSupportsAstraIQ(ch *Channel, names ...string) bool {
++	if ch == nil {
++		return false
++	}
++	for name := range strings.SplitSeq(ch.Models, ",") {
++		if strings.TrimSpace(name) == AstraIQModelName(names...) {
++			return true
++		}
++	}
++	return false
++}
++
++func ChannelEligibleForAstraIQ(ch *Channel, names ...string) bool {
++	return ch != nil && ch.Status == common.ChannelStatusEnabled && ChannelSupportsAstraIQ(ch, names...)
++}
++
++// Never return this hash in the API. Credential/configuration changes require
++// another probe, including changes to the enabled multi-key set.
++func AstraIQFingerprint(ch *Channel) string {
++	data, err := common.Marshal([]any{AstraIQClient, ch.Type, ch.Key, ch.BaseURL, ch.OpenAIOrganization, ch.ModelMapping, ch.ParamOverride, ch.HeaderOverride, ch.Setting, ch.OtherSettings, ch.Other, ch.ChannelInfo.MultiKeyStatusList})
++	if err != nil {
++		return ""
++	}
++	return fmt.Sprintf("%x", sha256.Sum256(data))
++}
++
++func (r AstraIQResult) applicable(ch *Channel) bool {
++	return ch != nil && r.CheckedAt > 0 && r.Version == AstraIQVersion &&
++		r.Fingerprint != "" && r.Fingerprint == AstraIQFingerprint(ch)
++}
++
++func (r AstraIQResult) Allows(ch *Channel, settings AstraIQSettings) bool {
++	if ch == nil {
++		return false
++	}
++	// No result (including cleared history or changed credentials) is allowed.
++	// Only an actual failure blocks calls, and it remains in force outside the
++	// check window until a new pass, deletion, or disabling this setting.
++	return !settings.Enabled || !settings.StopOnFailure || !settings.Includes(ch.Id) || !r.applicable(ch) || (r.Status != "fail" && r.Status != "error")
++}
++
++// Read shared storage at selection time so a failed probe takes effect on every
++// instance immediately, independently of the ordinary channel cache refresh.
++func GetAstraIQResults(ids []int, names ...string) (map[int]AstraIQResult, error) {
++	results := make(map[int]AstraIQResult)
++	if len(ids) == 0 {
++		return results, nil
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	var rows []AstraIQResult
++	err := DB.WithContext(ctx).Where("channel_id IN ? AND model_key = ?", ids, AstraIQModelKey(AstraIQModelName(names...))).Find(&rows).Error
++	for _, row := range rows {
++		results[row.ChannelID] = row
++	}
++	return results, err
++}
++
++func AstraIQAllowsChannel(ch *Channel, modelName string) bool {
++	if !AstraIQRequired(modelName) {
++		return true
++	}
++	if ch == nil {
++		return false
++	}
++	settings, err := GetAstraIQSettings(modelName)
++	if err != nil {
++		return false
++	}
++	if !settings.Enabled || !settings.StopOnFailure || !settings.Includes(ch.Id) {
++		return true
++	}
++	results, err := GetAstraIQResults([]int{ch.Id}, modelName)
++	return err == nil && results[ch.Id].Allows(ch, settings)
++}
++
++type astraIQRoutingSnapshot struct {
++	settings AstraIQSettings
++	results  map[int]AstraIQResult
++}
++
++// Read once per selection, outside channelSyncLock. Load only judgment fields:
++// full answers/history are irrelevant to routing and can be much larger.
++func loadAstraIQRouting(modelName string) (*astraIQRoutingSnapshot, error) {
++	if !AstraIQRequired(modelName) {
++		return nil, nil
++	}
++	settings, err := GetAstraIQSettings(modelName)
++	if err != nil {
++		return nil, err
++	}
++	if !settings.Enabled || !settings.StopOnFailure {
++		return nil, nil
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	var rows []AstraIQResult
++	query := DB.WithContext(ctx).Select("channel_id", "status", "checked_at", "version", "fingerprint").Where("model_key = ?", AstraIQModelKey(modelName))
++	if len(settings.ChannelIDs) > 0 {
++		query = query.Where("channel_id IN ?", settings.ChannelIDs)
++	}
++	if err := query.Find(&rows).Error; err != nil {
++		return nil, err
++	}
++	snapshot := &astraIQRoutingSnapshot{settings: settings, results: make(map[int]AstraIQResult, len(rows))}
++	for _, row := range rows {
++		snapshot.results[row.ChannelID] = row
++	}
++	return snapshot, nil
++}
++
++// Caller holds channelSyncLock. Check the current cached channel fingerprint,
++// including any credentials/configuration changed while the DB was queried.
++func (s *astraIQRoutingSnapshot) filterIDs(ids []int) []int {
++	if s == nil {
++		return ids
++	}
++	kept := make([]int, 0, len(ids))
++	for _, id := range ids {
++		if s.results[id].Allows(channelsIDM[id], s.settings) {
++			kept = append(kept, id)
++		}
++	}
++	return kept
++}
++
++func SaveAstraIQResult(ch *Channel, result AstraIQResult) error {
++	result.ModelName = AstraIQModelName(result.ModelName)
++	result.ModelKey = AstraIQModelKey(result.ModelName)
++	return DB.Transaction(func(tx *gorm.DB) error {
++		// Serialize history changes with deletion so a finishing probe cannot
++		// write back a copy of history that an administrator just removed.
++		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&AstraIQResult{ChannelID: ch.Id, ModelName: result.ModelName, ModelKey: result.ModelKey}).Error; err != nil {
++			return err
++		}
++		var previous AstraIQResult
++		if err := lockForUpdate(tx).First(&previous, "channel_id = ? AND model_key = ?", ch.Id, AstraIQModelKey(result.ModelName)).Error; err != nil {
++			return err
++		}
++		var history []AstraIQSample
++		if previous.Version == AstraIQVersion {
++			_ = common.UnmarshalJsonStr(string(previous.HistoryJSON), &history)
++		}
++		sample := result.Sample
++		sample.Status, sample.CheckedAt = result.Status, result.CheckedAt
++		sample.Answer, sample.Detail, sample.LatencyMS = result.Answer, result.Detail, result.LatencyMS
++		history = append(history, sample)
++		if len(history) > AstraIQHistorySize {
++			history = history[len(history)-AstraIQHistorySize:]
++		}
++		data, err := common.Marshal(history)
++		if err != nil {
++			return err
++		}
++		result.ChannelID = ch.Id
++		result.Version = AstraIQVersion
++		result.Fingerprint = AstraIQFingerprint(ch)
++		result.HistoryJSON = LongText(data)
++		return tx.Save(&result).Error
++	})
++}
++
++// checkedAt == 0 clears this channel's entire history. Removing the latest
++// result resets the channel to untested; an older sample is never promoted.
++func DeleteAstraIQResults(channelID int, checkedAt int64, names ...string) error {
++	return DB.Transaction(func(tx *gorm.DB) error {
++		var result AstraIQResult
++		if err := lockForUpdate(tx).First(&result, "channel_id = ? AND model_key = ?", channelID, AstraIQModelKey(AstraIQModelName(names...))).Error; err != nil {
++			if checkedAt == 0 && errors.Is(err, gorm.ErrRecordNotFound) {
++				return nil
++			}
++			return err
++		}
++		history := []AstraIQSample{}
++		if checkedAt != 0 {
++			if err := common.UnmarshalJsonStr(string(result.HistoryJSON), &history); err != nil {
++				return err
++			}
++			count := len(history)
++			history = slices.DeleteFunc(history, func(sample AstraIQSample) bool { return sample.CheckedAt == checkedAt })
++			if len(history) == count {
++				return gorm.ErrRecordNotFound
++			}
++		}
++		if checkedAt == 0 || checkedAt == result.CheckedAt {
++			result.Status, result.CheckedAt = "pending", 0
++			result.Answer, result.Detail, result.Fingerprint = "", "", ""
++			result.LatencyMS = 0
++		}
++		data, err := common.Marshal(history)
++		if err != nil {
++			return err
++		}
++		result.HistoryJSON = LongText(data)
++		return tx.Save(&result).Error
++	})
++}
++
++func AstraIQResultView(ch *Channel, r AstraIQResult, settings AstraIQSettings) AstraIQView {
++	view := AstraIQView{AstraIQResult: r, History: []AstraIQSample{}}
++	view.ChannelID = ch.Id
++	view.Allowed = r.Allows(ch, settings)
++	if view.Status == "" || !r.applicable(ch) {
++		view.Status = "pending"
++	}
++	_ = common.UnmarshalJsonStr(string(r.HistoryJSON), &view.History)
++	passed := 0
++	for _, sample := range view.History {
++		if sample.Status == "pass" {
++			passed++
++		}
++	}
++	// Full replies are fetched only when a history segment is opened.
++	for i := range view.History {
++		view.History[i].Attempts = nil
++	}
++	if len(view.History) > 0 {
++		view.PassRate = float64(passed) * 100 / float64(len(view.History))
++	}
++	return view
++}
++
++// Use a new composite-key table, keeping the original table intact for rollback.
++func (AstraIQResult) TableName() string { return "model_iq_results" }
++
++// Copy old Astra judgments exactly once; deletion must survive later startups.
++func MigrateAstraIQResults(db *gorm.DB) error {
++	if err := db.AutoMigrate(&AstraIQResult{}, &AstraIQModelRun{}); err != nil {
++		return err
++	}
++	if !db.Migrator().HasTable("astra_iq_results") {
++		return nil
++	}
++	return db.Transaction(func(tx *gorm.DB) error {
++		marker := Option{Key: "AstraIQModelsMigrated", Value: strconv.FormatInt(common.GetTimestamp(), 10)}
++		claim := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&marker)
++		if claim.Error != nil || claim.RowsAffected == 0 {
++			return claim.Error
++		}
++		var rows []AstraIQResult
++		if err := tx.Table("astra_iq_results").Find(&rows).Error; err != nil {
++			return err
++		}
++		for i := range rows {
++			rows[i].ModelName = AstraIQModel
++			rows[i].ModelKey = AstraIQModelKey(AstraIQModel)
++		}
++		if len(rows) == 0 {
++			return nil
++		}
++		return tx.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(rows, 100).Error
++	})
++}
++
++type AstraIQModelRun struct {
++	ID         int64  `gorm:"primaryKey" json:"-"`
++	ModelKey   string `gorm:"type:varchar(64);index" json:"-"`
++	ModelName  string `gorm:"type:varchar(128)" json:"-"`
++	StartedAt  int64  `json:"started_at"`
++	FinishedAt int64  `json:"finished_at"`
++}
++
++func GetAstraIQModelRuns(name string) ([]AstraIQRun, error) {
++	var rows []AstraIQModelRun
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	if err := DB.WithContext(ctx).Where("model_key = ?", AstraIQModelKey(name)).Order("id DESC").Limit(AstraIQHistorySize).Find(&rows).Error; err != nil {
++		return nil, err
++	}
++	runs := make([]AstraIQRun, 0, len(rows))
++	for i := len(rows) - 1; i >= 0; i-- {
++		runs = append(runs, AstraIQRun{StartedAt: rows[i].StartedAt, FinishedAt: rows[i].FinishedAt})
++	}
++	if name == AstraIQModel {
++		legacy, err := GetAstraIQRuns()
++		if err != nil {
++			return nil, err
++		}
++		// The one-time migration timestamp separates legacy Astra rounds
++		// from later shared tasks, including after per-model run retention.
++		var marker Option
++		if err := DB.WithContext(ctx).Where(&Option{Key: "AstraIQModelsMigrated"}).Find(&marker).Error; err != nil {
++			return nil, err
++		}
++		cutoff, _ := strconv.ParseInt(marker.Value, 10, 64)
++		if cutoff == 0 && len(runs) > 0 {
++			cutoff = runs[0].StartedAt
++		}
++
++		for i := len(legacy) - 1; i >= 0 && len(runs) < AstraIQHistorySize; i-- {
++			if cutoff == 0 || legacy[i].StartedAt < cutoff {
++				runs = append([]AstraIQRun{legacy[i]}, runs...)
++			}
++		}
++	}
++	return runs, nil
++}
++
++func DueAstraIQModels(now, legacyLastRun int64) (map[string]AstraIQSettings, error) {
++	config, err := GetAstraIQConfig()
++	if err != nil {
++		return nil, err
++	}
++	due := make(map[string]AstraIQSettings)
++	for name, settings := range config.Models {
++		var run AstraIQModelRun
++		if err := DB.Where("model_key = ?", AstraIQModelKey(name)).Order("id DESC").Limit(1).Find(&run).Error; err != nil {
++			return nil, err
++		}
++		last := run.StartedAt
++		if last == 0 && name == AstraIQModel {
++			last = legacyLastRun
++		}
++		if settings.Due(now, last) {
++			due[name] = settings
++		}
++	}
++	return due, nil
++}
++
++func FinishAstraIQModelRun(run AstraIQModelRun) error {
++	return DB.Transaction(func(tx *gorm.DB) error {
++		if err := tx.Model(&run).Update("finished_at", common.GetTimestamp()).Error; err != nil {
++			return err
++		}
++		var kept []int64
++		if err := tx.Model(&AstraIQModelRun{}).Where("model_key = ?", AstraIQModelKey(run.ModelName)).Order("id DESC").Limit(AstraIQHistorySize).Pluck("id", &kept).Error; err != nil {
++			return err
++		}
++		return tx.Where("model_key = ? AND id NOT IN ?", AstraIQModelKey(run.ModelName), kept).Delete(&AstraIQModelRun{}).Error
++	})
++}
++
++// A stable ASCII key keeps model identity case-sensitive even on MySQL's
++// default case-insensitive collation, without dialect-specific column types.
++func AstraIQModelKey(name string) string { return fmt.Sprintf("%x", sha256.Sum256([]byte(name))) }
++
++func (r *AstraIQModelRun) BeforeSave(_ *gorm.DB) error {
++	r.ModelKey = AstraIQModelKey(r.ModelName)
++	return nil
++}
+diff --git a/model/astra_iq_settings.go b/model/astra_iq_settings.go
+new file mode 100644
+index 00000000..4229b3d1
+--- /dev/null
++++ b/model/astra_iq_settings.go
+@@ -0,0 +1,175 @@
++package model
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"slices"
++	"strings"
++	"time"
++
++	"github.com/QuantumNous/new-api/common"
++	"gorm.io/gorm/clause"
++)
++
++const astraIQSettingsKey = "AstraIQSettings"
++
++var astraIQTimezone = time.FixedZone("Asia/Shanghai", 8*60*60)
++
++type AstraIQSettings struct {
++	Enabled         bool   `json:"enabled"`
++	StartTime       string `json:"start_time"`
++	EndTime         string `json:"end_time"`
++	IntervalMinutes int    `json:"interval_minutes"`
++	StopOnFailure   bool   `json:"stop_on_failure"`
++	// Empty, including settings saved before this field existed, checks every
++	// Astra channel.
++	ChannelIDs []int `json:"channel_ids"`
++}
++
++func DefaultAstraIQSettings() AstraIQSettings {
++	return AstraIQSettings{Enabled: true, StartTime: "00:00", EndTime: "00:00", IntervalMinutes: 5, StopOnFailure: true, ChannelIDs: []int{}}
++}
++
++func (s AstraIQSettings) Validate() error {
++	for _, value := range []string{s.StartTime, s.EndTime} {
++		parsed, err := time.Parse("15:04", value)
++		if err != nil || parsed.Format("15:04") != value {
++			return errors.New("Use HH:mm for check times")
++		}
++	}
++	if s.IntervalMinutes < 1 || s.IntervalMinutes > 1440 {
++		return errors.New("Check interval must be an integer from 1 to 1440")
++	}
++	for _, id := range s.ChannelIDs {
++		if id <= 0 {
++			return errors.New(AstraIQChannelSelectionError)
++		}
++	}
++	return nil
++}
++
++const AstraIQChannelSelectionError = "Select only channels that support the selected model"
++
++// Unselected channels are neither checked nor gated by earlier results.
++func (s AstraIQSettings) Includes(channelID int) bool {
++	return len(s.ChannelIDs) == 0 || slices.Contains(s.ChannelIDs, channelID)
++}
++
++// All nodes use Beijing time. Equal endpoints mean all day; overnight windows
++// belong to the day on which they start. The end boundary is exclusive.
++func (s AstraIQSettings) window(now time.Time) (time.Time, bool) {
++	now = now.In(astraIQTimezone)
++	startClock, _ := time.Parse("15:04", s.StartTime)
++	endClock, _ := time.Parse("15:04", s.EndTime)
++	start := time.Date(now.Year(), now.Month(), now.Day(), startClock.Hour(), startClock.Minute(), 0, 0, astraIQTimezone)
++	end := time.Date(now.Year(), now.Month(), now.Day(), endClock.Hour(), endClock.Minute(), 0, 0, astraIQTimezone)
++	if !end.After(start) {
++		if now.Before(end) {
++			start = start.AddDate(0, 0, -1)
++		} else {
++			end = end.AddDate(0, 0, 1)
++		}
++	}
++	return start, !now.Before(start) && now.Before(end)
++}
++
++func (s AstraIQSettings) Active(now time.Time) bool {
++	_, active := s.window(now)
++	return s.Enabled && active
++}
++
++func (s AstraIQSettings) Due(now, lastRun int64) bool {
++	start, active := s.window(time.Unix(now, 0))
++	return s.Enabled && active && (lastRun == 0 || (s.StartTime != s.EndTime && lastRun < start.Unix()) || now-lastRun >= int64(s.IntervalMinutes)*60)
++}
++
++// Model schedules share one atomic option; older single-model JSON remains Astra.
++type AstraIQConfig struct {
++	Models map[string]AstraIQSettings `json:"model_settings"`
++}
++
++func (c AstraIQConfig) Validate() error {
++	if c.Models == nil {
++		return errors.New("Invalid check settings")
++	}
++	for name, settings := range c.Models {
++		if name == "" || name != strings.TrimSpace(name) || len(name) > 128 || strings.ContainsAny(name, "\r\n\t") {
++			return errors.New("Invalid check model")
++		}
++		if err := settings.Validate(); err != nil {
++			return fmt.Errorf("%s: %w", name, err)
++		}
++	}
++	return nil
++}
++
++func GetAstraIQConfig() (AstraIQConfig, error) {
++	config := AstraIQConfig{Models: map[string]AstraIQSettings{AstraIQModel: DefaultAstraIQSettings()}}
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	var option Option
++	result := DB.WithContext(ctx).Where(&Option{Key: astraIQSettingsKey}).Find(&option)
++	if result.Error != nil || result.RowsAffected == 0 {
++		return config, result.Error
++	}
++	var fields map[string]any
++	if err := common.UnmarshalJsonStr(option.Value, &fields); err != nil {
++		return config, err
++	}
++	if _, exists := fields["model_settings"]; exists {
++		config.Models = nil
++		if err := common.UnmarshalJsonStr(option.Value, &config); err != nil {
++			return config, err
++		}
++	} else {
++		legacy := DefaultAstraIQSettings()
++		if err := common.UnmarshalJsonStr(option.Value, &legacy); err != nil {
++			return config, err
++		}
++		config.Models[AstraIQModel] = legacy
++	}
++	return config, config.Validate()
++}
++
++// Omitted model names retain the existing Astra API contract.
++func AstraIQModelName(names ...string) string {
++	if len(names) > 0 && names[0] != "" {
++		return names[0]
++	}
++	return AstraIQModel
++}
++
++func GetAstraIQSettings(names ...string) (AstraIQSettings, error) {
++	config, err := GetAstraIQConfig()
++	settings, selected := config.Models[AstraIQModelName(names...)]
++	if !selected {
++		settings = DefaultAstraIQSettings()
++		settings.Enabled = false
++	}
++	return settings, err
++}
++
++func SaveAstraIQConfig(config AstraIQConfig) error {
++	if err := config.Validate(); err != nil {
++		return err
++	}
++	value, err := common.Marshal(config)
++	if err != nil {
++		return err
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	return DB.WithContext(ctx).Clauses(clause.OnConflict{
++		Columns: []clause.Column{{Name: "key"}}, DoUpdates: clause.AssignmentColumns([]string{"value"}),
++	}).Create(&Option{Key: astraIQSettingsKey, Value: string(value)}).Error
++}
++
++func SaveAstraIQSettings(settings AstraIQSettings, names ...string) error {
++	config, err := GetAstraIQConfig()
++	if err != nil {
++		return err
++	}
++	config.Models[AstraIQModelName(names...)] = settings
++	return SaveAstraIQConfig(config)
++}
+diff --git a/model/channel_cache.go b/model/channel_cache.go
+index 5bdf1404..f9be0c13 100644
+--- a/model/channel_cache.go
++++ b/model/channel_cache.go
+@@ -125,16 +125,20 @@ func GetRandomSatisfiedChannel(
+ 		return GetChannel(group, model, retry, filters)
+ 	}
+ 
++	iq, err := loadAstraIQRouting(model)
++	if err != nil {
++		return nil, fmt.Errorf("Astra IQ routing unavailable: %w", err)
++	}
+ 	channelSyncLock.RLock()
+ 	defer channelSyncLock.RUnlock()
+ 
+ 	// First, try to find channels with the exact model name.
+-	channels, _ := filterCandidateIDs(group2model2channels[group][model], model, filters)
++	channels, _ := filterCandidateIDs(iq.filterIDs(group2model2channels[group][model]), model, filters)
+ 
+ 	// If no channels found, try to find channels with the normalized model name.
+ 	if len(channels) == 0 {
+ 		normalizedModel := ratio_setting.RoutingMatchModelName(model)
+-		channels, _ = filterCandidateIDs(group2model2channels[group][normalizedModel], model, filters)
++		channels, _ = filterCandidateIDs(iq.filterIDs(group2model2channels[group][normalizedModel]), model, filters)
+ 	}
+ 
+ 	if len(channels) == 0 {
+diff --git a/model/channel_constraint.go b/model/channel_constraint.go
+index 34121a7b..06073fea 100644
+--- a/model/channel_constraint.go
++++ b/model/channel_constraint.go
+@@ -22,6 +22,9 @@ func ChannelSatisfiesFilters(ch *Channel, modelName string, filters []dto.Channe
+ 	if ch == nil {
+ 		return false, ""
+ 	}
++	if !AstraIQAllowsChannel(ch, modelName) {
++		return false, "astra_iq"
++	}
+ 	for _, kind := range filterEvalOrder {
+ 		for _, filter := range filters {
+ 			if filter.Kind != kind {
+diff --git a/model/main.go b/model/main.go
+index 3f99cd78..c35b43b0 100644
+--- a/model/main.go
++++ b/model/main.go
+@@ -341,6 +341,8 @@ func migrateDB() error {
+ 
+ 	err := DB.AutoMigrate(
+ 		&Channel{},
++		&AstraIQResult{},
++		&AstraIQModelRun{},
+ 		&Token{},
+ 		&User{},
+ 		&UserSession{},
+@@ -380,6 +382,9 @@ func migrateDB() error {
+ 	if err != nil {
+ 		return err
+ 	}
++	if err := MigrateAstraIQResults(DB); err != nil {
++		return err
++	}
+ 	if err := InitializeUserAuthVersions(); err != nil {
+ 		return err
+ 	}
+diff --git a/router/channel-router.go b/router/channel-router.go
+index 560f5274..3f24779c 100644
+--- a/router/channel-router.go
++++ b/router/channel-router.go
+@@ -57,6 +57,12 @@ func registerChannelRoutes(apiRouter *gin.RouterGroup) {
+ var channelPermissionRoutes = []permissionRoute{
+ 	{method: http.MethodGet, path: "/priority/order", permission: authz.ChannelRead, handler: controller.GetChannelPriorityOrder},
+ 	{method: http.MethodPost, path: "/priority/reorder", permission: authz.ChannelWrite, handler: controller.ReorderChannelPriority},
++	{method: http.MethodGet, path: "/astra_iq", permission: authz.ChannelRead, handler: controller.GetAstraIQStatus},
++	{method: http.MethodGet, path: "/astra_iq/settings", permission: authz.ChannelRead, handler: controller.GetAstraIQSettings},
++	{method: http.MethodPut, path: "/astra_iq/settings", permission: authz.ChannelWrite, handler: controller.UpdateAstraIQSettings},
++	{method: http.MethodGet, path: "/astra_iq/:id/:checked_at", permission: authz.ChannelRead, handler: controller.GetAstraIQSample},
++	{method: http.MethodDelete, path: "/astra_iq/:id", permission: authz.ChannelWrite, handler: controller.DeleteAstraIQResults},
++	{method: http.MethodDelete, path: "/astra_iq/:id/:checked_at", permission: authz.ChannelWrite, handler: controller.DeleteAstraIQResults},
+ 	{method: http.MethodGet, path: "/", permission: authz.ChannelRead, handler: controller.GetAllChannels},
+ 	{method: http.MethodGet, path: "/search", permission: authz.ChannelRead, handler: controller.SearchChannels},
+ 	{method: http.MethodGet, path: "/models", permission: authz.ChannelRead, handler: controller.ChannelListModels},
+diff --git a/scripts/install-astra-iq-codex.sh b/scripts/install-astra-iq-codex.sh
+new file mode 100644
+index 00000000..2d9f6054
+--- /dev/null
++++ b/scripts/install-astra-iq-codex.sh
+@@ -0,0 +1,22 @@
++#!/usr/bin/env bash
++set -Eeuo pipefail
++destination="${1:?destination directory required}"
++architecture="${2:-$(uname -m)}"
++case "$architecture" in
++  amd64|x86_64)
++    target=x86_64-unknown-linux-musl
++    digest=e98c1e8e028e8137fa2d2415c82ec58e7b3701a627e3554aace5b3ca31454af2
++    ;;
++  arm64|aarch64)
++    target=aarch64-unknown-linux-musl
++    digest=4c6b1c17c1c5fd0d4fb2951b7481867b95ea732b1feab269c98588b15db16253
++    ;;
++  *) echo "unsupported Codex CLI architecture: $architecture" >&2; exit 1 ;;
++esac
++scratch="$(mktemp -d)"
++trap 'rm -rf "$scratch"' EXIT
++wget -q -T 60 "https://github.com/openai/codex/releases/download/rust-v0.157.1/codex-${target}.tar.gz" -O "$scratch/codex.tar.gz"
++echo "$digest  $scratch/codex.tar.gz" | sha256sum -c -
++tar -xzf "$scratch/codex.tar.gz" -C "$scratch"
++mkdir -p "$destination"
++install -m 755 "$scratch/codex-$target" "$destination/codex"
+diff --git a/service/system_task.go b/service/system_task.go
+index b55eb84b..c846ad42 100644
+--- a/service/system_task.go
++++ b/service/system_task.go
+@@ -46,6 +46,17 @@ type ScheduledSystemTaskHandler interface {
+ 	NewPayload() any
+ }
+ 
++// Optional for probes whose cadence must include execution time. Existing
++// scheduled handlers continue waiting their interval after completion.
++type startIntervalSystemTaskHandler interface {
++	ScheduleFromStart() bool
++}
++
++// Optional for schedules with daily windows or a configurable cadence.
++type dueSystemTaskHandler interface {
++	ScheduleDue(now, lastRun int64) (bool, error)
++}
++
+ var (
+ 	systemTaskHandlersMu sync.RWMutex
+ 	systemTaskHandlers   = map[string]SystemTaskHandler{}
+@@ -280,13 +291,26 @@ func runSystemTaskScheduler() {
+ 	}
+ 	for _, scheduled := range scheduledHandlers {
+ 		latest := latestTasks[scheduled.Type()]
++		var lastRun int64
+ 		if latest != nil {
+ 			if latest.Status == model.SystemTaskStatusPending || latest.Status == model.SystemTaskStatusRunning {
+ 				continue // an active row already exists
+ 			}
+-			if now-latest.UpdatedAt < int64(scheduled.Interval().Seconds()) {
+-				continue // not due yet
++			lastRun = latest.UpdatedAt
++			if anchored, ok := scheduled.(startIntervalSystemTaskHandler); ok && anchored.ScheduleFromStart() {
++				lastRun = latest.CreatedAt
++			}
++		}
++		if custom, ok := scheduled.(dueSystemTaskHandler); ok {
++			due, err := custom.ScheduleDue(now, lastRun)
++			if err != nil {
++				logger.LogWarn(context.Background(), fmt.Sprintf("system task schedule failed: type=%s err=%v", scheduled.Type(), err))
++			}
++			if err != nil || !due {
++				continue
+ 			}
++		} else if latest != nil && now-lastRun < int64(scheduled.Interval().Seconds()) {
++			continue // not due yet
+ 		}
+ 		if _, err := model.CreateSystemTask(scheduled.Type(), scheduled.NewPayload(), nil); err != nil {
+ 			activeTask, activeErr := model.GetActiveSystemTask(scheduled.Type())
+diff --git a/web/src/components/multi-select.tsx b/web/src/components/multi-select.tsx
+index 89e2cc22..5b9d82b3 100644
+--- a/web/src/components/multi-select.tsx
++++ b/web/src/components/multi-select.tsx
+@@ -23,6 +23,7 @@ import * as React from 'react'
+ import { useTranslation } from 'react-i18next'
+ import { toast } from 'sonner'
+ 
++import { Button } from '@/components/ui/button'
+ import {
+   Combobox,
+   ComboboxChip,
+@@ -88,6 +89,13 @@ interface MultiSelectProps {
+    * instead of being inert. The remove (×) button keeps its own behaviour.
+    */
+   copyChipOnClick?: boolean
++  /**
++   * Activate a selected value without changing the selection, including for
++   * read-only inspection when disabled. Takes priority over copying.
++   */
++  onChipClick?: (value: string) => void
++  /** Highlight the selected value currently being inspected or configured. */
++  activeValue?: string
+ }
+ 
+ const COMMA_REGEX = /[,，\n]/
+@@ -331,7 +339,16 @@ export function MultiSelect(props: MultiSelectProps) {
+                   const hint = hintMap.get(value)
+                   const icon = iconMap.get(value)
+                   return (
+-                    <ComboboxChip key={value}>
++                    <ComboboxChip
++                      key={value}
++                      showRemove={!(props.disabled && props.onChipClick)}
++                      className={cn(
++                        props.onChipClick && 'min-w-0 max-w-full',
++                        props.onChipClick &&
++                          props.activeValue === value &&
++                          'bg-primary/10 text-primary ring-primary/30 ring-1'
++                      )}
++                    >
+                       {icon && (
+                         <span
+                           aria-hidden='true'
+@@ -340,18 +357,39 @@ export function MultiSelect(props: MultiSelectProps) {
+                           {icon}
+                         </span>
+                       )}
+-                      {props.copyChipOnClick ? (
+-                        <button
++                      {props.onChipClick || props.copyChipOnClick ? (
++                        <Button
+                           type='button'
+-                          onClick={(event) =>
+-                            handleCopyChip(event, value, label)
+-                          }
++                          variant='ghost'
++                          size='xs'
++                          onClick={(event) => {
++                            if (props.onChipClick) {
++                              event.preventDefault()
++                              event.stopPropagation()
++                              props.onChipClick(value)
++                              return
++                            }
++                            void handleCopyChip(event, value, label)
++                          }}
+                           onPointerDown={(event) => event.stopPropagation()}
+-                          title={t('Click to copy')}
+-                          className='max-w-[16rem] cursor-pointer truncate rounded-sm hover:underline'
++                          onKeyDown={(event) => {
++                            if (
++                              props.onChipClick &&
++                              (event.key === 'Enter' || event.key === ' ')
++                            ) {
++                              event.stopPropagation()
++                            }
++                          }}
++                          aria-pressed={
++                            props.onChipClick
++                              ? props.activeValue === value
++                              : undefined
++                          }
++                          title={props.onChipClick ? label : t('Click to copy')}
++                          className='h-auto max-w-[16rem] min-w-0 shrink cursor-pointer rounded-sm border-0 px-0 py-0 font-medium hover:underline'
+                         >
+-                          {label}
+-                        </button>
++                          <span className='truncate'>{label}</span>
++                        </Button>
+                       ) : (
+                         <span className='max-w-[16rem] truncate'>{label}</span>
+                       )}
+diff --git a/web/src/features/channels/components/astra-iq-settings.tsx b/web/src/features/channels/components/astra-iq-settings.tsx
+new file mode 100644
+index 00000000..eac64430
+--- /dev/null
++++ b/web/src/features/channels/components/astra-iq-settings.tsx
+@@ -0,0 +1,505 @@
++/*
++Copyright (C) 2023-2026 QuantumNous
++
++This program is free software: you can redistribute it and/or modify
++it under the terms of the GNU Affero General Public License as
++published by the Free Software Foundation, either version 3 of the
++License, or (at your option) any later version.
++
++This program is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++GNU Affero General Public License for more details.
++
++You should have received a copy of the GNU Affero General Public License
++along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++For commercial licensing, please contact support@quantumnous.com
++*/
++import { zodResolver } from '@hookform/resolvers/zod'
++import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
++import { Settings2 } from 'lucide-react'
++import { useRef, useState } from 'react'
++import { useForm } from 'react-hook-form'
++import { useTranslation } from 'react-i18next'
++import { z } from 'zod'
++
++import { Dialog } from '@/components/dialog'
++import { ErrorState } from '@/components/error-state'
++import { LoadingState } from '@/components/loading-state'
++import { MultiSelect } from '@/components/multi-select'
++import { Button } from '@/components/ui/button'
++import {
++  Form,
++  FormControl,
++  FormDescription,
++  FormField,
++  FormItem,
++  FormLabel,
++  FormMessage,
++} from '@/components/ui/form'
++import { Input } from '@/components/ui/input'
++import { Switch } from '@/components/ui/switch'
++import { safeNumberFieldProps } from '@/features/system-settings/utils/numeric-field'
++import {
++  ADMIN_PERMISSION_ACTIONS,
++  ADMIN_PERMISSION_RESOURCES,
++  hasPermission,
++} from '@/lib/admin-permissions'
++import { api } from '@/lib/api'
++import { markServerErrorHandled } from '@/lib/handle-server-error'
++import {
++  getServerErrorMessage,
++  requireServerSuccess,
++} from '@/lib/server-error-message'
++import { useAuthStore } from '@/stores/auth-store'
++
++import { CHANNEL_STATUS, CHANNEL_STATUS_LABELS } from '../constants'
++
++const timeSchema = z
++  .string()
++  .regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Use HH:mm for check times')
++const settingsSchema = z.object({
++  enabled: z.boolean(),
++  start_time: timeSchema,
++  end_time: timeSchema,
++  interval_minutes: z
++    .number()
++    .int('Check interval must be an integer from 1 to 1440')
++    .min(1, 'Check interval must be an integer from 1 to 1440')
++    .max(1440, 'Check interval must be an integer from 1 to 1440'),
++  stop_on_failure: z.boolean(),
++  channel_ids: z.array(z.number().int().positive()),
++})
++// Only channel metadata is returned; upstream credentials never reach the form.
++const channelsSchema = z.array(
++  z.object({
++    id: z.number(),
++    name: z.string(),
++    status: z.number(),
++    models: z.array(z.string()).default(['gpt-6-astra']),
++  })
++)
++const configSchema = z.object({
++  models: z.array(settingsSchema.extend({ model: z.string().min(1) })),
++})
++const resolveSettings = zodResolver(configSchema)
++type CheckSettings = z.infer<typeof settingsSchema>
++type CheckConfig = { model_settings: Record<string, CheckSettings> }
++type FormValues = z.infer<typeof configSchema>
++type CheckChannel = z.infer<typeof channelsSchema>[number]
++type SettingsResponse = {
++  success: boolean
++  message?: string
++  data: CheckSettings & Partial<CheckConfig> & { channels: CheckChannel[] }
++}
++const endpoint = '/api/channel/astra_iq/settings'
++const queryKey = ['channels', 'astra-iq-settings']
++const defaultModelSettings: CheckSettings = {
++  enabled: true,
++  start_time: '00:00',
++  end_time: '00:00',
++  interval_minutes: 5,
++  stop_on_failure: true,
++  channel_ids: [],
++}
++const formId = 'astra-iq-settings-form'
++
++export function AstraIQSettings() {
++  const { t } = useTranslation()
++  const [open, setOpen] = useState(false)
++  return (
++    <>
++      <Button
++        variant='outline'
++        size='sm'
++        className='h-6 shrink-0 gap-1 rounded-full px-2 text-xs font-normal'
++        onClick={() => setOpen(true)}
++      >
++        {t('Check settings')}
++        <Settings2 data-icon='inline-end' />
++      </Button>
++      {open && <SettingsDialog onClose={() => setOpen(false)} />}
++    </>
++  )
++}
++
++function SettingsDialog(props: { onClose: () => void }) {
++  const { t } = useTranslation()
++  const user = useAuthStore((state) => state.auth.user)
++  const canWrite = hasPermission(
++    user,
++    ADMIN_PERMISSION_RESOURCES.CHANNEL,
++    ADMIN_PERMISSION_ACTIONS.WRITE
++  )
++  const client = useQueryClient()
++  const query = useQuery({
++    queryKey,
++    queryFn: async ({ signal }) => {
++      const response = await api.get<SettingsResponse>(endpoint, { signal })
++      const { channels, model_settings, ...settings } = requireServerSuccess(
++        response.data
++      ).data
++      return {
++        settings: model_settings
++          ? z.record(z.string(), settingsSchema).parse(model_settings)
++          : { 'gpt-6-astra': settingsSchema.parse(settings) },
++        channels: channelsSchema.parse(channels),
++      }
++    },
++    gcTime: 0,
++    refetchOnWindowFocus: false,
++    retry: false,
++    meta: { errorToast: false },
++  })
++  const mutation = useMutation({
++    mutationFn: async (settings: CheckConfig) => {
++      const response = await api.put<SettingsResponse>(endpoint, settings)
++      return requireServerSuccess(response.data).data
++    },
++    onSuccess: () => {
++      void client.invalidateQueries({ queryKey: ['channels', 'astra-iq'] })
++      props.onClose()
++    },
++    onError: markServerErrorHandled,
++    meta: { errorToast: false },
++  })
++  return (
++    <Dialog
++      open
++      onOpenChange={(open) => {
++        if (!open && !mutation.isPending) props.onClose()
++      }}
++      title={t('Check settings')}
++      description={t(
++        'Each model has its own channels and schedule in Beijing time (UTC+8).'
++      )}
++      contentClassName='sm:max-w-lg'
++      contentHeight='auto'
++      bodyClassName='space-y-4'
++      footer={
++        <>
++          <Button
++            variant='outline'
++            disabled={mutation.isPending}
++            onClick={props.onClose}
++          >
++            {t('Cancel')}
++          </Button>
++          {canWrite && (
++            <Button
++              type='submit'
++              form={formId}
++              disabled={
++                !query.isSuccess || query.isFetching || mutation.isPending
++              }
++            >
++              {t('Save')}
++            </Button>
++          )}
++        </>
++      }
++    >
++      {query.isPending && <LoadingState />}
++      {query.isError && (
++        <ErrorState
++          className='min-h-40'
++          title={t('Check settings unavailable')}
++          onRetry={() => void query.refetch()}
++        />
++      )}
++      {query.isSuccess && (
++        <SettingsForm
++          key={query.dataUpdatedAt}
++          settings={query.data.settings}
++          channels={query.data.channels}
++          disabled={!canWrite || query.isFetching || mutation.isPending}
++          onSave={(values) => mutation.mutate(values)}
++        />
++      )}
++      {mutation.isError && (
++        <p role='alert' className='text-destructive text-sm'>
++          {t(getServerErrorMessage(mutation.error))}
++        </p>
++      )}
++    </Dialog>
++  )
++}
++
++function SettingsForm(props: {
++  settings: Record<string, CheckSettings>
++  channels: CheckChannel[]
++  disabled: boolean
++  onSave: (settings: CheckConfig) => void
++}) {
++  const { t } = useTranslation()
++  const [activeModel, setActiveModel] = useState(
++    Object.keys(props.settings)[0] ?? ''
++  )
++  const drafts = useRef<Record<string, CheckSettings>>({ ...props.settings })
++  const form = useForm<FormValues>({
++    resolver: (values, context, options) =>
++      resolveSettings(
++        {
++          models: values.models.map((entry) =>
++            entry.enabled
++              ? entry
++              : {
++                  ...(props.settings[entry.model] ?? defaultModelSettings),
++                  model: entry.model,
++                  enabled: false,
++                }
++          ),
++        },
++        context,
++        options
++      ),
++    defaultValues: {
++      models: Object.entries(props.settings).map(([model, settings]) => ({
++        model,
++        ...settings,
++      })),
++    },
++  })
++  const models = form.watch('models')
++  const index = models.findIndex((entry) => entry.model === activeModel)
++  const enabled = index >= 0 && models[index].enabled
++  const name = <K extends keyof CheckSettings>(key: K) =>
++    `models.${index}.${key}` as const
++  const selectedModels = models.map((entry) => entry.model)
++  const availableModels = new Set(
++    props.channels.flatMap((channel) => channel.models)
++  )
++  for (const model of selectedModels) availableModels.add(model)
++  const channelOptions = props.channels.filter((channel) =>
++    channel.models.includes(activeModel)
++  )
++  const options = channelOptions.map((channel) => {
++    let label = `#${channel.id} ${channel.name}`
++    if (channel.status !== CHANNEL_STATUS.ENABLED) {
++      const status =
++        CHANNEL_STATUS_LABELS[
++          channel.status as keyof typeof CHANNEL_STATUS_LABELS
++        ] ?? 'Unknown'
++      label += ` · ${t(status)}`
++    }
++    return { value: String(channel.id), label }
++  })
++  for (const id of models[index]?.channel_ids ?? []) {
++    if (!channelOptions.some((channel) => channel.id === id)) {
++      options.push({ value: String(id), label: `#${id}` })
++    }
++  }
++  return (
++    <Form {...form}>
++      <form
++        id={formId}
++        noValidate
++        className='space-y-5'
++        onSubmit={form.handleSubmit(
++          (values) =>
++            props.onSave({
++              model_settings: Object.fromEntries(
++                values.models.map(({ model, ...settings }) => [model, settings])
++              ),
++            }),
++          (errors) => {
++            const invalidIndex = errors.models?.findIndex?.((error) =>
++              Boolean(error)
++            )
++            if (invalidIndex !== undefined && invalidIndex >= 0) {
++              setActiveModel(models[invalidIndex].model)
++            }
++          }
++        )}
++      >
++        <div className='space-y-2'>
++          <label className='text-sm font-medium' htmlFor='iq-check-models'>
++            {t('Check models')}
++          </label>
++          <MultiSelect
++            id='iq-check-models'
++            options={[...availableModels]
++              .sort()
++              .map((model) => ({ value: model, label: model }))}
++            selected={selectedModels}
++            activeValue={activeModel}
++            onChipClick={setActiveModel}
++            onChange={(names) => {
++              for (const { model, ...settings } of form.getValues('models')) {
++                drafts.current[model] = settings
++              }
++              form.setValue(
++                'models',
++                names.map((model) => ({
++                  model,
++                  ...(drafts.current[model] ?? {
++                    ...defaultModelSettings,
++                    channel_ids: [],
++                  }),
++                }))
++              )
++              form.clearErrors()
++              const addedModel = names.find(
++                (model) => !selectedModels.includes(model)
++              )
++              if (addedModel) {
++                setActiveModel(addedModel)
++              } else if (!names.includes(activeModel)) {
++                setActiveModel(names[0] ?? '')
++              }
++            }}
++            placeholder={t('Select check models')}
++            disabled={props.disabled}
++          />
++          <p className='text-muted-foreground text-xs'>
++            {t(
++              'Select models to check, then click a selected model to configure it. Removing a model keeps its history and stops gating its calls.'
++            )}
++          </p>
++        </div>
++        {models.length > 0 && (
++          <>
++            <FormField
++              control={form.control}
++              name={name('enabled')}
++              render={({ field }) => (
++                <FormItem className='flex items-center justify-between gap-4 rounded-lg border p-3'>
++                  <div className='space-y-1'>
++                    <FormLabel>{t('Enable checks')}</FormLabel>
++                    <FormDescription>
++                      {t(
++                        'When off, checks stop and results do not block calls. History is kept.'
++                      )}
++                    </FormDescription>
++                  </div>
++                  <FormControl>
++                    <Switch
++                      name={field.name}
++                      checked={field.value}
++                      onCheckedChange={field.onChange}
++                      onBlur={field.onBlur}
++                      ref={field.ref}
++                      disabled={props.disabled}
++                    />
++                  </FormControl>
++                </FormItem>
++              )}
++            />
++            {enabled && (
++              <>
++                <FormField
++                  control={form.control}
++                  name={name('channel_ids')}
++                  render={({ field }) => (
++                    <FormItem>
++                      <FormLabel>{t('Check channels')}</FormLabel>
++                      <FormControl>
++                        <MultiSelect
++                          options={options}
++                          selected={field.value.map(String)}
++                          onChange={(values) =>
++                            field.onChange(values.map(Number))
++                          }
++                          placeholder={t('All channels for this model')}
++                          disabled={props.disabled}
++                        />
++                      </FormControl>
++                      <FormDescription>
++                        {t(
++                          'Leave empty to check all channels for this model. Unselected channels are not checked and their results do not block calls.'
++                        )}
++                      </FormDescription>
++                      <FormMessage />
++                    </FormItem>
++                  )}
++                />
++                {/* iOS time controls can overrun width: 100% when padded. */}
++                <div className='grid min-w-0 grid-cols-1 gap-4 sm:grid-cols-2'>
++                  {(['start_time', 'end_time'] as const).map((timeField) => (
++                    <FormField
++                      key={timeField}
++                      control={form.control}
++                      name={name(timeField)}
++                      render={({ field }) => (
++                        <FormItem className='min-w-0 grid-cols-1'>
++                          <FormLabel>
++                            {timeField === 'start_time'
++                              ? t('Check start time')
++                              : t('End Time')}
++                          </FormLabel>
++                          <FormControl>
++                            <Input
++                              {...field}
++                              type='time'
++                              className='w-auto max-w-full appearance-none justify-self-stretch'
++                              step={60}
++                              disabled={props.disabled}
++                            />
++                          </FormControl>
++                          <FormMessage />
++                        </FormItem>
++                      )}
++                    />
++                  ))}
++                </div>
++                <p className='text-muted-foreground text-xs'>
++                  {t(
++                    'Equal times mean all day. Overnight schedules are supported.'
++                  )}
++                </p>
++                <FormField
++                  control={form.control}
++                  name={name('interval_minutes')}
++                  render={({ field }) => (
++                    <FormItem>
++                      <FormLabel>{t('Interval (minutes)')}</FormLabel>
++                      <FormControl>
++                        <Input
++                          {...safeNumberFieldProps(field)}
++                          type='number'
++                          min={1}
++                          max={1440}
++                          step={1}
++                          disabled={props.disabled}
++                        />
++                      </FormControl>
++                      <FormMessage />
++                    </FormItem>
++                  )}
++                />
++                <FormField
++                  control={form.control}
++                  name={name('stop_on_failure')}
++                  render={({ field }) => (
++                    <FormItem className='flex items-center justify-between gap-4 rounded-lg border p-3'>
++                      <div className='space-y-1'>
++                        <FormLabel>{t('Stop on failure')}</FormLabel>
++                        <FormDescription>
++                          {t(
++                            'Pause only this model on a failed channel. Calls without a result are allowed.'
++                          )}
++                        </FormDescription>
++                      </div>
++                      <FormControl>
++                        <Switch
++                          name={field.name}
++                          checked={field.value}
++                          onCheckedChange={field.onChange}
++                          onBlur={field.onBlur}
++                          ref={field.ref}
++                          disabled={props.disabled}
++                        />
++                      </FormControl>
++                      <FormMessage />
++                    </FormItem>
++                  )}
++                />
++              </>
++            )}
++          </>
++        )}
++      </form>
++    </Form>
++  )
++}
+diff --git a/web/src/features/channels/components/astra-iq-status.tsx b/web/src/features/channels/components/astra-iq-status.tsx
+new file mode 100644
+index 00000000..5f5e1ee9
+--- /dev/null
++++ b/web/src/features/channels/components/astra-iq-status.tsx
+@@ -0,0 +1,188 @@
++/*
++Copyright (C) 2023-2026 QuantumNous
++
++This program is free software: you can redistribute it and/or modify
++it under the terms of the GNU Affero General Public License as
++published by the Free Software Foundation, either version 3 of the
++License, or (at your option) any later version.
++
++This program is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++GNU Affero General Public License for more details.
++
++You should have received a copy of the GNU Affero General Public License
++along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++For commercial licensing, please contact support@quantumnous.com
++*/
++import { useQuery } from '@tanstack/react-query'
++import { useState } from 'react'
++import { useTranslation } from 'react-i18next'
++
++import { Button } from '@/components/ui/button'
++import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
++import {
++  Tooltip,
++  TooltipContent,
++  TooltipTrigger,
++} from '@/components/ui/tooltip'
++import { toIntlLocale } from '@/i18n/languages'
++import { api } from '@/lib/api'
++import { requireServerSuccess } from '@/lib/server-error-message'
++import { cn } from '@/lib/utils'
++
++import {
++  astraIQStatusLabel,
++  astraIQTimeline,
++  type AstraIQStatusData,
++  type IQSample,
++} from '../lib/astra-iq'
++import { AstraIQDetailDialog } from './dialogs/astra-iq-detail-dialog'
++
++export type { AstraIQStatusData } from '../lib/astra-iq'
++
++async function getAstraIQStatus(
++  signal: AbortSignal
++): Promise<AstraIQStatusData> {
++  const response = await api.get<{ success: boolean; data: AstraIQStatusData }>(
++    '/api/channel/astra_iq',
++    { signal }
++  )
++  return requireServerSuccess(response.data).data
++}
++
++// Individual checks form a discrete timeline; Progress cannot represent or
++// activate separate historical outcomes. Buttons and tooltips use shared UI.
++export function AstraIQStatus(props: {
++  channelId: number
++  channelEnabled?: boolean
++  models?: string[]
++}) {
++  const { t, i18n } = useTranslation()
++  const [selected, setSelected] = useState<{
++    sample: IQSample
++    model: string
++  } | null>(null)
++  const [chosenModel, setChosenModel] = useState('')
++  const query = useQuery({
++    queryKey: ['channels', 'astra-iq'],
++    queryFn: ({ signal }) => getAstraIQStatus(signal),
++    staleTime: 15_000,
++    refetchInterval: 30_000,
++    refetchIntervalInBackground: false,
++    meta: { errorToast: false },
++  })
++  if (query.data?.enabled === false) return null
++  const modelData = query.data?.models ?? {
++    'gpt-6-astra': {
++      results: query.data?.results ?? {},
++      interval_minutes: query.data?.interval_minutes ?? 5,
++      runs: query.data?.runs ?? [],
++    },
++  }
++  const names = Object.keys(modelData)
++    .filter(
++      (name) =>
++        modelData[name].results[String(props.channelId)] &&
++        (!props.models || props.models.includes(name))
++    )
++    .sort()
++  const activeModel = names.includes(chosenModel)
++    ? chosenModel
++    : (names[0] ?? '')
++  const active = modelData[activeModel]
++  const result = active?.results[String(props.channelId)]
++  // Channels outside the selected check scope have no result entry. An open
++  // detail dialog stays until it is closed.
++  if (query.isSuccess && !result && !selected) return null
++  const history = query.isError ? [] : (result?.history?.slice(-24) ?? [])
++  const samples = astraIQTimeline(
++    history,
++    active?.interval_minutes ?? 5,
++    query.data?.server_time ?? Date.now() / 1000,
++    active?.runs
++  )
++  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
++  let state = t(astraIQStatusLabel(result?.status ?? 'pending'))
++  if (props.channelEnabled === false) state = t('Astra IQ disabled channel')
++  if (query.isError) state = t('Astra IQ status unavailable')
++
++  return (
++    <>
++      <div
++        className='flex h-5 min-w-0 flex-1 items-center gap-0.5'
++        role='group'
++        data-slot='astra-iq-timeline'
++        aria-label={`${t('Astra IQ')} ${activeModel}: ${state}`}
++      >
++        {names.length > 1 && (
++          <NativeSelect
++            size='sm'
++            className='max-w-24 min-w-0 shrink-0 [&_select]:h-5 [&_select]:text-[10px]'
++            aria-label={t('Check model')}
++            title={activeModel}
++            value={activeModel}
++            onChange={(event) => setChosenModel(event.target.value)}
++          >
++            {names.map((name) => (
++              <NativeSelectOption value={name} key={name}>
++                {name}
++              </NativeSelectOption>
++            ))}
++          </NativeSelect>
++        )}
++        {samples.map((sample, index) => {
++          if (!sample) {
++            return (
++              <span
++                key={`empty-${24 - index}`}
++                aria-hidden='true'
++                className='h-3.5 min-w-0 flex-1'
++              />
++            )
++          }
++          const label = `${t(astraIQStatusLabel(sample.status))} · ${new Date(sample.checked_at * 1000).toLocaleString(locale)}`
++          return (
++            <Tooltip key={sample.checked_at}>
++              <TooltipTrigger
++                render={
++                  <Button
++                    variant='ghost'
++                    aria-label={label}
++                    onClick={() => setSelected({ sample, model: activeModel })}
++                    className='group h-5 min-w-0 flex-1 rounded-md border-0 p-0 hover:bg-transparent focus-visible:ring-2'
++                  />
++                }
++              >
++                <span
++                  className={cn(
++                    'h-3.5 w-full rounded-[3px] ring-1 ring-inset ring-black/5 transition-[height,filter,box-shadow] duration-150 group-hover:h-5 group-hover:brightness-110 group-focus-visible:h-5',
++                    sample.status === 'pass' &&
++                      'bg-emerald-500 shadow-[inset_0_1px_0_#ffffff40,0_1px_2px_#10b98125]',
++                    sample.status === 'fail' &&
++                      'bg-rose-500 shadow-[inset_0_1px_0_#ffffff40,0_1px_2px_#f43f5e25]',
++                    sample.status === 'error' &&
++                      'bg-amber-400 shadow-[inset_0_1px_0_#ffffff50,0_1px_2px_#fbbf2425]'
++                  )}
++                />
++              </TooltipTrigger>
++              <TooltipContent className='space-y-1 text-center'>
++                <p>{label}</p>
++                <p className='opacity-70'>{t('View check details')}</p>
++              </TooltipContent>
++            </Tooltip>
++          )
++        })}
++      </div>
++      {selected && (
++        <AstraIQDetailDialog
++          channelId={props.channelId}
++          sample={selected.sample}
++          model={query.data?.models ? selected.model : undefined}
++          onClose={() => setSelected(null)}
++        />
++      )}
++    </>
++  )
++}
+diff --git a/web/src/features/channels/components/channel-card.tsx b/web/src/features/channels/components/channel-card.tsx
+index 3f0b3d4c..d5988491 100644
+--- a/web/src/features/channels/components/channel-card.tsx
++++ b/web/src/features/channels/components/channel-card.tsx
+@@ -22,10 +22,12 @@ import { useTranslation } from 'react-i18next'
+ 
+ import { GroupBadge } from '@/components/group-badge'
+ import { StatusBadgeTypeContext } from '@/components/status-badge'
++import { cn } from '@/lib/utils'
+ 
+ import { CHANNEL_STATUS } from '../constants'
+ import { isTagAggregateRow, parseGroupsList } from '../lib'
+ import type { Channel } from '../types'
++import { AstraIQStatus } from './astra-iq-status'
+ import { ChannelRowActionsLayoutContext } from './channel-row-actions-context'
+ import { useChannels } from './channels-provider'
+ 
+@@ -62,6 +64,7 @@ function ChannelCardComponent({
+   }
+ 
+   const groups = parseGroupsList(row.original.group ?? '')
++  const showAstraIQ = !isTagRow
+ 
+   const reorderCell = reorderEnabled ? renderCell('reorder') : null
+   const selectCell = renderCell('select')
+@@ -72,7 +75,8 @@ function ChannelCardComponent({
+   const responseCell = renderCell('response_time')
+   const testCell = renderCell('test_time')
+ 
+-  const labelClass = 'text-muted-foreground text-[11px] font-medium select-none'
++  const labelClass =
++    'text-muted-foreground/80 text-[10px] font-medium tracking-wide select-none'
+ 
+   // In card view the enable/disable state is already conveyed by the inline
+   // power toggle, so the plain "Enabled"/"Disabled" badge is redundant. Keep
+@@ -86,7 +90,7 @@ function ChannelCardComponent({
+     <ChannelRowActionsLayoutContext.Provider value='card'>
+       <div
+         data-state={isSelected ? 'selected' : undefined}
+-        className='flex min-w-0 flex-col gap-3'
++        className='flex h-full min-w-0 flex-col gap-4'
+       >
+         {/* Row 1: selection + type, with status badge + actions menu */}
+         <div className='flex items-center justify-between gap-2'>
+@@ -105,7 +109,7 @@ function ChannelCardComponent({
+         {/* Both rows share their columns: identity/balance on the left,
+           priority/response and weight/last tested on the right. */}
+         <StatusBadgeTypeContext.Provider value='text'>
+-          <div className='grid grid-cols-[minmax(0,1fr)_auto_auto] items-start gap-3'>
++          <div className='grid grid-cols-[minmax(0,1fr)_auto_auto] items-start gap-x-4 gap-y-4'>
+             <div className='min-w-0 overflow-hidden text-sm'>
+               {!isTagRow && (
+                 <div className={labelClass}>
+@@ -122,7 +126,7 @@ function ChannelCardComponent({
+               <span className={labelClass}>{t('Weight')}</span>
+               {weightCell}
+             </div>
+-            <dl className='col-span-3 grid grid-cols-subgrid gap-y-1'>
++            <dl className='bg-muted/35 col-span-3 grid grid-cols-subgrid gap-y-1.5 rounded-xl px-3 py-2.5'>
+               <div className='row-span-2 grid min-w-0 grid-rows-subgrid'>
+                 <dt className={labelClass}>{t('Used / Remaining')}</dt>
+                 <dd className='min-w-0 text-sm tabular-nums [&_[data-slot=status-badge]]:!ml-0 [&>div]:ml-0 [&>div]:flex-wrap [&>div]:gap-x-3'>
+@@ -149,10 +153,15 @@ function ChannelCardComponent({
+           </div>
+         </StatusBadgeTypeContext.Provider>
+ 
+-        {/* Groups retain their compact, full-width footer. */}
+-        <div className='min-w-0'>
++        {/* Checks share the group row without adding to the card height. */}
++        <div className='group/channel-footer mt-auto flex min-w-0 items-center gap-3'>
+           {groups.length > 0 ? (
+-            <div className='-ml-1.5 flex min-w-0 flex-wrap gap-1'>
++            <div
++              className={cn(
++                '-ml-1.5 flex min-w-0 flex-wrap gap-1',
++                'group-has-data-[slot=astra-iq-timeline]/channel-footer:max-w-2/5 group-has-data-[slot=astra-iq-timeline]/channel-footer:flex-nowrap'
++              )}
++            >
+               {groups.map((g) => (
+                 <GroupBadge
+                   key={g}
+@@ -165,6 +174,13 @@ function ChannelCardComponent({
+           ) : (
+             <span className='text-muted-foreground text-sm'>-</span>
+           )}
++          {showAstraIQ && (
++            <AstraIQStatus
++              channelId={row.original.id}
++              models={row.original.models.split(',').map((name) => name.trim())}
++              channelEnabled={row.original.status === CHANNEL_STATUS.ENABLED}
++            />
++          )}
+         </div>
+       </div>
+     </ChannelRowActionsLayoutContext.Provider>
+diff --git a/web/src/features/channels/components/channels-table.tsx b/web/src/features/channels/components/channels-table.tsx
+index 069cdc8b..931e85c5 100644
+--- a/web/src/features/channels/components/channels-table.tsx
++++ b/web/src/features/channels/components/channels-table.tsx
+@@ -544,7 +544,7 @@ export function ChannelsTable() {
+               reorderEnabled={reorderActive}
+             />
+           )}
+-          cardGridClassName='grid grid-cols-1 gap-3 sm:gap-4 lg:grid-cols-3'
++          cardGridClassName='grid grid-cols-1 gap-4 lg:grid-cols-3 [&>[data-slot=data-table-card]]:rounded-2xl [&>[data-slot=data-table-card]]:border-border/70 [&>[data-slot=data-table-card]]:p-4 [&>[data-slot=data-table-card]]:shadow-xs'
+           applyHeaderSize
+           afterTable={<ChannelPriorityStatus order={priorityOrder} />}
+           toolbarProps={{
+diff --git a/web/src/features/channels/components/dialogs/astra-iq-detail-dialog.tsx b/web/src/features/channels/components/dialogs/astra-iq-detail-dialog.tsx
+new file mode 100644
+index 00000000..2830830e
+--- /dev/null
++++ b/web/src/features/channels/components/dialogs/astra-iq-detail-dialog.tsx
+@@ -0,0 +1,429 @@
++/*
++Copyright (C) 2023-2026 QuantumNous
++
++This program is free software: you can redistribute it and/or modify
++it under the terms of the GNU Affero General Public License as
++published by the Free Software Foundation, either version 3 of the
++License, or (at your option) any later version.
++
++This program is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++GNU Affero General Public License for more details.
++
++You should have received a copy of the GNU Affero General Public License
++along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++For commercial licensing, please contact support@quantumnous.com
++*/
++import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
++import { useState } from 'react'
++import { useTranslation } from 'react-i18next'
++
++import { ConfirmDialog } from '@/components/confirm-dialog'
++import { Dialog } from '@/components/dialog'
++import { ErrorState } from '@/components/error-state'
++import { LoadingState } from '@/components/loading-state'
++import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
++import { Button } from '@/components/ui/button'
++import { toIntlLocale } from '@/i18n/languages'
++import {
++  ADMIN_PERMISSION_ACTIONS,
++  ADMIN_PERMISSION_RESOURCES,
++  hasPermission,
++} from '@/lib/admin-permissions'
++import { api } from '@/lib/api'
++import { formatNumber } from '@/lib/format'
++import { markServerErrorHandled } from '@/lib/handle-server-error'
++import {
++  getServerErrorMessage,
++  requireServerSuccess,
++} from '@/lib/server-error-message'
++import { cn } from '@/lib/utils'
++import { useAuthStore } from '@/stores/auth-store'
++
++import {
++  astraIQStatusLabel,
++  type IQAttempt,
++  type IQSample,
++} from '../../lib/astra-iq'
++
++export type IQCheckDetail = {
++  sample: IQSample
++  question: string
++  expected_answer: string
++  model: string
++  reasoning_effort: string
++}
++
++type Props = {
++  channelId: number
++  sample: IQSample
++  model?: string
++  onClose: () => void
++}
++
++function CheckFailure(props: {
++  attempt: Partial<IQAttempt>
++  expected: string
++}) {
++  const { t } = useTranslation()
++  const attempt = props.attempt
++  if (attempt.status !== 'fail' && attempt.status !== 'error') return null
++  let message = attempt.error_message
++  if (attempt.status === 'fail') {
++    message = t('Expected {{expected}}, received {{actual}}.', {
++      expected: props.expected,
++      actual: attempt.response || '—',
++    })
++  } else if (!message) {
++    const reasons: Record<string, string> = {
++      timeout: t('The check exceeded its time limit.'),
++      official_client_rejected: t(
++        'Upstream rejected the official Codex client.'
++      ),
++      official_client_unavailable: t(
++        'The official Codex client could not be started.'
++      ),
++      official_client_failed: t(
++        'The official Codex client did not send a request.'
++      ),
++      official_client_incomplete: t(
++        'The official Codex client did not receive a complete response.'
++      ),
++      empty_answer: t('The upstream response contained no final answer.'),
++      incomplete_response: t('The upstream response ended before completion.'),
++      no_enabled_keys: t('This channel has no enabled keys.'),
++    }
++    message =
++      reasons[attempt.detail || ''] ||
++      t('The request failed. This older check has no saved error details.')
++  }
++  return (
++    <Alert variant='destructive' className='space-y-2 p-4'>
++      <AlertTitle>{t('Failure reason')}</AlertTitle>
++      <AlertDescription className='space-y-2'>
++        <p className='break-words whitespace-pre-wrap'>{message}</p>
++        <div className='flex flex-wrap gap-x-4 gap-y-1 font-mono text-xs break-all'>
++          {attempt.http_status ? <span>HTTP {attempt.http_status}</span> : null}
++          {attempt.error_code && (
++            <span>
++              {t('Error code')}: {attempt.error_code}
++            </span>
++          )}
++          {attempt.error_type && (
++            <span>
++              {t('Error type')}: {attempt.error_type}
++            </span>
++          )}
++          {!attempt.error_code && attempt.detail && (
++            <span>
++              {t('Error code')}: {attempt.detail}
++            </span>
++          )}
++        </div>
++      </AlertDescription>
++    </Alert>
++  )
++}
++
++export function AstraIQDetailDialog(props: Props) {
++  const { t, i18n } = useTranslation()
++  const queryClient = useQueryClient()
++  const currentUser = useAuthStore((state) => state.auth.user)
++  const canDelete = hasPermission(
++    currentUser,
++    ADMIN_PERMISSION_RESOURCES.CHANNEL,
++    ADMIN_PERMISSION_ACTIONS.WRITE
++  )
++  const modelQuery = props.model
++    ? `?model=${encodeURIComponent(props.model)}`
++    : ''
++  const detailKey = [
++    'channels',
++    'astra-iq-detail',
++    props.channelId,
++    props.model ?? 'gpt-6-astra',
++  ]
++  const [deleteScope, setDeleteScope] = useState<'this' | 'all' | null>(null)
++  const deletion = useMutation({
++    mutationFn: async (scope: 'this' | 'all') => {
++      const endpoint = `/api/channel/astra_iq/${props.channelId}`
++      const response = await api.delete<{ success: boolean; message?: string }>(
++        (scope === 'all'
++          ? endpoint
++          : `${endpoint}/${props.sample.checked_at}`) + modelQuery
++      )
++      requireServerSuccess(response.data)
++    },
++    onSuccess: (_, scope) => {
++      setDeleteScope(null)
++      props.onClose()
++      queryClient.removeQueries({
++        queryKey:
++          scope === 'all' ? detailKey : [...detailKey, props.sample.checked_at],
++      })
++      void queryClient.invalidateQueries({ queryKey: ['channels', 'astra-iq'] })
++    },
++    onError: markServerErrorHandled,
++    meta: { errorToast: false },
++  })
++  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
++  const query = useQuery({
++    queryKey: [...detailKey, props.sample.checked_at],
++    queryFn: async ({ signal }) => {
++      const response = await api.get<{ success: boolean; data: IQCheckDetail }>(
++        `/api/channel/astra_iq/${props.channelId}/${props.sample.checked_at}${modelQuery}`,
++        { signal }
++      )
++      return requireServerSuccess(response.data).data
++    },
++    staleTime: Infinity,
++    meta: { errorToast: false },
++  })
++  const detail = query.data
++  const sample = detail?.sample ?? props.sample
++  const attempts = sample.attempts ?? []
++  const hasUsage =
++    attempts.length > 0 &&
++    attempts.every(
++      (attempt) =>
++        attempt.prompt_tokens != null && attempt.completion_tokens != null
++    )
++  const inputTokens = attempts.reduce(
++    (total, attempt) => total + (attempt.prompt_tokens ?? 0),
++    0
++  )
++  const outputTokens = attempts.reduce(
++    (total, attempt) => total + (attempt.completion_tokens ?? 0),
++    0
++  )
++  const firstToken = attempts[0]?.first_token_ms
++  const metrics = [
++    {
++      label: t('Latency'),
++      value:
++        sample.latency_ms == null
++          ? '—'
++          : `${formatNumber(sample.latency_ms / 1000, locale)} s`,
++    },
++    {
++      label: t('Time to first token'),
++      value:
++        firstToken == null
++          ? '—'
++          : `${formatNumber(firstToken / 1000, locale)} s`,
++    },
++    {
++      label: t('Input / Output tokens'),
++      value: hasUsage
++        ? `${formatNumber(inputTokens, locale)} / ${formatNumber(outputTokens, locale)}`
++        : '—',
++    },
++    {
++      label: t('Check requests'),
++      value: attempts.length ? formatNumber(attempts.length, locale) : '—',
++    },
++  ]
++
++  return (
++    <>
++      <Dialog
++        open
++        onOpenChange={(open) => {
++          if (!open && !deletion.isPending) props.onClose()
++        }}
++        title={t('Astra IQ check details')}
++        description={new Date(sample.checked_at * 1000).toLocaleString(locale)}
++        contentClassName='rounded-2xl sm:max-w-3xl'
++        headerClassName='border-b border-border/60 pb-4 pr-6'
++        bodyClassName='space-y-6'
++        footer={
++          canDelete && (
++            <>
++              <Button
++                variant='outline'
++                disabled={deletion.isPending}
++                onClick={() => {
++                  deletion.reset()
++                  setDeleteScope('this')
++                }}
++              >
++                {t('Delete this check')}
++              </Button>
++              <Button
++                variant='destructive'
++                disabled={deletion.isPending}
++                onClick={() => {
++                  deletion.reset()
++                  setDeleteScope('all')
++                }}
++              >
++                {t('Delete all checks')}
++              </Button>
++            </>
++          )
++        }
++      >
++        {query.isPending && <LoadingState />}
++        {query.isError && (
++          <ErrorState
++            title={t('Astra IQ details unavailable')}
++            onRetry={() => void query.refetch()}
++          />
++        )}
++        {detail && !query.isError && (
++          <>
++            <div className='flex flex-wrap items-center justify-between gap-3'>
++              <div className='flex flex-wrap items-center gap-3'>
++                <span
++                  className={cn(
++                    'inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-medium ring-1 ring-inset',
++                    sample.status === 'pass' &&
++                      'bg-emerald-500/8 text-emerald-700 ring-emerald-500/20 dark:text-emerald-400',
++                    sample.status === 'fail' &&
++                      'bg-rose-500/8 text-rose-700 ring-rose-500/20 dark:text-rose-400',
++                    sample.status === 'error' &&
++                      'bg-amber-500/8 text-amber-700 ring-amber-500/20 dark:text-amber-400'
++                  )}
++                >
++                  <span className='size-1.5 rounded-full bg-current' />
++                  {t(astraIQStatusLabel(sample.status))}
++                </span>
++                <span className='text-muted-foreground text-sm'>
++                  {t('Expected answer')}:{' '}
++                  <strong className='text-foreground font-medium'>
++                    {detail.expected_answer}
++                  </strong>
++                </span>
++              </div>
++              <div className='text-muted-foreground flex flex-wrap items-center gap-2 font-mono text-xs'>
++                <span>{detail.model}</span>
++                <span aria-hidden='true'>·</span>
++                <span>{detail.reasoning_effort}</span>
++                {sample.client && (
++                  <>
++                    <span aria-hidden='true'>·</span>
++                    <span>{sample.client}</span>
++                  </>
++                )}
++              </div>
++            </div>
++            <CheckFailure
++              attempt={
++                attempts.find(
++                  (attempt) =>
++                    attempt.status === 'fail' || attempt.status === 'error'
++                ) || {
++                  status: sample.status,
++                  detail: sample.detail,
++                  response: sample.answer,
++                }
++              }
++              expected={detail.expected_answer}
++            />
++            <section className='space-y-2.5'>
++              <div className='flex flex-wrap items-center justify-between gap-2'>
++                <h3 className='text-sm font-medium'>
++                  {t('Question sent to model')}
++                </h3>
++                {sample.endpoint && (
++                  <span className='text-muted-foreground font-mono text-xs'>
++                    {sample.endpoint}
++                  </span>
++                )}
++              </div>
++              <div className='bg-muted/35 border-border/60 rounded-xl border p-4 text-sm leading-7 break-words whitespace-pre-wrap'>
++                {detail.question}
++              </div>
++            </section>
++            <dl className='bg-muted/35 grid grid-cols-2 gap-x-5 gap-y-4 rounded-xl p-4 sm:grid-cols-4'>
++              {metrics.map((metric) => (
++                <div key={metric.label} className='space-y-1.5'>
++                  <dt className='text-muted-foreground text-xs'>
++                    {metric.label}
++                  </dt>
++                  <dd className='font-mono text-sm font-medium tabular-nums'>
++                    {metric.value}
++                  </dd>
++                </div>
++              ))}
++            </dl>
++            <section className='space-y-3'>
++              <h3 className='text-sm font-medium'>{t('Model response')}</h3>
++              {!attempts.length && (
++                <div className='border-border/60 rounded-xl border p-4 text-sm'>
++                  {sample.answer && (
++                    <p className='mb-2 whitespace-pre-wrap'>{sample.answer}</p>
++                  )}
++                  <p className='text-muted-foreground'>
++                    {t('Detailed metrics were not saved for this older check.')}
++                  </p>
++                </div>
++              )}
++              {attempts.map((attempt, index) => (
++                <div
++                  key={attempt.key_index}
++                  className='border-border/60 space-y-3 rounded-xl border p-4'
++                >
++                  {attempts.length > 1 && (
++                    <p className='text-muted-foreground text-xs'>
++                      {t('Check request')} {formatNumber(index + 1, locale)} ·{' '}
++                      {t(astraIQStatusLabel(attempt.status))}
++                    </p>
++                  )}
++                  {attempt.response ? (
++                    <p className='text-sm leading-7 break-words whitespace-pre-wrap'>
++                      {attempt.response}
++                    </p>
++                  ) : (
++                    <p className='text-muted-foreground text-sm'>
++                      {t('No completed model response')}
++                    </p>
++                  )}
++                </div>
++              ))}
++            </section>
++          </>
++        )}
++      </Dialog>
++      <ConfirmDialog
++        open={deleteScope !== null}
++        onOpenChange={(open) => {
++          if (!open && !deletion.isPending) setDeleteScope(null)
++        }}
++        title={
++          deleteScope === 'all'
++            ? t('Delete all checks for this channel?')
++            : t('Delete this check?')
++        }
++        desc={
++          deleteScope === 'all'
++            ? t(
++                'This permanently deletes all check results for this channel. Calls are allowed until the next check.'
++              )
++            : t(
++                'This permanently deletes this check. If it is the latest result, calls are allowed until the next check.'
++              )
++        }
++        confirmText={t('Delete')}
++        destructive
++        isLoading={deletion.isPending}
++        handleConfirm={() => {
++          if (deleteScope && canDelete && !deletion.isPending) {
++            deletion.mutate(deleteScope)
++          }
++        }}
++      >
++        {deletion.isError && (
++          <p role='alert' className='text-destructive text-sm'>
++            {getServerErrorMessage(
++              deletion.error,
++              t('Failed to delete check results')
++            )}
++          </p>
++        )}
++      </ConfirmDialog>
++    </>
++  )
++}
+diff --git a/web/src/features/channels/index.tsx b/web/src/features/channels/index.tsx
+index a34d037f..25df9888 100644
+--- a/web/src/features/channels/index.tsx
++++ b/web/src/features/channels/index.tsx
+@@ -33,6 +33,7 @@ import { requireServerSuccess } from '@/lib/server-error-message'
+ import { useAuthStore } from '@/stores/auth-store'
+ 
+ import { getChannelOps } from './api'
++import { AstraIQSettings } from './components/astra-iq-settings'
+ import { ChannelsDialogs } from './components/channels-dialogs'
+ import { ChannelsPrimaryButtons } from './components/channels-primary-buttons'
+ import { ChannelsProvider } from './components/channels-provider'
+@@ -89,9 +90,10 @@ export function Channels() {
+     <ChannelsProvider>
+       <SectionPageLayout fixedContent>
+         <SectionPageLayout.Title>
+-          <span className='flex min-w-0 items-center gap-2'>
++          <span className='flex min-w-0 flex-wrap items-center gap-2'>
+             <span className='truncate'>{t('Channels')}</span>
+             {retryBadge}
++            <AstraIQSettings />
+           </span>
+         </SectionPageLayout.Title>
+         <SectionPageLayout.Actions>
+diff --git a/web/src/features/channels/lib/astra-iq.ts b/web/src/features/channels/lib/astra-iq.ts
+new file mode 100644
+index 00000000..ce0eef4c
+--- /dev/null
++++ b/web/src/features/channels/lib/astra-iq.ts
+@@ -0,0 +1,139 @@
++/*
++Copyright (C) 2023-2026 QuantumNous
++
++This program is free software: you can redistribute it and/or modify
++it under the terms of the GNU Affero General Public License as
++published by the Free Software Foundation, either version 3 of the
++License, or (at your option) any later version.
++
++This program is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++GNU Affero General Public License for more details.
++
++You should have received a copy of the GNU Affero General Public License
++along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++For commercial licensing, please contact support@quantumnous.com
++*/
++export type IQAttempt = {
++  key_index: number
++  status: string
++  response?: string
++  detail?: string
++  error_message?: string
++  error_code?: string
++  error_type?: string
++  latency_ms: number
++  first_token_ms: number | null
++  prompt_tokens: number | null
++  completion_tokens: number | null
++  http_status?: number
++}
++export type IQSample = {
++  status: string
++  checked_at: number
++  started_at?: number
++  answer?: string
++  detail?: string
++  latency_ms?: number
++  endpoint?: string
++  client?: string
++  attempts?: IQAttempt[]
++}
++export type AstraIQStatusData = {
++  enabled: boolean
++  interval_minutes?: number
++  server_time?: number
++  runs?: IQRun[]
++  models?: Record<
++    string,
++    {
++      interval_minutes: number
++      runs: IQRun[]
++      results: AstraIQStatusData['results']
++    }
++  >
++  results: Record<
++    string,
++    {
++      status: string
++      allowed: boolean
++      pass_rate: number
++      checked_at: number
++      answer: string
++      detail: string
++      history: IQSample[]
++    }
++  >
++}
++
++type IQRun = { started_at: number; finished_at: number }
++
++// Each actual scheduler round occupies one position. Account for the whole
++// round's duration and the scheduler/runner's two 15-second polling windows;
++// wall-clock minute boundaries must not turn normal delays into missed checks.
++export function astraIQTimeline(
++  history: IQSample[],
++  intervalMinutes: number,
++  now: number,
++  runs: IQRun[] = []
++): (IQSample | null)[] {
++  const interval = Math.max(1, intervalMinutes) * 60
++  const rounds = [...runs]
++  const samples = new Map<IQRun, IQSample>()
++  for (const sample of history) {
++    const started =
++      sample.started_at ||
++      sample.checked_at - Math.floor((sample.latency_ms || 0) / 1000)
++    let round: IQRun | undefined
++    for (let i = rounds.length - 1; i >= 0; i--) {
++      const candidate = rounds[i]
++      if (
++        started >= candidate.started_at - 1 &&
++        started <= (candidate.finished_at || now) + 1
++      ) {
++        round = candidate
++        break
++      }
++    }
++    // Task history can be cleared independently of saved check results.
++    if (!round) {
++      round = { started_at: started, finished_at: sample.checked_at }
++      rounds.push(round)
++    }
++    const previous = samples.get(round)
++    if (!previous || sample.checked_at > previous.checked_at) {
++      samples.set(round, sample)
++    }
++  }
++  rounds.sort((a, b) => a.started_at - b.started_at)
++  const slots: (IQSample | null)[] = []
++  let dueAt: number | undefined
++  for (const round of rounds) {
++    if (dueAt !== undefined) {
++      const missed = Math.min(
++        24,
++        Math.max(0, Math.ceil((round.started_at - dueAt - 30) / interval))
++      )
++      slots.push(...Array<IQSample | null>(missed).fill(null))
++    }
++    slots.push(samples.get(round) ?? null)
++    dueAt = Math.max(round.started_at + interval, round.finished_at || now)
++  }
++  if (dueAt !== undefined) {
++    const missed = Math.min(
++      24,
++      Math.max(0, Math.ceil((now - dueAt - 30) / interval))
++    )
++    slots.push(...Array<IQSample | null>(missed).fill(null))
++  }
++  return [...Array<IQSample | null>(24).fill(null), ...slots].slice(-24)
++}
++
++export function astraIQStatusLabel(status: string) {
++  if (status === 'pass') return 'Astra IQ passed'
++  if (status === 'fail') return 'Astra IQ wrong answer'
++  if (status === 'error') return 'Astra IQ request failed'
++  return 'Astra IQ pending'
++}
+diff --git a/web/src/i18n/locales/en.json b/web/src/i18n/locales/en.json
+--- a/web/src/i18n/locales/en.json
++++ b/web/src/i18n/locales/en.json
+@@ -7726,6 +7726,73 @@
+     "Zhipu GLM": "Zhipu GLM",
+     "Zhipu V4": "Zhipu V4",
+     "Zoom": "Zoom",
++    "Astra IQ": "Astra IQ",
++    "Astra IQ check details": "Astra IQ check details",
++    "Astra IQ details unavailable": "Astra IQ details unavailable",
++    "Astra IQ disabled channel": "Astra IQ disabled channel",
++    "Astra IQ passed": "Astra IQ passed",
++    "Astra IQ pending": "Astra IQ pending",
++    "Astra IQ request failed": "Astra IQ request failed",
++    "Astra IQ status unavailable": "Astra IQ status unavailable",
++    "Astra IQ wrong answer": "Astra IQ wrong answer",
++    "Check request": "Check request",
++    "Check requests": "Check requests",
++    "Detailed metrics were not saved for this older check.": "Detailed metrics were not saved for this older check.",
++    "Expected answer": "Expected answer",
++    "Input / Output tokens": "Input / Output tokens",
++    "Model response": "Model response",
++    "No completed model response": "No completed model response",
++    "Question sent to model": "Question sent to model",
++    "Time to first token": "Time to first token",
++    "View check details": "View check details",
++    "Upstream rejected the official Codex client.": "Upstream rejected the official Codex client.",
++    "Delete this check": "Delete this check",
++    "Delete all checks": "Delete all checks",
++    "Delete this check?": "Delete this check?",
++    "Delete all checks for this channel?": "Delete all checks for this channel?",
++    "Failed to delete check results": "Failed to delete check results",
++    "Check settings": "Check settings",
++    "Check start time": "Start time",
++    "Interval (minutes)": "Interval (minutes)",
++    "Stop on failure": "Stop on failure",
++    "Settings apply to every checked channel. Daily schedule in Beijing time (UTC+8).": "Settings apply to every checked channel. Daily schedule in Beijing time (UTC+8).",
++    "Equal times mean all day. Overnight schedules are supported.": "Equal times mean all day. Overnight schedules are supported.",
++    "Pause Astra calls after a failed check. Calls without a result are allowed.": "Pause Astra calls after a failed check. Calls without a result are allowed.",
++    "Check settings unavailable": "Check settings unavailable",
++    "Use HH:mm for check times": "Use HH:mm for check times",
++    "Check interval must be an integer from 1 to 1440": "Check interval must be an integer from 1 to 1440",
++    "Invalid check settings": "Invalid check settings",
++    "This permanently deletes this check. If it is the latest result, calls are allowed until the next check.": "This permanently deletes this check. If it is the latest result, calls are allowed until the next check.",
++    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "This permanently deletes all check results for this channel. Calls are allowed until the next check.",
++    "Enable checks": "Enable checks",
++    "When off, checks stop and results do not block calls. History is kept.": "When off, checks stop and results do not block calls. History is kept.",
++    "Expected {{expected}}, received {{actual}}.": "Expected {{expected}}, received {{actual}}.",
++    "Error code": "Error code",
++    "Error type": "Error type",
++    "The check exceeded its time limit.": "The check exceeded its time limit.",
++    "The official Codex client could not be started.": "The official Codex client could not be started.",
++    "The official Codex client did not send a request.": "The official Codex client did not send a request.",
++    "The official Codex client did not receive a complete response.": "The official Codex client did not receive a complete response.",
++    "The upstream response contained no final answer.": "The upstream response contained no final answer.",
++    "The upstream response ended before completion.": "The upstream response ended before completion.",
++    "This channel has no enabled keys.": "This channel has no enabled keys.",
++    "The request failed. This older check has no saved error details.": "The request failed. This older check has no saved error details.",
++    "Check channels": "Check channels",
++    "All Astra channels": "All Astra channels",
++    "Leave empty to check all Astra channels. Unselected channels are not checked and their results do not block calls.": "Leave empty to check all Astra channels. Unselected channels are not checked and their results do not block calls.",
++    "Select only channels that support gpt-6-astra": "Select only channels that support gpt-6-astra",
++    "Check models": "Check models",
++    "Select check models": "Select check models",
++    "Configure model": "Configure model",
++    "Check model": "Check model",
++    "Each model has its own channels and schedule in Beijing time (UTC+8).": "Each model has its own channels and schedule in Beijing time (UTC+8).",
++    "Select models to check, then click a selected model to configure it. Removing a model keeps its history and stops gating its calls.": "Select models to check, then click a selected model to configure it. Removing a model keeps its history and stops gating its calls.",
++    "All channels for this model": "All channels for this model",
++    "Leave empty to check all channels for this model. Unselected channels are not checked and their results do not block calls.": "Leave empty to check all channels for this model. Unselected channels are not checked and their results do not block calls.",
++    "Pause only this model on a failed channel. Calls without a result are allowed.": "Pause only this model on a failed channel. Calls without a result are allowed.",
++    "Select only channels that support the selected model": "Select only channels that support the selected model",
++    "Select a model configured on a channel": "Select a model configured on a channel",
++    "Invalid check model": "Invalid check model",
+     "By clicking sign in, you agree to our": "By clicking sign in, you agree to our",
+     "By creating an account, you agree to our": "By creating an account, you agree to our"
+   }
+diff --git a/web/src/i18n/locales/fr.json b/web/src/i18n/locales/fr.json
+--- a/web/src/i18n/locales/fr.json
++++ b/web/src/i18n/locales/fr.json
+@@ -7726,6 +7726,73 @@
+     "Zhipu GLM": "Zhipu GLM",
+     "Zhipu V4": "Zhipu V4",
+     "Zoom": "Zoom",
++    "Astra IQ": "Astra IQ",
++    "Astra IQ check details": "Astra IQ check details",
++    "Astra IQ details unavailable": "Astra IQ details unavailable",
++    "Astra IQ disabled channel": "Astra IQ disabled channel",
++    "Astra IQ passed": "Astra IQ passed",
++    "Astra IQ pending": "Astra IQ pending",
++    "Astra IQ request failed": "Astra IQ request failed",
++    "Astra IQ status unavailable": "Astra IQ status unavailable",
++    "Astra IQ wrong answer": "Astra IQ wrong answer",
++    "Check request": "Check request",
++    "Check requests": "Check requests",
++    "Detailed metrics were not saved for this older check.": "Detailed metrics were not saved for this older check.",
++    "Expected answer": "Expected answer",
++    "Input / Output tokens": "Input / Output tokens",
++    "Model response": "Model response",
++    "No completed model response": "No completed model response",
++    "Question sent to model": "Question sent to model",
++    "Time to first token": "Time to first token",
++    "View check details": "View check details",
++    "Upstream rejected the official Codex client.": "Le fournisseur a refusé le client officiel Codex.",
++    "Delete this check": "Supprimer ce résultat",
++    "Delete all checks": "Supprimer tous les résultats",
++    "Delete this check?": "Supprimer ce résultat de test ?",
++    "Delete all checks for this channel?": "Supprimer tous les résultats de ce canal ?",
++    "Failed to delete check results": "Échec de la suppression des résultats",
++    "Check settings": "Réglages des tests",
++    "Check start time": "Heure de début",
++    "Interval (minutes)": "Intervalle (minutes)",
++    "Stop on failure": "Arrêt si échec",
++    "Settings apply to every checked channel. Daily schedule in Beijing time (UTC+8).": "Pour tous les canaux testés. Horaire quotidien de Pékin (UTC+8).",
++    "Equal times mean all day. Overnight schedules are supported.": "Des heures identiques signifient toute la journée. Les plages peuvent passer minuit.",
++    "Pause Astra calls after a failed check. Calls without a result are allowed.": "Suspendre les appels Astra après un échec. Sans résultat, les appels sont autorisés.",
++    "Check settings unavailable": "Réglages des tests indisponibles",
++    "Use HH:mm for check times": "Utilisez HH:mm pour les heures des tests",
++    "Check interval must be an integer from 1 to 1440": "L’intervalle doit être un entier entre 1 et 1440",
++    "Invalid check settings": "Réglages des tests invalides",
++    "This permanently deletes this check. If it is the latest result, calls are allowed until the next check.": "Ce résultat sera supprimé définitivement. Si c’est le plus récent, les appels seront autorisés jusqu’au prochain test.",
++    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "Tous les résultats de ce canal seront supprimés définitivement. Les appels seront autorisés jusqu’au prochain test.",
++    "Enable checks": "Activer les tests",
++    "When off, checks stop and results do not block calls. History is kept.": "Désactivé : les tests cessent et les résultats ne bloquent plus les appels. L’historique est conservé.",
++    "Expected {{expected}}, received {{actual}}.": "Réponse attendue : {{expected}}, reçue : {{actual}}.",
++    "Error code": "Code d’erreur",
++    "Error type": "Type d’erreur",
++    "The check exceeded its time limit.": "Le test a dépassé le délai.",
++    "The official Codex client could not be started.": "Impossible de démarrer le client officiel Codex.",
++    "The official Codex client did not send a request.": "Le client officiel Codex n’a envoyé aucune requête.",
++    "The official Codex client did not receive a complete response.": "Le client officiel Codex n’a pas reçu de réponse complète.",
++    "The upstream response contained no final answer.": "La réponse amont ne contient pas de réponse finale.",
++    "The upstream response ended before completion.": "La réponse amont s’est interrompue avant la fin.",
++    "This channel has no enabled keys.": "Ce canal n’a aucune clé activée.",
++    "The request failed. This older check has no saved error details.": "La requête a échoué. Aucun détail d’erreur n’a été enregistré pour cet ancien test.",
++    "Check channels": "Canaux testés",
++    "All Astra channels": "Tous les canaux Astra",
++    "Leave empty to check all Astra channels. Unselected channels are not checked and their results do not block calls.": "Laissez vide pour tester tous les canaux Astra. Les canaux non sélectionnés ne sont pas testés et leurs résultats ne bloquent pas les appels.",
++    "Select only channels that support gpt-6-astra": "Sélectionnez uniquement des canaux prenant en charge gpt-6-astra",
++    "Check models": "Modèles à vérifier",
++    "Select check models": "Choisir les modèles",
++    "Configure model": "Configurer le modèle",
++    "Check model": "Modèle vérifié",
++    "Each model has its own channels and schedule in Beijing time (UTC+8).": "Chaque modèle a ses propres canaux et horaires en heure de Pékin (UTC+8).",
++    "Select models to check, then click a selected model to configure it. Removing a model keeps its history and stops gating its calls.": "Sélectionnez les modèles à vérifier, puis cliquez sur un modèle sélectionné pour le configurer. Retirer un modèle conserve son historique et cesse de limiter ses appels.",
++    "All channels for this model": "Tous les canaux de ce modèle",
++    "Leave empty to check all channels for this model. Unselected channels are not checked and their results do not block calls.": "Laisser vide pour vérifier tous les canaux de ce modèle. Les canaux non sélectionnés ne sont ni vérifiés ni bloqués.",
++    "Pause only this model on a failed channel. Calls without a result are allowed.": "Suspendre uniquement ce modèle sur le canal en échec. Les appels sans résultat restent autorisés.",
++    "Select only channels that support the selected model": "Sélectionnez les canaux prenant en charge ce modèle",
++    "Select a model configured on a channel": "Choisissez un modèle configuré sur un canal",
++    "Invalid check model": "Modèle de vérification invalide",
+     "By clicking sign in, you agree to our": "En cliquant sur se connecter, vous acceptez nos",
+     "By creating an account, you agree to our": "En créant un compte, vous acceptez nos"
+   }
+diff --git a/web/src/i18n/locales/ja.json b/web/src/i18n/locales/ja.json
+--- a/web/src/i18n/locales/ja.json
++++ b/web/src/i18n/locales/ja.json
+@@ -7726,6 +7726,73 @@
+     "Zhipu GLM": "Zhipu GLM",
+     "Zhipu V4": "Zhipu V 4",
+     "Zoom": "ズーム",
++    "Astra IQ": "Astra IQ",
++    "Astra IQ check details": "Astra IQ check details",
++    "Astra IQ details unavailable": "Astra IQ details unavailable",
++    "Astra IQ disabled channel": "Astra IQ disabled channel",
++    "Astra IQ passed": "Astra IQ passed",
++    "Astra IQ pending": "Astra IQ pending",
++    "Astra IQ request failed": "Astra IQ request failed",
++    "Astra IQ status unavailable": "Astra IQ status unavailable",
++    "Astra IQ wrong answer": "Astra IQ wrong answer",
++    "Check request": "Check request",
++    "Check requests": "Check requests",
++    "Detailed metrics were not saved for this older check.": "Detailed metrics were not saved for this older check.",
++    "Expected answer": "Expected answer",
++    "Input / Output tokens": "Input / Output tokens",
++    "Model response": "Model response",
++    "No completed model response": "No completed model response",
++    "Question sent to model": "Question sent to model",
++    "Time to first token": "Time to first token",
++    "View check details": "View check details",
++    "Upstream rejected the official Codex client.": "上流が公式 Codex クライアントを拒否しました。",
++    "Delete this check": "この結果を削除",
++    "Delete all checks": "すべての結果を削除",
++    "Delete this check?": "この検査結果を削除しますか？",
++    "Delete all checks for this channel?": "このチャネルの検査結果をすべて削除しますか？",
++    "Failed to delete check results": "検査結果を削除できませんでした",
++    "Check settings": "検査設定",
++    "Check start time": "開始時刻",
++    "Interval (minutes)": "間隔（分）",
++    "Stop on failure": "失敗時に停止",
++    "Settings apply to every checked channel. Daily schedule in Beijing time (UTC+8).": "検査対象のすべてのチャネルに適用。北京時間（UTC+8）で毎日実行します。",
++    "Equal times mean all day. Overnight schedules are supported.": "同じ時刻は終日を意味します。日付をまたぐ時間帯も設定できます。",
++    "Pause Astra calls after a failed check. Calls without a result are allowed.": "検査失敗後に Astra 呼び出しを停止します。結果がない場合は許可します。",
++    "Check settings unavailable": "検査設定を読み込めません",
++    "Use HH:mm for check times": "時刻は HH:mm 形式で入力してください",
++    "Check interval must be an integer from 1 to 1440": "間隔は 1～1440 の整数で入力してください",
++    "Invalid check settings": "検査設定が無効です",
++    "This permanently deletes this check. If it is the latest result, calls are allowed until the next check.": "この検査結果を完全に削除します。最新の結果の場合、次の検査まで呼び出しを許可します。",
++    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "このチャネルの全検査結果を完全に削除します。次の検査まで呼び出しを許可します。",
++    "Enable checks": "検査を有効化",
++    "When off, checks stop and results do not block calls. History is kept.": "オフにすると検査を停止し、結果による呼び出し制限を解除します。履歴は保持します。",
++    "Expected {{expected}}, received {{actual}}.": "期待する答えは {{expected}}、実際の答えは {{actual}} です。",
++    "Error code": "エラーコード",
++    "Error type": "エラー種別",
++    "The check exceeded its time limit.": "検査の制限時間を超えました。",
++    "The official Codex client could not be started.": "Codex 公式クライアントを起動できませんでした。",
++    "The official Codex client did not send a request.": "Codex 公式クライアントがリクエストを送信しませんでした。",
++    "The official Codex client did not receive a complete response.": "Codex 公式クライアントが完全な応答を受信できませんでした。",
++    "The upstream response contained no final answer.": "上流の応答に最終回答がありません。",
++    "The upstream response ended before completion.": "上流の応答が完了前に終了しました。",
++    "This channel has no enabled keys.": "このチャネルに有効なキーがありません。",
++    "The request failed. This older check has no saved error details.": "リクエストに失敗しました。この古い検査にはエラー詳細が保存されていません。",
++    "Check channels": "検査対象チャネル",
++    "All Astra channels": "すべての Astra チャネル",
++    "Leave empty to check all Astra channels. Unselected channels are not checked and their results do not block calls.": "未選択の場合はすべての Astra チャネルを検査します。選択外のチャネルは検査せず、その結果で呼び出しを制限しません。",
++    "Select only channels that support gpt-6-astra": "gpt-6-astra に対応するチャネルのみ選択できます",
++    "Check models": "検査モデル",
++    "Select check models": "検査モデルを選択",
++    "Configure model": "モデルの設定",
++    "Check model": "検査モデル",
++    "Each model has its own channels and schedule in Beijing time (UTC+8).": "各モデルのチャネルとスケジュールは個別設定です。時刻は北京時間 (UTC+8) です。",
++    "Select models to check, then click a selected model to configure it. Removing a model keeps its history and stops gating its calls.": "検査するモデルを選択し、選択済みモデルをクリックして設定を切り替えます。モデルを削除しても履歴は保持され、呼び出しの制限は解除されます。",
++    "All channels for this model": "このモデルの全チャネル",
++    "Leave empty to check all channels for this model. Unselected channels are not checked and their results do not block calls.": "空欄の場合、このモデルの全チャネルを検査します。未選択のチャネルは検査・制限されません。",
++    "Pause only this model on a failed channel. Calls without a result are allowed.": "失敗したチャネルのこのモデルのみ停止します。結果がない呼び出しは許可します。",
++    "Select only channels that support the selected model": "選択したモデルに対応するチャネルのみ選択できます",
++    "Select a model configured on a channel": "チャネルに設定済みのモデルを選択してください",
++    "Invalid check model": "検査モデルが無効です",
+     "By clicking sign in, you agree to our": "サインインをクリックすると、以下に同意したことになります：",
+     "By creating an account, you agree to our": "アカウントを作成すると、以下に同意したことになります："
+   }
+diff --git a/web/src/i18n/locales/ru.json b/web/src/i18n/locales/ru.json
+--- a/web/src/i18n/locales/ru.json
++++ b/web/src/i18n/locales/ru.json
+@@ -7726,6 +7726,73 @@
+     "Zhipu GLM": "Zhipu GLM",
+     "Zhipu V4": "Zhipu V4",
+     "Zoom": "Zoom",
++    "Astra IQ": "Astra IQ",
++    "Astra IQ check details": "Astra IQ check details",
++    "Astra IQ details unavailable": "Astra IQ details unavailable",
++    "Astra IQ disabled channel": "Astra IQ disabled channel",
++    "Astra IQ passed": "Astra IQ passed",
++    "Astra IQ pending": "Astra IQ pending",
++    "Astra IQ request failed": "Astra IQ request failed",
++    "Astra IQ status unavailable": "Astra IQ status unavailable",
++    "Astra IQ wrong answer": "Astra IQ wrong answer",
++    "Check request": "Check request",
++    "Check requests": "Check requests",
++    "Detailed metrics were not saved for this older check.": "Detailed metrics were not saved for this older check.",
++    "Expected answer": "Expected answer",
++    "Input / Output tokens": "Input / Output tokens",
++    "Model response": "Model response",
++    "No completed model response": "No completed model response",
++    "Question sent to model": "Question sent to model",
++    "Time to first token": "Time to first token",
++    "View check details": "View check details",
++    "Upstream rejected the official Codex client.": "Сервис отклонил официальный клиент Codex.",
++    "Delete this check": "Удалить этот результат",
++    "Delete all checks": "Удалить все результаты",
++    "Delete this check?": "Удалить этот результат проверки?",
++    "Delete all checks for this channel?": "Удалить все результаты проверок этого канала?",
++    "Failed to delete check results": "Не удалось удалить результаты проверок",
++    "Check settings": "Настройки проверок",
++    "Check start time": "Время начала",
++    "Interval (minutes)": "Интервал (минуты)",
++    "Stop on failure": "Отключать при сбое",
++    "Settings apply to every checked channel. Daily schedule in Beijing time (UTC+8).": "Для всех проверяемых каналов. Ежедневно по времени Пекина (UTC+8).",
++    "Equal times mean all day. Overnight schedules are supported.": "Одинаковое время означает весь день. Поддерживается переход через полночь.",
++    "Pause Astra calls after a failed check. Calls without a result are allowed.": "Приостанавливать вызовы Astra после неудачной проверки. Без результата вызовы разрешены.",
++    "Check settings unavailable": "Настройки проверок недоступны",
++    "Use HH:mm for check times": "Используйте формат HH:mm",
++    "Check interval must be an integer from 1 to 1440": "Интервал должен быть целым числом от 1 до 1440",
++    "Invalid check settings": "Неверные настройки проверок",
++    "This permanently deletes this check. If it is the latest result, calls are allowed until the next check.": "Этот результат будет удалён навсегда. Если он последний, вызовы будут разрешены до следующей проверки.",
++    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "Все результаты этого канала будут удалены навсегда. Вызовы будут разрешены до следующей проверки.",
++    "Enable checks": "Включить проверки",
++    "When off, checks stop and results do not block calls. History is kept.": "При отключении проверки прекращаются, результаты не блокируют вызовы. История сохраняется.",
++    "Expected {{expected}}, received {{actual}}.": "Ожидалось {{expected}}, получено {{actual}}.",
++    "Error code": "Код ошибки",
++    "Error type": "Тип ошибки",
++    "The check exceeded its time limit.": "Время проверки истекло.",
++    "The official Codex client could not be started.": "Не удалось запустить официальный клиент Codex.",
++    "The official Codex client did not send a request.": "Официальный клиент Codex не отправил запрос.",
++    "The official Codex client did not receive a complete response.": "Официальный клиент Codex не получил полный ответ.",
++    "The upstream response contained no final answer.": "Ответ сервера не содержит итогового ответа.",
++    "The upstream response ended before completion.": "Ответ сервера оборвался до завершения.",
++    "This channel has no enabled keys.": "У этого канала нет включённых ключей.",
++    "The request failed. This older check has no saved error details.": "Запрос не выполнен. Для этой старой проверки подробности ошибки не сохранены.",
++    "Check channels": "Каналы для проверки",
++    "All Astra channels": "Все каналы Astra",
++    "Leave empty to check all Astra channels. Unselected channels are not checked and their results do not block calls.": "Оставьте пустым, чтобы проверять все каналы Astra. Невыбранные каналы не проверяются, и их результаты не блокируют вызовы.",
++    "Select only channels that support gpt-6-astra": "Выбирайте только каналы с поддержкой gpt-6-astra",
++    "Check models": "Проверяемые модели",
++    "Select check models": "Выберите модели",
++    "Configure model": "Настроить модель",
++    "Check model": "Проверяемая модель",
++    "Each model has its own channels and schedule in Beijing time (UTC+8).": "Для каждой модели задаются свои каналы и расписание по пекинскому времени (UTC+8).",
++    "Select models to check, then click a selected model to configure it. Removing a model keeps its history and stops gating its calls.": "Выберите модели для проверки, затем нажмите на выбранную модель для её настройки. Удаление модели сохраняет историю и снимает ограничения её вызовов.",
++    "All channels for this model": "Все каналы модели",
++    "Leave empty to check all channels for this model. Unselected channels are not checked and their results do not block calls.": "Пустой список означает все каналы модели. Невыбранные каналы не проверяются и не блокируются.",
++    "Pause only this model on a failed channel. Calls without a result are allowed.": "При сбое блокируется только эта модель на канале. Вызовы без результата разрешены.",
++    "Select only channels that support the selected model": "Выберите каналы с поддержкой выбранной модели",
++    "Select a model configured on a channel": "Выберите модель, настроенную на канале",
++    "Invalid check model": "Некорректная модель проверки",
+     "By clicking sign in, you agree to our": "Нажимая «Войти», вы соглашаетесь с нашими",
+     "By creating an account, you agree to our": "Создавая аккаунт, вы соглашаетесь с нашими"
+   }
+diff --git a/web/src/i18n/locales/vi.json b/web/src/i18n/locales/vi.json
+--- a/web/src/i18n/locales/vi.json
++++ b/web/src/i18n/locales/vi.json
+@@ -7726,6 +7726,73 @@
+     "Zhipu GLM": "Zhipu GLM",
+     "Zhipu V4": "Zhipu V4",
+     "Zoom": "Zoom",
++    "Astra IQ": "Astra IQ",
++    "Astra IQ check details": "Astra IQ check details",
++    "Astra IQ details unavailable": "Astra IQ details unavailable",
++    "Astra IQ disabled channel": "Astra IQ disabled channel",
++    "Astra IQ passed": "Astra IQ passed",
++    "Astra IQ pending": "Astra IQ pending",
++    "Astra IQ request failed": "Astra IQ request failed",
++    "Astra IQ status unavailable": "Astra IQ status unavailable",
++    "Astra IQ wrong answer": "Astra IQ wrong answer",
++    "Check request": "Check request",
++    "Check requests": "Check requests",
++    "Detailed metrics were not saved for this older check.": "Detailed metrics were not saved for this older check.",
++    "Expected answer": "Expected answer",
++    "Input / Output tokens": "Input / Output tokens",
++    "Model response": "Model response",
++    "No completed model response": "No completed model response",
++    "Question sent to model": "Question sent to model",
++    "Time to first token": "Time to first token",
++    "View check details": "View check details",
++    "Upstream rejected the official Codex client.": "Dịch vụ từ chối ứng dụng Codex chính thức.",
++    "Delete this check": "Xóa kết quả này",
++    "Delete all checks": "Xóa tất cả kết quả",
++    "Delete this check?": "Xóa kết quả kiểm tra này?",
++    "Delete all checks for this channel?": "Xóa tất cả kết quả kiểm tra của kênh này?",
++    "Failed to delete check results": "Không thể xóa kết quả kiểm tra",
++    "Check settings": "Cài đặt kiểm tra",
++    "Check start time": "Giờ bắt đầu",
++    "Interval (minutes)": "Khoảng cách (phút)",
++    "Stop on failure": "Dừng khi thất bại",
++    "Settings apply to every checked channel. Daily schedule in Beijing time (UTC+8).": "Áp dụng cho mọi kênh được kiểm tra. Chạy hằng ngày theo giờ Bắc Kinh (UTC+8).",
++    "Equal times mean all day. Overnight schedules are supported.": "Hai giờ giống nhau nghĩa là cả ngày. Hỗ trợ khoảng thời gian qua nửa đêm.",
++    "Pause Astra calls after a failed check. Calls without a result are allowed.": "Tạm dừng gọi Astra sau kiểm tra thất bại. Cho phép gọi khi chưa có kết quả.",
++    "Check settings unavailable": "Không tải được cài đặt kiểm tra",
++    "Use HH:mm for check times": "Nhập giờ theo định dạng HH:mm",
++    "Check interval must be an integer from 1 to 1440": "Khoảng cách phải là số nguyên từ 1 đến 1440",
++    "Invalid check settings": "Cài đặt kiểm tra không hợp lệ",
++    "This permanently deletes this check. If it is the latest result, calls are allowed until the next check.": "Xóa vĩnh viễn kết quả này. Nếu là kết quả mới nhất, cho phép gọi đến lần kiểm tra tiếp theo.",
++    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "Xóa vĩnh viễn mọi kết quả của kênh này. Cho phép gọi đến lần kiểm tra tiếp theo.",
++    "Enable checks": "Bật kiểm tra",
++    "When off, checks stop and results do not block calls. History is kept.": "Khi tắt, dừng kiểm tra và kết quả không chặn lệnh gọi. Giữ lại lịch sử.",
++    "Expected {{expected}}, received {{actual}}.": "Đáp án dự kiến {{expected}}, nhận được {{actual}}.",
++    "Error code": "Mã lỗi",
++    "Error type": "Loại lỗi",
++    "The check exceeded its time limit.": "Kiểm tra vượt quá thời hạn.",
++    "The official Codex client could not be started.": "Không khởi động được ứng dụng Codex chính thức.",
++    "The official Codex client did not send a request.": "Ứng dụng Codex chính thức chưa gửi yêu cầu.",
++    "The official Codex client did not receive a complete response.": "Ứng dụng Codex chính thức chưa nhận phản hồi đầy đủ.",
++    "The upstream response contained no final answer.": "Phản hồi từ nguồn không có đáp án cuối cùng.",
++    "The upstream response ended before completion.": "Phản hồi từ nguồn kết thúc trước khi hoàn tất.",
++    "This channel has no enabled keys.": "Kênh này không có khóa đang bật.",
++    "The request failed. This older check has no saved error details.": "Yêu cầu thất bại. Lần kiểm tra cũ này không lưu chi tiết lỗi.",
++    "Check channels": "Kênh kiểm tra",
++    "All Astra channels": "Tất cả kênh Astra",
++    "Leave empty to check all Astra channels. Unselected channels are not checked and their results do not block calls.": "Để trống để kiểm tra mọi kênh Astra. Kênh không được chọn sẽ không được kiểm tra và kết quả của nó không chặn lệnh gọi.",
++    "Select only channels that support gpt-6-astra": "Chỉ chọn kênh hỗ trợ gpt-6-astra",
++    "Check models": "Mô hình kiểm tra",
++    "Select check models": "Chọn mô hình kiểm tra",
++    "Configure model": "Cấu hình mô hình",
++    "Check model": "Mô hình kiểm tra",
++    "Each model has its own channels and schedule in Beijing time (UTC+8).": "Mỗi mô hình có kênh và lịch riêng theo giờ Bắc Kinh (UTC+8).",
++    "Select models to check, then click a selected model to configure it. Removing a model keeps its history and stops gating its calls.": "Chọn các mô hình cần kiểm tra, rồi nhấp vào mô hình đã chọn để cấu hình. Xóa mô hình vẫn giữ lịch sử và ngừng hạn chế các lệnh gọi của mô hình đó.",
++    "All channels for this model": "Tất cả kênh của mô hình",
++    "Leave empty to check all channels for this model. Unselected channels are not checked and their results do not block calls.": "Để trống để kiểm tra mọi kênh của mô hình. Kênh không chọn không bị kiểm tra hay chặn.",
++    "Pause only this model on a failed channel. Calls without a result are allowed.": "Chỉ dừng mô hình này trên kênh thất bại. Lệnh gọi chưa có kết quả được phép.",
++    "Select only channels that support the selected model": "Chỉ chọn kênh hỗ trợ mô hình đã chọn",
++    "Select a model configured on a channel": "Chọn mô hình đã cấu hình trên kênh",
++    "Invalid check model": "Mô hình kiểm tra không hợp lệ",
+     "By clicking sign in, you agree to our": "Bằng cách nhấp đăng nhập, bạn đồng ý với",
+     "By creating an account, you agree to our": "Bằng cách tạo tài khoản, bạn đồng ý với"
+   }
+diff --git a/web/src/i18n/locales/zh-TW.json b/web/src/i18n/locales/zh-TW.json
+--- a/web/src/i18n/locales/zh-TW.json
++++ b/web/src/i18n/locales/zh-TW.json
+@@ -7726,6 +7726,73 @@
+     "Zhipu GLM": "智譜GLM",
+     "Zhipu V4": "智譜 V4",
+     "Zoom": "縮放",
++    "Astra IQ": "Astra IQ",
++    "Astra IQ check details": "Astra IQ check details",
++    "Astra IQ details unavailable": "Astra IQ details unavailable",
++    "Astra IQ disabled channel": "Astra IQ disabled channel",
++    "Astra IQ passed": "Astra IQ passed",
++    "Astra IQ pending": "Astra IQ pending",
++    "Astra IQ request failed": "Astra IQ request failed",
++    "Astra IQ status unavailable": "Astra IQ status unavailable",
++    "Astra IQ wrong answer": "Astra IQ wrong answer",
++    "Check request": "Check request",
++    "Check requests": "Check requests",
++    "Detailed metrics were not saved for this older check.": "Detailed metrics were not saved for this older check.",
++    "Expected answer": "Expected answer",
++    "Input / Output tokens": "Input / Output tokens",
++    "Model response": "Model response",
++    "No completed model response": "No completed model response",
++    "Question sent to model": "Question sent to model",
++    "Time to first token": "Time to first token",
++    "View check details": "View check details",
++    "Upstream rejected the official Codex client.": "上游拒絕了官方 Codex 用戶端。",
++    "Delete this check": "刪除此筆結果",
++    "Delete all checks": "刪除全部結果",
++    "Delete this check?": "刪除此筆檢測結果？",
++    "Delete all checks for this channel?": "刪除此管道的全部檢測結果？",
++    "Failed to delete check results": "刪除檢測結果失敗",
++    "Check settings": "檢測設定",
++    "Check start time": "開始時間",
++    "Interval (minutes)": "間隔（分鐘）",
++    "Stop on failure": "失敗停用",
++    "Settings apply to every checked channel. Daily schedule in Beijing time (UTC+8).": "設定適用於所有檢測渠道，按北京時間（UTC+8）每天執行。",
++    "Equal times mean all day. Overnight schedules are supported.": "時間相同表示全天，支援跨午夜。",
++    "Pause Astra calls after a failed check. Calls without a result are allowed.": "檢測失敗後暫停 Astra 呼叫；無結果時允許呼叫。",
++    "Check settings unavailable": "檢測設定載入失敗",
++    "Use HH:mm for check times": "時間格式為 HH:mm",
++    "Check interval must be an integer from 1 to 1440": "間隔須為 1～1440 的整數",
++    "Invalid check settings": "檢測設定無效",
++    "This permanently deletes this check. If it is the latest result, calls are allowed until the next check.": "此次檢測結果將被永久刪除。如果這是最新結果，下次檢測前允許呼叫。",
++    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "此渠道的全部檢測結果將被永久刪除，下次檢測前允許呼叫。",
++    "Enable checks": "啟用檢測",
++    "When off, checks stop and results do not block calls. History is kept.": "關閉後停止檢測，檢測結果不再限制呼叫，保留歷史記錄。",
++    "Expected {{expected}}, received {{actual}}.": "預期答案為 {{expected}}，實際返回 {{actual}}。",
++    "Error code": "錯誤碼",
++    "Error type": "錯誤類型",
++    "The check exceeded its time limit.": "檢測超過時限。",
++    "The official Codex client could not be started.": "無法啟動 Codex 官方用戶端。",
++    "The official Codex client did not send a request.": "Codex 官方用戶端未發出請求。",
++    "The official Codex client did not receive a complete response.": "Codex 官方用戶端未收到完整回應。",
++    "The upstream response contained no final answer.": "上游回應中沒有最終答案。",
++    "The upstream response ended before completion.": "上游回應未完成就已結束。",
++    "This channel has no enabled keys.": "此渠道沒有已啟用的金鑰。",
++    "The request failed. This older check has no saved error details.": "請求失敗。這條舊記錄未儲存具體錯誤詳情。",
++    "Check channels": "檢測渠道",
++    "All Astra channels": "全部 Astra 渠道",
++    "Leave empty to check all Astra channels. Unselected channels are not checked and their results do not block calls.": "不選擇則檢測全部 Astra 渠道；未選中的渠道不檢測，其結果也不限制呼叫。",
++    "Select only channels that support gpt-6-astra": "只能選擇支援 gpt-6-astra 的渠道",
++    "Check models": "檢測模型",
++    "Select check models": "選擇檢測模型",
++    "Configure model": "設定模型",
++    "Check model": "檢測模型",
++    "Each model has its own channels and schedule in Beijing time (UTC+8).": "每個模型獨立設定渠道和檢測時段，時間採用北京時間（UTC+8）。",
++    "Select models to check, then click a selected model to configure it. Removing a model keeps its history and stops gating its calls.": "選擇檢測模型，點擊模型標籤切換設定。移除模型會保留歷史，並停止限制其呼叫。",
++    "All channels for this model": "此模型的全部渠道",
++    "Leave empty to check all channels for this model. Unselected channels are not checked and their results do not block calls.": "留空表示檢測此模型的全部渠道。未選渠道不檢測，其結果也不限制呼叫。",
++    "Pause only this model on a failed channel. Calls without a result are allowed.": "僅暫停失敗渠道上的當前模型呼叫；尚無結果時允許呼叫。",
++    "Select only channels that support the selected model": "只能選擇支援當前模型的渠道",
++    "Select a model configured on a channel": "請選擇已在渠道中設定的模型",
++    "Invalid check model": "檢測模型無效",
+     "By clicking sign in, you agree to our": "點擊登入即表示您同意我們的",
+     "By creating an account, you agree to our": "建立帳戶即表示您同意我們的"
+   }
+diff --git a/web/src/i18n/locales/zh.json b/web/src/i18n/locales/zh.json
+--- a/web/src/i18n/locales/zh.json
++++ b/web/src/i18n/locales/zh.json
+@@ -7726,6 +7726,73 @@
+     "Zhipu GLM": "智谱GLM",
+     "Zhipu V4": "智谱 V4",
+     "Zoom": "缩放",
++    "Astra IQ": "模型智力检测",
++    "Astra IQ check details": "模型检测详情",
++    "Astra IQ details unavailable": "暂时无法读取检测详情",
++    "Astra IQ disabled channel": "渠道已停用，暂停检测",
++    "Astra IQ passed": "通过",
++    "Astra IQ pending": "待检测",
++    "Astra IQ request failed": "检测异常",
++    "Astra IQ status unavailable": "检测状态读取失败",
++    "Astra IQ wrong answer": "答案错误",
++    "Check request": "检测请求",
++    "Check requests": "请求次数",
++    "Detailed metrics were not saved for this older check.": "此历史记录未保存完整请求详情。",
++    "Expected answer": "正确答案",
++    "Input / Output tokens": "输入 / 输出 Token",
++    "Model response": "模型回复",
++    "No completed model response": "未收到完整的模型回复",
++    "Question sent to model": "发送给模型的题目",
++    "Time to first token": "首字延迟",
++    "View check details": "点击查看检测详情",
++    "Upstream rejected the official Codex client.": "上游拒绝了官方 Codex 客户端。",
++    "Delete this check": "删除此次结果",
++    "Delete all checks": "删除全部结果",
++    "Delete this check?": "删除此次检测结果？",
++    "Delete all checks for this channel?": "删除此渠道的全部检测结果？",
++    "Failed to delete check results": "删除检测结果失败",
++    "Check settings": "检测设置",
++    "Check start time": "开始时间",
++    "Interval (minutes)": "间隔（分钟）",
++    "Stop on failure": "失败停用",
++    "Settings apply to every checked channel. Daily schedule in Beijing time (UTC+8).": "设置适用于所有检测渠道，按北京时间（UTC+8）每天执行。",
++    "Equal times mean all day. Overnight schedules are supported.": "时间相同表示全天，支持跨午夜。",
++    "Pause Astra calls after a failed check. Calls without a result are allowed.": "检测失败后暂停 Astra 调用；无结果时允许调用。",
++    "Check settings unavailable": "检测设置加载失败",
++    "Use HH:mm for check times": "时间格式为 HH:mm",
++    "Check interval must be an integer from 1 to 1440": "间隔须为 1～1440 的整数",
++    "Invalid check settings": "检测设置无效",
++    "This permanently deletes this check. If it is the latest result, calls are allowed until the next check.": "此次检测结果将被永久删除。如果这是最新结果，下次检测前允许调用。",
++    "This permanently deletes all check results for this channel. Calls are allowed until the next check.": "此渠道的全部检测结果将被永久删除，下次检测前允许调用。",
++    "Enable checks": "启用检测",
++    "When off, checks stop and results do not block calls. History is kept.": "关闭后停止检测，检测结果不再限制调用，保留历史记录。",
++    "Expected {{expected}}, received {{actual}}.": "预期答案为 {{expected}}，实际返回 {{actual}}。",
++    "Error code": "错误码",
++    "Error type": "错误类型",
++    "The check exceeded its time limit.": "检测超过时限。",
++    "The official Codex client could not be started.": "无法启动 Codex 官方客户端。",
++    "The official Codex client did not send a request.": "Codex 官方客户端未发出请求。",
++    "The official Codex client did not receive a complete response.": "Codex 官方客户端未收到完整响应。",
++    "The upstream response contained no final answer.": "上游响应中没有最终答案。",
++    "The upstream response ended before completion.": "上游响应未完成就已结束。",
++    "This channel has no enabled keys.": "此渠道没有已启用的密钥。",
++    "The request failed. This older check has no saved error details.": "请求失败。这条旧记录未保存具体错误详情。",
++    "Check channels": "检测渠道",
++    "All Astra channels": "全部 Astra 渠道",
++    "Leave empty to check all Astra channels. Unselected channels are not checked and their results do not block calls.": "不选择则检测全部 Astra 渠道；未选中的渠道不检测，其结果也不限制调用。",
++    "Select only channels that support gpt-6-astra": "只能选择支持 gpt-6-astra 的渠道",
++    "Check models": "检测模型",
++    "Select check models": "选择检测模型",
++    "Configure model": "配置模型",
++    "Check model": "检测模型",
++    "Each model has its own channels and schedule in Beijing time (UTC+8).": "每个模型独立配置渠道和检测时段，时间采用北京时间（UTC+8）。",
++    "Select models to check, then click a selected model to configure it. Removing a model keeps its history and stops gating its calls.": "选择检测模型，点击模型标签切换配置。移除模型会保留历史，并停止限制其调用。",
++    "All channels for this model": "该模型的全部渠道",
++    "Leave empty to check all channels for this model. Unselected channels are not checked and their results do not block calls.": "留空表示检测该模型的全部渠道。未选渠道不检测，其结果也不限制调用。",
++    "Pause only this model on a failed channel. Calls without a result are allowed.": "仅暂停失败渠道上的当前模型调用；尚无结果时允许调用。",
++    "Select only channels that support the selected model": "只能选择支持当前模型的渠道",
++    "Select a model configured on a channel": "请选择已在渠道中配置的模型",
++    "Invalid check model": "检测模型无效",
+     "By clicking sign in, you agree to our": "点击登录即表示您同意我们的",
+     "By creating an account, you agree to our": "创建账户即表示您同意我们的"
+   }

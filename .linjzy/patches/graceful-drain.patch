@@ -1,0 +1,550 @@
+diff --git a/Dockerfile b/Dockerfile
+index 96228148..7d49499b 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -33,6 +33,8 @@ RUN apk add --no-cache bash \
+ 
+ FROM debian:bookworm-slim@sha256:f06537653ac770703bc45b4b113475bd402f451e85223f0f2837acbf89ab020a
+ 
++LABEL com.linjzy.new-api.drain-protocol="1"
++
+ RUN apt-get update \
+     && apt-get install -y --no-install-recommends ca-certificates tzdata libasan8 wget \
+     && rm -rf /var/lib/apt/lists/* \
+diff --git a/controller/relay.go b/controller/relay.go
+index 34a11216..4f394810 100644
+--- a/controller/relay.go
++++ b/controller/relay.go
+@@ -16,6 +16,7 @@ import (
+ 	"github.com/QuantumNous/new-api/logger"
+ 	"github.com/QuantumNous/new-api/middleware"
+ 	"github.com/QuantumNous/new-api/model"
++	"github.com/QuantumNous/new-api/pkg/drain"
+ 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
+ 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
+ 	"github.com/QuantumNous/new-api/relay"
+@@ -88,4 +89,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+ 			return
+ 		}
+ 		defer ws.Close()
++		// Realtime audio has no reliable idle boundary. Keep its complete
++		// session busy so maintenance times out instead of canceling a turn.
++		session := drain.RegisterWS(c.Request.Context(), true, func() {})
++		if session == nil {
++			_ = ws.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseServiceRestart, "service restarting"), time.Now().Add(time.Second))
++			return
++		}
++		defer session.Unregister()
+ 	}
+diff --git a/main.go b/main.go
+index 476e1008..ccb8d48d 100644
+--- a/main.go
++++ b/main.go
+@@ -23,6 +23,7 @@ import (
+ 	"github.com/QuantumNous/new-api/middleware"
+ 	"github.com/QuantumNous/new-api/model"
+ 	"github.com/QuantumNous/new-api/oauth"
++	"github.com/QuantumNous/new-api/pkg/drain"
+ 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+ 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
+ 	"github.com/QuantumNous/new-api/pkg/wsmanager"
+@@ -48,6 +49,9 @@ var buildFS embed.FS
+ var indexPage []byte
+ 
+ func main() {
++	if len(os.Args) > 1 && os.Args[1] == "drain" {
++		os.Exit(drain.RunCLI(os.Args[2:]))
++	}
+ 	if len(os.Args) > 1 && os.Args[1] == "plugin" {
+ 		os.Exit(jsplugin.RunCLI(os.Args[2:], os.Stdout, os.Stderr))
+ 	}
+@@ -213,8 +217,14 @@ func main() {
+ 
+ 	srv := &http.Server{
+ 		Addr:    net.JoinHostPort(host, port),
+-		Handler: server,
++		Handler: drain.Default.Wrap(server),
+ 	}
++	closeControl, err := drain.Default.StartControl(drain.SocketPath)
++	if err != nil {
++		common.FatalLog(common.LogText("failed to start drain control: %s", err.Error()))
++		return
++	}
++	defer closeControl()
+ 
+ 	go func() {
+ 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+@@ -235,9 +245,13 @@ func main() {
+ 	shutdownTimeout := time.Duration(common.GetEnvOrDefault("SHUTDOWN_TIMEOUT_SECONDS", 120)) * time.Second
+ 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+ 	defer cancel()
++	drain.Default.BeginShutdown()
+ 	if err := srv.Shutdown(ctx); err != nil {
+ 		common.SysError(common.LogText("server forced to shutdown: %v", err))
+ 	}
++	if err := drain.Default.Wait(ctx); err != nil {
++		common.SysError(common.LogText("websocket drain timed out: %v", err))
++	}
+ 	// 内存中的看板数据保存入库，避免重启丢失未落库数据 (issue #5679)
+ 	if common.DataExportEnabled {
+ 		model.SaveQuotaDataCache()
+diff --git a/relay/responses_websocket.go b/relay/responses_websocket.go
+index 5f0d6bd2..8c44e1ef 100644
+--- a/relay/responses_websocket.go
++++ b/relay/responses_websocket.go
+@@ -19,7 +19,8 @@ import (
+ 	"github.com/QuantumNous/new-api/i18n"
+ 	"github.com/QuantumNous/new-api/middleware"
+ 	appmodel "github.com/QuantumNous/new-api/model"
++	"github.com/QuantumNous/new-api/pkg/drain"
+ 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+ 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
+ 	"github.com/QuantumNous/new-api/pkg/wsmanager"
+ 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
+@@ -89,6 +90,7 @@ type responsesWSCallState struct {
+ }
+ 
+ type responsesWSSession struct {
++	drainSession   *drain.Session
+ 	ctx            context.Context
+ 	cancel         context.CancelFunc
+ 	client         *websocket.Conn
+@@ -134,6 +136,14 @@ func ResponsesWebSocketHelper(c *gin.Context, client *websocket.Conn, runner Res
+ 		maxMB = 128
+ 	}
+ 	client.SetReadLimit(int64(maxMB) << 20)
++	s.drainSession = drain.RegisterWS(ctx, false, func() {
++		s.shutdown(websocket.CloseServiceRestart, "service restarting")
++	})
++	if s.drainSession == nil {
++		s.shutdown(websocket.CloseServiceRestart, "service restarting")
++		return nil
++	}
++	defer s.drainSession.Unregister()
+ 	defer func() {
+ 		// Unless an earlier shutdown ended the read, the client closed or left.
+ 		// Gorilla already answered a client close frame, so this tells the upstream.
+@@ -172,6 +182,10 @@ func ResponsesWebSocketHelper(c *gin.Context, client *websocket.Conn, runner Res
+ 		}
+ 		state := &responsesWSCallState{inbox: make(chan responsesWSMessage), controls: make(chan responsesWSControl, 1), done: make(chan struct{})}
+ 		if !s.tryReserveCurrent(state) {
++			if s.drainSession.Draining() {
++				s.sendError(envelope.EventID, streamID, types.NewErrorWithStatusCode(errors.New("service restarting; retry later"), types.ErrorCode("service_draining"), http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry()))
++				continue
++			}
+ 			s.sendError(envelope.EventID, streamID, types.NewErrorWithStatusCode(errors.New("another response.create is already in progress on this websocket connection"), types.ErrorCodeInvalidRequest, http.StatusConflict, types.ErrOptionWithSkipRetry()))
+ 			continue
+ 		}
+@@ -215,6 +229,7 @@ func (s *responsesWSSession) runRequest(state *responsesWSCallState, message []b
+ 		}
+ 		s.current = nil
+ 		close(state.done)
++		s.drainSession.FinishWork()
+ 		s.stateMu.Unlock()
+ 		s.clientWriteMu.Unlock()
+ 	}()
+@@ -679,7 +694,7 @@ func (s *responsesWSSession) getCurrent() *responsesWSCallState {
+ func (s *responsesWSSession) tryReserveCurrent(state *responsesWSCallState) bool {
+ 	s.stateMu.Lock()
+ 	defer s.stateMu.Unlock()
+-	if s.current != nil {
++	if s.current != nil || !s.drainSession.StartWork() {
+ 		return false
+ 	}
+ 	s.current = state
+diff --git a/pkg/drain/drain.go b/pkg/drain/drain.go
+new file mode 100644
+index 00000000..afe3b304
+--- /dev/null
++++ b/pkg/drain/drain.go
+@@ -0,0 +1,252 @@
++// Package drain coordinates local deployment admission and connection shutdown.
++package drain
++
++import (
++	"context"
++	"errors"
++	"net/http"
++	"sync"
++)
++
++var Default = New()
++
++type Status struct {
++	Protocol     int    `json:"protocol"`
++	JobID        string `json:"job_id"`
++	Draining     bool   `json:"draining"`
++	HTTPInflight int    `json:"http_inflight"`
++	WSBusy       int    `json:"ws_busy"`
++	WSIdle       int    `json:"ws_idle"`
++	WSClosing    int    `json:"ws_closing"`
++	Ready        bool   `json:"ready"`
++}
++
++type Manager struct {
++	mu       sync.Mutex
++	jobID    string
++	shutdown bool
++	http     int
++	sessions map[*Session]struct{}
++	changed  chan struct{}
++}
++
++type admissionKey struct{}
++type admission struct {
++	manager *Manager
++	active  bool // protected by manager.mu
++}
++
++type Session struct {
++	manager *Manager
++	busy    bool // all session fields are protected by manager.mu
++	closing bool
++	close   func()
++}
++
++func New() *Manager {
++	return &Manager{sessions: make(map[*Session]struct{}), changed: make(chan struct{})}
++}
++
++func (m *Manager) notifyLocked() {
++	close(m.changed)
++	m.changed = make(chan struct{})
++}
++
++func (m *Manager) Status() Status {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	s := Status{Protocol: 1, JobID: m.jobID, Draining: m.jobID != "", HTTPInflight: m.http}
++	for session := range m.sessions {
++		switch {
++		case session.closing:
++			s.WSClosing++
++		case session.busy:
++			s.WSBusy++
++		default:
++			s.WSIdle++
++		}
++	}
++	s.Ready = s.Draining && m.http == 0 && len(m.sessions) == 0
++	return s
++}
++
++// Begin is idempotent for the same job. Idle connections close immediately;
++// busy connections close only after their request worker finishes its output.
++func (m *Manager) Begin(jobID string) error {
++	m.mu.Lock()
++	if jobID == "" || (m.jobID != "" && m.jobID != jobID) || m.shutdown {
++		m.mu.Unlock()
++		return errors.New("drain is owned by another job or shutdown")
++	}
++	callbacks := m.beginLocked(jobID)
++	m.mu.Unlock()
++	for _, closeSession := range callbacks {
++		go closeSession()
++	}
++	return nil
++}
++
++func (m *Manager) beginLocked(jobID string) []func() {
++	m.jobID = jobID
++	var callbacks []func()
++	for session := range m.sessions {
++		if !session.busy && !session.closing {
++			session.closing = true
++			callbacks = append(callbacks, session.close)
++		}
++	}
++	m.notifyLocked()
++	return callbacks
++}
++
++func (m *Manager) Cancel(jobID string) error {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	if jobID == "" || m.jobID != jobID || m.shutdown {
++		return errors.New("drain is owned by another job or shutdown")
++	}
++	m.jobID = ""
++	m.notifyLocked()
++	return nil
++}
++
++func (m *Manager) BeginShutdown() {
++	m.mu.Lock()
++	// Shutdown takes over deployment admission and cannot subsequently be canceled.
++	m.shutdown = true
++	callbacks := m.beginLocked("shutdown")
++	m.mu.Unlock()
++	for _, closeSession := range callbacks {
++		go closeSession()
++	}
++}
++
++func (m *Manager) Wait(ctx context.Context) error {
++	for {
++		m.mu.Lock()
++		ready := m.jobID != "" && m.http == 0 && len(m.sessions) == 0
++		changed := m.changed
++		m.mu.Unlock()
++		if ready {
++			return nil
++		}
++		select {
++		case <-changed:
++		case <-ctx.Done():
++			return ctx.Err()
++		}
++	}
++}
++
++// Wrap holds admission through the entire handler, including settlement defers.
++// Health checks remain available and are excluded from the business counters.
++func (m *Manager) Wrap(next http.Handler) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path == "/api/status" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
++			next.ServeHTTP(w, r)
++			return
++		}
++		m.mu.Lock()
++		if m.jobID != "" {
++			m.mu.Unlock()
++			w.Header().Set("Retry-After", "5")
++			w.Header().Set("Content-Type", "application/json")
++			w.WriteHeader(http.StatusServiceUnavailable)
++			_, _ = w.Write([]byte(`{"error":{"message":"service restarting; retry later","type":"service_unavailable","code":"service_draining"}}`))
++			return
++		}
++		m.http++
++		a := &admission{manager: m, active: true}
++		m.notifyLocked()
++		m.mu.Unlock()
++		defer func() {
++			m.mu.Lock()
++			if a.active {
++				m.http--
++				a.active = false
++				m.notifyLocked()
++			}
++			m.mu.Unlock()
++		}()
++		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), admissionKey{}, a)))
++	})
++}
++
++// RegisterWS atomically transfers the HTTP handshake admission to a session.
++// The continuous realtime protocol stays busy for its complete lifetime: it has
++// no universally safe request boundary, so deployments wait instead of cutting it.
++func RegisterWS(ctx context.Context, busy bool, closeSession func()) *Session {
++	m := Default
++	a, _ := ctx.Value(admissionKey{}).(*admission)
++	if a != nil {
++		m = a.manager
++	}
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	if m.jobID != "" {
++		return nil
++	}
++	if a != nil && a.active {
++		a.active = false
++		m.http--
++	}
++	s := &Session{manager: m, busy: busy, close: closeSession}
++	m.sessions[s] = struct{}{}
++	m.notifyLocked()
++	return s
++}
++
++// StartWork shares the admission lock with Begin, so a successful idle
++// observation can never race a new response.create into the upstream.
++func (s *Session) StartWork() bool {
++	if s == nil {
++		return true
++	}
++	m := s.manager
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	if _, exists := m.sessions[s]; !exists || m.jobID != "" || s.closing || s.busy {
++		return false
++	}
++	s.busy = true
++	m.notifyLocked()
++	return true
++}
++
++func (s *Session) Draining() bool {
++	if s == nil {
++		return false
++	}
++	s.manager.mu.Lock()
++	defer s.manager.mu.Unlock()
++	return s.manager.jobID != "" || s.closing
++}
++
++func (s *Session) FinishWork() {
++	if s == nil {
++		return
++	}
++	m := s.manager
++	m.mu.Lock()
++	s.busy = false
++	closeNow := m.jobID != "" && !s.closing
++	if closeNow {
++		s.closing = true
++	}
++	m.notifyLocked()
++	m.mu.Unlock()
++	if closeNow {
++		s.close()
++	}
++}
++
++func (s *Session) Unregister() {
++	if s == nil {
++		return
++	}
++	m := s.manager
++	m.mu.Lock()
++	delete(m.sessions, s)
++	m.notifyLocked()
++	m.mu.Unlock()
++}
+diff --git a/pkg/drain/control.go b/pkg/drain/control.go
+new file mode 100644
+index 00000000..2c159c79
+--- /dev/null
++++ b/pkg/drain/control.go
+@@ -0,0 +1,132 @@
++package drain
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/url"
++	"os"
++	"path/filepath"
++	"regexp"
++	"time"
++
++	"github.com/QuantumNous/new-api/common"
++)
++
++const SocketPath = "/tmp/newapi-drain/control.sock"
++
++var validJobID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$`)
++
++// ControlHandler is served only on a mode-0600 Unix socket, never on the public
++// router. Docker exec grants the host operator access without an API credential.
++func (m *Manager) ControlHandler() http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		w.Header().Set("Cache-Control", "no-store")
++		status := http.StatusOK
++		switch {
++		case r.Method == http.MethodGet && r.URL.Path == "/status":
++		case r.Method == http.MethodPost && (r.URL.Path == "/begin" || r.URL.Path == "/cancel"):
++			job := r.URL.Query().Get("job")
++			if !validJobID.MatchString(job) || job == "shutdown" {
++				http.Error(w, "invalid drain job", http.StatusBadRequest)
++				return
++			}
++			var err error
++			if r.URL.Path == "/begin" {
++				err = m.Begin(job)
++			} else {
++				err = m.Cancel(job)
++			}
++			if err != nil {
++				status = http.StatusConflict
++			}
++		default:
++			http.Error(w, "unsupported drain operation", http.StatusMethodNotAllowed)
++			return
++		}
++		payload, err := common.Marshal(m.Status())
++		if err != nil {
++			http.Error(w, "cannot encode drain status", http.StatusInternalServerError)
++			return
++		}
++		w.WriteHeader(status)
++		_, _ = w.Write(payload)
++	})
++}
++
++func (m *Manager) StartControl(path string) (func(), error) {
++	dir := filepath.Dir(path)
++	if err := os.Mkdir(dir, 0700); err != nil && !os.IsExist(err) {
++		return nil, err
++	}
++	info, err := os.Lstat(dir)
++	if err != nil || !info.IsDir() || info.Mode().Perm() != 0700 {
++		return nil, errors.New("drain control directory must be private")
++	}
++	if info, err := os.Lstat(path); err == nil {
++		if info.Mode()&os.ModeSocket == 0 {
++			return nil, errors.New("drain control path is not a socket")
++		}
++		conn, dialErr := net.DialTimeout("unix", path, time.Second)
++		if dialErr == nil {
++			_ = conn.Close()
++			return nil, errors.New("drain control socket is already active")
++		}
++		if err := os.Remove(path); err != nil {
++			return nil, err
++		}
++	} else if !os.IsNotExist(err) {
++		return nil, err
++	}
++	listener, err := net.Listen("unix", path)
++	if err != nil {
++		return nil, err
++	}
++	if err := os.Chmod(path, 0600); err != nil {
++		_ = listener.Close()
++		return nil, err
++	}
++	server := &http.Server{Handler: m.ControlHandler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second}
++	go func() { _ = server.Serve(listener) }()
++	return func() { _ = server.Close() }, nil
++}
++
++func RunCLI(args []string) int {
++	if len(args) == 0 || (args[0] != "status" && args[0] != "begin" && args[0] != "cancel") ||
++		(args[0] == "status" && len(args) != 1) || (args[0] != "status" && (len(args) != 2 || !validJobID.MatchString(args[1]))) {
++		fmt.Fprintln(os.Stderr, "usage: new-api drain status | begin JOB_ID | cancel JOB_ID")
++		return 2
++	}
++	method, target := http.MethodGet, "http://unix/status"
++	if args[0] != "status" {
++		method, target = http.MethodPost, "http://unix/"+args[0]+"?job="+url.QueryEscape(args[1])
++	}
++	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
++		return (&net.Dialer{}).DialContext(ctx, "unix", SocketPath)
++	}}
++	defer transport.CloseIdleConnections()
++	client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
++	request, _ := http.NewRequest(method, target, nil)
++	response, err := client.Do(request)
++	if err != nil {
++		fmt.Fprintln(os.Stderr, "drain control unavailable:", err)
++		return 1
++	}
++	defer response.Body.Close()
++	payload, err := io.ReadAll(io.LimitReader(response.Body, 16*1024))
++	if err != nil || response.StatusCode != http.StatusOK {
++		fmt.Fprintln(os.Stderr, "drain control rejected operation:", response.Status)
++		return 1
++	}
++	var status Status
++	if common.Unmarshal(payload, &status) != nil || status.Protocol != 1 {
++		fmt.Fprintln(os.Stderr, "invalid drain control response")
++		return 1
++	}
++	fmt.Println(string(payload))
++	return 0
++}
